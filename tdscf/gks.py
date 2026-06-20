@@ -74,6 +74,54 @@ class _KernelXCMixin:
         self.frozen = [int(i) for i in occ if i not in core]
         return self
 
+    def _contract_multipole(self, ints, hermi=True, xy=None):
+        '''Transition multipole (e.g. dipole) for a spinor (2-component)
+        reference -- pyscf's GHF stub raises NotImplementedError.
+
+        ``oscillator_strength`` calls this with the spin-free electric-dipole
+        integrals built in the *spherical* AO basis; the spinor MOs live in the
+        n2c basis, so rebuild the operator there (int1e_r_spinor) and contract
+        with the X (and Y) amplitudes over the active occupied/virtual spinors.
+        No factor of two: unlike closed-shell RHF the spinor basis carries no
+        spin degeneracy to sum over.
+        '''
+        import numpy
+        if xy is None:
+            xy = self.xy
+        nstates = len(xy)
+        pol_shape = ints.shape[:-2]          # (3,) for the dipole
+        mol = self._scf.mol
+        n2c = mol.nao_2c()
+        # spin-free electric dipole in the spinor AO basis (same (0,0,0) gauge
+        # origin as pyscf's int1e_r)
+        ints = mol.intor('int1e_r_spinor', comp=3).reshape(-1, n2c, n2c)
+
+        mask = self.get_frozen_mask()
+        mo = self._scf.mo_coeff[:, mask]
+        occ = self._scf.mo_occ[mask]
+        orbo = mo[:, occ == 1]
+        orbv = mo[:, occ == 0]
+        # MO transition dipole <i|r|a>  (active occ x active vir)
+        ints = lib.einsum('xpq,pi,qj->xij', ints, orbo.conj(), orbv)
+        pol = numpy.array([numpy.einsum('xij,ij->x', ints, x) for x, y in xy])
+        if isinstance(xy[0][1], numpy.ndarray):    # TDHF/RPA has de-excitations
+            ymo = numpy.array([numpy.einsum('xij,ij->x', ints, y) for x, y in xy])
+            pol = pol + ymo if hermi else pol - ymo
+        return pol.reshape((nstates,) + pol_shape)
+
+    def oscillator_strength(self, e=None, xy=None, gauge='length', order=0):
+        '''f = (2/3) * dE * |mu|^2.  The spinor transition dipole is complex, so
+        use |mu|^2 = mu . mu* -- pyscf's base routine forms mu . mu (real-dipole
+        assumption), which underestimates and can even go negative here.
+        '''
+        import numpy
+        if e is None:
+            e = self.e
+        if gauge == 'length' and order == 0:
+            mu = self.transition_dipole(xy)
+            return (2. / 3. * numpy.einsum('s,sx,sx->s', e, mu, mu.conj())).real
+        return super().oscillator_strength(e=e, xy=xy, gauge=gauge, order=order)
+
 
 class TDA(_KernelXCMixin, _ghf.TDA):
     pass
