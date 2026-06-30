@@ -25,7 +25,6 @@ def read_genbas(basis_name, filename, so_basis=False):
         exps.append(np.zeros(basinfo[ii][2]))
         coeffs.append(np.zeros(basinfo[ii][2]*basinfo[ii][1]))
     assert len(exps) == max_ang+1
-    print(basinfo)
     ll = 0
     nexp = 0
     ncoeff = 0
@@ -102,13 +101,13 @@ def parse_genbas(basis, filename="GENBAS", uncontract=False, so_basis=False):
     for ii in range(len(basinfo)):
         if uncontract:
             for jj in range(basinfo[ii][2]):
-                basis_pyscf.append([ii,[exps[ii][jj],1.0]])
+                basis_pyscf.append([ii,[float(exps[ii][jj]),1.0]])
         else:
             basis_pyscf.append([basinfo[ii][0]])
             for jj in range(basinfo[ii][2]):
-                basis_pyscf[ii].append([exps[ii][jj]])
+                basis_pyscf[ii].append([float(exps[ii][jj])])
                 for kk in range(basinfo[ii][1]):
-                    basis_pyscf[ii][jj+1].append(coeffs[ii][jj][kk])
+                    basis_pyscf[ii][jj+1].append(float(coeffs[ii][jj][kk]))
     if so_basis:
         basis_pyscf = to_pyscf_kappa_basis(basis_pyscf, so_basis_info)
     return basis_pyscf
