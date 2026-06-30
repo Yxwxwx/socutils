@@ -660,10 +660,19 @@ class _CDERIS(lib.StreamObject):
                              moo_sph, mop_sph, log):
         """One-pass: half-transform occ MOs, produce cd_pa and vk_core simultaneously.
 
+        Mirrors scf.spinor_hf._DFJHF._get_k_mo's real/imag-split K build: never
+        materialise a complex (naux_blk, nocc, nao_nr) tensor (ncore is usually
+        >> ncas, and core rows are only ever needed for K) -- the old code
+        complex-materialised the full nocc block and made an extra .copy() of
+        each half-transform buffer, which dominated both memory and wall time.
+        blksize is with_df.blockdim, same as before this rewrite.
+
         For each DF chunk:
-        1. Half-transform with occ MOs → L_{P,μ,i} (i ∈ core+active)
-        2. Active columns: second-step transform → cd_pa
-        3. Core columns: K assembly → accumulate vk_sph
+        1. Half-transform with occ MOs -> real L_{P,i,mu} (alpha/beta x real/imag)
+        2. Core rows (i < ncore): K assembly directly from the real/imag split,
+           via real GEMMs only -- accumulate vk_sph.
+        3. Active rows (i >= ncore): complex-materialise just this small slice,
+           then one batched matmul -> cd_pa.
         """
         import ctypes
         from pyscf.ao2mo import _ao2mo
@@ -695,54 +704,76 @@ class _CDERIS(lib.StreamObject):
         naux = with_df.get_naoaux()
         cd_pa = numpy.zeros((naux, nmo, ncas), dtype=complex)
         vk_sph = numpy.zeros((2 * nao_nr, 2 * nao_nr), dtype=complex)
-        blksize = with_df.blockdim
-        buf = numpy.empty((blksize * nocc, nao_nr))
 
-        log.info('CDERIS before loop: current memory %.1f MB', lib.current_memory()[0])
+        blksize = with_df.blockdim
+        buf_aR = numpy.empty((blksize * nocc, nao_nr))
+        buf_aI = numpy.empty((blksize * nocc, nao_nr))
+        buf_bR = numpy.empty((blksize * nocc, nao_nr))
+        buf_bI = numpy.empty((blksize * nocc, nao_nr))
+
+        log.info('CDERIS before loop: current memory %.1f MB, blksize=%d',
+                 lib.current_memory()[0], blksize)
+        # Per-phase cumulative (cpu, wall) seconds, tallied across all blocks and
+        # reported once after the loop -- splits the "CD integral transformation"
+        # total into half-transform (C kernel, untouched) vs core-K assembly vs
+        # cd_pa construction (the two this rewrite changed), so a slow run shows
+        # which phase to look at instead of one opaque number.
+        t_half = t_corek = t_cdpa = numpy.zeros(2)
         b0 = 0
         for eri1 in with_df.loop(blksize):
+            tb0 = (logger.process_clock(), logger.perf_counter())
             naux_blk = eri1.shape[0]
-            bufslice = buf[:naux_blk * nocc]
+            LaR = buf_aR[:naux_blk * nocc]
+            LaI = buf_aI[:naux_blk * nocc]
+            LbR = buf_bR[:naux_blk * nocc]
+            LbI = buf_bI[:naux_blk * nocc]
 
-            # Half-transform: 4 calls for alpha/beta × real/imag
-            _half(eri1, C_aR, bufslice)
-            LaR = bufslice.reshape(naux_blk, nocc, nao_nr).copy()
-            _half(eri1, C_aI, bufslice)
-            LaI = bufslice.reshape(naux_blk, nocc, nao_nr).copy()
-            _half(eri1, C_bR, bufslice)
-            LbR = bufslice.reshape(naux_blk, nocc, nao_nr).copy()
-            _half(eri1, C_bI, bufslice)
-            LbI = bufslice.reshape(naux_blk, nocc, nao_nr).copy()
+            # Half-transform: 4 calls for alpha/beta x real/imag, real arrays only
+            _half(eri1, C_aR, LaR)
+            _half(eri1, C_aI, LaI)
+            _half(eri1, C_bR, LbR)
+            _half(eri1, C_bI, LbI)
 
-            # Complex half-transformed: L_{P,i,μ} for alpha and beta
-            La = LaR + 1j * LaI  # (naux_blk, nocc, nao_nr)
-            Lb = LbR + 1j * LbI
+            LaR = LaR.reshape(naux_blk, nocc, nao_nr)
+            LaI = LaI.reshape(naux_blk, nocc, nao_nr)
+            LbR = LbR.reshape(naux_blk, nocc, nao_nr)
+            LbI = LbI.reshape(naux_blk, nocc, nao_nr)
+            tb1 = (logger.process_clock(), logger.perf_counter())
+            t_half += (tb1[0] - tb0[0], tb1[1] - tb0[1])
 
-            # --- Core K assembly (i < ncore) ---
-            # K_aa[μ,ν] = Σ_{P,i} La[P,i,μ]* La[P,i,ν] (wrong)
-            # Actually L[P,μ,i] but buf gives L[P,i,μ], so:
-            # K[μ,ν] = Σ_{Pi} L[P,i,μ].conj() * L[P,i,ν]
-            #        = La_core_flat.conj().T @ La_core_flat
-            # L[P,i,μ] stored as La[P,i,μ], reshape to (naux*ncore, nao_nr) = L[Pi,μ]
-            # K[μ,ν] = Σ_{Pi} L[Pi,μ] L*[Pi,ν] = La.T @ La.conj()
-            La_core = La[:, :ncore, :].reshape(-1, nao_nr)  # (naux_blk*ncore, nao_nr)
-            Lb_core = Lb[:, :ncore, :].reshape(-1, nao_nr)
-            vk_sph[:nao_nr, :nao_nr] += lib.dot(La_core.T, La_core.conj())
-            vk_sph[nao_nr:, nao_nr:] += lib.dot(Lb_core.T, Lb_core.conj())
-            K_ab = lib.dot(La_core.T, Lb_core.conj())
+            # --- Core K assembly (i < ncore), real GEMMs only ---
+            # K[mu,nu] = sum_{Pi} L[Pi,mu] L[Pi,nu]* with L = LR + i*LI splits
+            # into a real symmetric part (LR.T@LR + LI.T@LI) and an imaginary
+            # antisymmetric part (LI.T@LR - (LI.T@LR).T); this never forms the
+            # complex L itself for the (naux_blk, ncore, nao_nr) core block.
+            LaR_c = LaR[:, :ncore, :].reshape(-1, nao_nr)
+            LaI_c = LaI[:, :ncore, :].reshape(-1, nao_nr)
+            LbR_c = LbR[:, :ncore, :].reshape(-1, nao_nr)
+            LbI_c = LbI[:, :ncore, :].reshape(-1, nao_nr)
+
+            IRa = lib.dot(LaI_c.T, LaR_c)
+            vk_sph[:nao_nr, :nao_nr] += (lib.dot(LaR_c.T, LaR_c) + lib.dot(LaI_c.T, LaI_c)
+                                          + 1j * (IRa - IRa.T))
+            IRb = lib.dot(LbI_c.T, LbR_c)
+            vk_sph[nao_nr:, nao_nr:] += (lib.dot(LbR_c.T, LbR_c) + lib.dot(LbI_c.T, LbI_c)
+                                          + 1j * (IRb - IRb.T))
+            K_ab = (lib.dot(LaR_c.T, LbR_c) + lib.dot(LaI_c.T, LbI_c)
+                    + 1j * (lib.dot(LaI_c.T, LbR_c) - lib.dot(LaR_c.T, LbI_c)))
             vk_sph[:nao_nr, nao_nr:] += K_ab
             vk_sph[nao_nr:, :nao_nr] += K_ab.conj().T
+            tb2 = (logger.process_clock(), logger.perf_counter())
+            t_corek += (tb2[0] - tb1[0], tb2[1] - tb1[1])
 
-            # --- cd_pa: active columns, second-step transform ---
-            # L_active: (naux_blk, ncas, 2*nao_nr) → (naux_blk, 2*nao_nr, ncas)
-            La_act = La[:, ncore:, :]  # (naux_blk, ncas, nao_nr)
-            Lb_act = Lb[:, ncore:, :]
-            L_act = numpy.concatenate([La_act, Lb_act], axis=2)  # (naux_blk, ncas, 2*nao_nr)
-            L_act = L_act.transpose(0, 2, 1)  # (naux_blk, 2*nao_nr, ncas)
-            for i in range(naux_blk):
-                cd_pa[b0 + i] = numpy.dot(mop_sph_H, L_act[i])
+            # --- cd_pa: active rows only, complex-materialised (ncas << ncore) ---
+            La_act = LaR[:, ncore:, :] + 1j * LaI[:, ncore:, :]  # (naux_blk, ncas, nao_nr)
+            Lb_act = LbR[:, ncore:, :] + 1j * LbI[:, ncore:, :]
+            L_act = numpy.concatenate([La_act, Lb_act], axis=2).transpose(0, 2, 1)  # (naux_blk, 2*nao_nr, ncas)
+            cd_pa[b0:b0 + naux_blk] = numpy.matmul(mop_sph_H, L_act)
+            tb3 = (logger.process_clock(), logger.perf_counter())
+            t_cdpa += (tb3[0] - tb2[0], tb3[1] - tb2[1])
+
             b0 += naux_blk
-            del LaR, LaI, LbR, LbI, La, Lb, La_core, Lb_core, La_act, Lb_act, L_act
+            del LaR_c, LaI_c, LbR_c, LbI_c, La_act, Lb_act, L_act
             if b0 % (blksize * 5) == 0 or b0 >= naux - blksize:
                 log.info('  chunk b0=%d, memory %.1f MB', b0, lib.current_memory()[0])
 
@@ -751,6 +782,9 @@ class _CDERIS(lib.StreamObject):
         vk_core = sph2spinor(mol, vk_sph)
         log.info('CDERIS after loop: current memory %.1f MB', lib.current_memory()[0])
         log.info('CDERIS: %d aux functions, cd_pa and vk_core built in one pass', naux)
+        log.info('CDERIS phase breakdown: half-transform CPU %.1f wall %.1f sec, '
+                 'core-K CPU %.1f wall %.1f sec, cd_pa CPU %.1f wall %.1f sec',
+                 t_half[0], t_half[1], t_corek[0], t_corek[1], t_cdpa[0], t_cdpa[1])
         return cd_pa, vk_core
 
     def _build_cd_pa(self, with_df, cderi, mol, nao_nr, nmo, ncas,
