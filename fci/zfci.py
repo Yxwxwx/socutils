@@ -523,6 +523,15 @@ class FCISolver(fci_dhf_slow.FCISolver):
     eigh call; set nroots to the number of states needed.
     '''
 
+    # Spin is not a good quantum number for a spinor wavefunction, and the
+    # spin_square inherited from fci_dhf_slow is a non-relativistic routine
+    # (it splits nelec into (na, nb)) that is meaningless here.  Suppress it so
+    # that mcscf.addons.state_average does not attach a per-state <S^2> to
+    # _finalize.  For a genuine (relativistic-expectation) spin/L/J diagnostic
+    # use socutils.fci.addons.angular_momentum_square / spin_square.
+    spin_square = None
+    states_spin_square = None
+
     def __init__(self, mol=None):
         fci_dhf_slow.FCISolver.__init__(self, mol)
         self.converged = True
