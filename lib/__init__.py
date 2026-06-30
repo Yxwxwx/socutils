@@ -7,6 +7,7 @@ top-level CMake) and emitted flat into this directory:
   libx2camf_c.so   X2CAMF spin-orbit integrals   (exposed as ``import x2camf``)
   libccsdt_clib.so spinor CCSDT residual kernels  (socutils.cc)
   libzquatev.so    quaternion eigensolver         (Kramers-restricted SCF)
+  libnrr_opt.so    spinor AO2MO e1/e2 kernels      (socutils.lib.ao2mo.nrr_fast)
 
 ``load_library`` mirrors ``pyscf.lib.load_library``: it loads a library by name
 from this directory.  A ``SOCUTILS_<NAME>_LIBRARY`` environment variable (e.g.

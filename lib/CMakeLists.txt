@@ -11,6 +11,7 @@
 #   x2camf  ->  lib/libx2camf_c.so    (import x2camf, the SOC integral backend)
 #   ccsdt   ->  lib/libccsdt_clib.so  (socutils.cc CCSDT kernels)
 #   zquatev ->  lib/libzquatev.so     (Kramers-restricted spinor SCF)
+#   ao2mo   ->  lib/libnrr_opt.so     (socutils.lib.ao2mo.nrr_fast spinor AO2MO)
 #
 # The subdirectory CMakeLists.txt files are thin (just the target plus its
 # link/output), exactly as in pyscf/lib, so they slot into pyscf/lib unchanged
@@ -93,3 +94,4 @@ endif()
 add_subdirectory(x2camf)
 add_subdirectory(ccsdt)
 add_subdirectory(zquatev)
+add_subdirectory(ao2mo)

@@ -14,41 +14,17 @@ The only host-side work is a single complex transpose between the two passes.
 Output matches int2e_spinor over j-spinor MOs to machine precision; see the
 self-test at the bottom and NOTES.md.
 '''
-import os
 import ctypes
 import _ctypes
-import subprocess
 import numpy as np
 from pyscf import lib
 from pyscf.gto.moleintor import make_cintopt, make_loc, ascint3
+from .. import load_library
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_SO = os.path.join(_HERE, 'libnrr_opt.so')
-_SRC = os.path.join(_HERE, 'nrr_ao2mo_opt.c')
-
-
-def _ensure_lib():
-    '''Build libnrr_opt.so from nrr_ao2mo_opt.c if missing or stale.
-
-    The .so is gitignored, so it is (re)built on demand against the installed
-    pyscf libraries (all needed headers live under pyscf/lib).'''
-    if os.path.exists(_SO) and os.path.getmtime(_SO) >= os.path.getmtime(_SRC):
-        return
-    pi = os.path.dirname(os.path.abspath(lib.__file__))      # pyscf/lib
-    import glob
-    openblas = glob.glob(os.path.join(pi, 'libopenblas*.so')) or \
-        glob.glob(os.path.join(pi, 'deps', 'lib', 'libopenblas*.so'))
-    cmd = ['gcc', '-shared', '-fPIC', '-fopenmp', '-O2', _SRC, '-o', _SO,
-           '-I' + pi, '-I' + os.path.join(pi, 'deps', 'include'), '-I' + _HERE,
-           '-L' + pi, '-lao2mo', '-lnp_helper', '-lcvhf',
-           '-L' + os.path.join(pi, 'deps', 'lib'), '-lcint',
-           *openblas,
-           '-Wl,-rpath,' + pi, '-Wl,-rpath,' + os.path.join(pi, 'deps', 'lib')]
-    subprocess.run(cmd, check=True)
-
-
-_ensure_lib()
-_libopt = ctypes.CDLL(_SO)
+# libnrr_opt.so is built from nrr_ao2mo_opt.c by lib/CMakeLists.txt (`make`,
+# or lib/build.sh), like every other bundled socutils library; it links
+# against the pyscf that was active at configure time (see lib/ao2mo/CMakeLists.txt).
+_libopt = load_library('libnrr_opt')
 _libao2mo = lib.load_library('libao2mo')
 
 

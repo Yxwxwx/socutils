@@ -24,18 +24,23 @@ here; it has been removed.)
 
 ## Building native libraries
 
-Two bundled C/C++ libraries must be compiled before the features that use them.
-All three are built together by **one** top-level CMake under `lib/`
+Four bundled C/C++ libraries must be compiled before the features that use
+them. All four are built together by **one** top-level CMake under `lib/`
 (`lib/CMakeLists.txt`), modelled on `pyscf/lib`: it centralises the common
 config (BLAS/LAPACK, OpenMP, flags, `$ORIGIN` RPATH) and `add_subdirectory`s
-each library. The subdir CMakeLists (`lib/x2camf`, `lib/ccsdt`, `lib/zquatev`)
+each library. The subdir CMakeLists for `lib/x2camf`, `lib/ccsdt`, `lib/zquatev`
 are thin (target + link only) and rely on the parent scope, exactly like
-`pyscf/lib/vhf` — so they drop into `pyscf/lib` unchanged if upstreamed. Each
-`.so` is emitted **flat into `lib/`**, next to its ctypes loader. They're
+`pyscf/lib/vhf` — so they drop into `pyscf/lib` unchanged if upstreamed.
+`lib/ao2mo` (spinor AO2MO e1/e2 kernels, `nrr_fast.py`) is the odd one out: it
+reuses C already compiled into an *installed* pyscf (`libao2mo`/`libnp_helper`/
+`libcvhf`/`libcint`) rather than standing alone, so its CMakeLists locates that
+pyscf via the configuring Python interpreter at configure time — if upstreamed
+*into* pyscf it would simplify to an ordinary in-tree `target_link_libraries`.
+Each `.so` is emitted **flat into `lib/`**, next to its ctypes loader. They're
 optional — two-component code that doesn't call them runs without.
 
 ```bash
-make            # build all three -> lib/libx2camf_c.so, libccsdt_clib.so, libzquatev.so
+make            # build all four -> lib/libx2camf_c.so, libccsdt_clib.so, libzquatev.so, libnrr_opt.so
 make test       # build + no-dependency x2camf smoke test
 make compare    # build + A/B compare C backend vs C++ reference
                 #   (needs X2CAMF_CPP_LIBRARY=/path/to/libx2camf*.so)
@@ -47,7 +52,8 @@ make CMAKE_ARGS=-DBLA_VENDOR=OpenBLAS      # or -DBLAS_LIBRARIES=mkl_rt
 
 The ctypes loaders find their library in `lib/` (and honour a
 `SOCUTILS_*_LIBRARY` env override): `lib/__init__.py:load_library`,
-`x2camf_c/x2camf/_c_backend.py`, `cc/_ccsdt_clib.py`, `lib/zquatev/__init__.py`.
+`x2camf_c/x2camf/_c_backend.py`, `cc/_ccsdt_clib.py`, `lib/zquatev/__init__.py`,
+`lib/ao2mo/nrr_fast.py`.
 
 ## Tests
 
