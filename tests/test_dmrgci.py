@@ -1,10 +1,15 @@
+import json
 import math
 from pathlib import Path
 
 import numpy as np
 from pyscf.fci import fci_dhf_slow
 
-from socutils.dmrg.dmrgci import DMRGCI, energy_from_rdms
+from socutils.dmrg.dmrgci import (
+    DMRGCI,
+    energy_from_rdms,
+    pyscf_dmrg_schedule,
+)
 from socutils.fci import zfci
 
 
@@ -39,6 +44,71 @@ def _assert_rdm_invariants(dm1, dm2, nelec):
     assert np.max(abs(dm2.conj() - dm2.transpose(1, 0, 3, 2))) <= RDM_TOL
     assert np.max(abs(dm2 + dm2.transpose(2, 1, 0, 3))) <= RDM_TOL
     assert np.max(abs(dm2 + dm2.transpose(0, 3, 2, 1))) <= RDM_TOL
+
+
+def test_pyscf_schedule_is_expanded_for_direct_pyblock2():
+    schedule = pyscf_dmrg_schedule(
+        max_bond_dimension=1000,
+        start_bond_dimension=200,
+        tol=1e-7,
+    )
+
+    # These are the anchor rows produced by the official PySCF loop.  The
+    # extra 1e-7 row reflects its literal repeated floating-point division.
+    assert schedule.anchor_sweeps == (0, 4, 8, 12, 14, 16, 18, 20)
+    assert schedule.anchor_bond_dims == (
+        200,
+        400,
+        800,
+        1000,
+        1000,
+        1000,
+        1000,
+        1000,
+    )
+    assert np.allclose(
+        schedule.anchor_thrds,
+        [1e-4, 1e-4, 1e-4, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8],
+        rtol=1e-14,
+        atol=0.0,
+    )
+    assert schedule.n_sweeps == 32
+    assert schedule.twosite_to_onesite == 24
+    assert schedule.bond_dims[:4] == (200,) * 4
+    assert schedule.bond_dims[4:8] == (400,) * 4
+    assert schedule.noises[20:] == (0.0,) * 12
+
+    restart = pyscf_dmrg_schedule(
+        max_bond_dimension=1000, tol=1e-7, restart=True
+    )
+    assert restart.n_sweeps == 8
+    assert restart.twosite_to_onesite is None
+    assert restart.bond_dims == (1000,) * 8
+    assert restart.noises == (0.0,) * 8
+    assert restart.thrds == (1e-8,) * 8
+
+    tuned = pyscf_dmrg_schedule(
+        max_bond_dimension=32,
+        start_bond_dimension=16,
+        tol=1e-10,
+        noise_scale=0.5,
+        max_davidson_threshold=1e-12,
+    )
+    assert max(tuned.thrds) == 1e-12
+    assert tuned.anchor_noises[0] == 5e-5
+    assert tuned.anchor_noises[-1] == 0.0
+
+
+def test_restart_scheduler_accepts_both_callback_vocabularies():
+    solver = DMRGCI()
+    callback = solver.restart_scheduler_()
+
+    assert not callback({"orbital_gradient_norm": 2e-3})
+    assert callback({"orbital_gradient_norm": 5e-4})
+    assert solver.restart_diagnostics["reasons"] == ["orbital_gradient"]
+    assert callback({"norm_gorb": 2e-3, "norm_ddm": 5e-3})
+    assert solver.restart_diagnostics["reasons"] == ["density_change"]
+    assert not callback({"norm_gorb": 2e-3, "norm_ddm": 2e-2})
 
 
 def test_analytic_one_electron_and_determinant_rdms(tmp_path):
@@ -104,6 +174,119 @@ def test_large_ecore_is_excluded_from_sweep_convergence(tmp_path):
     )
     assert np.max(abs(np.asarray(solver.convergence_info["sweep_energies"]))) < 2
     solver.close()
+
+
+def test_casscf_restart_reuses_only_compatible_internal_mps(tmp_path):
+    h1 = np.array(
+        [
+            [-1.1, 0.08j, 0.02],
+            [-0.08j, -0.3, -0.04j],
+            [0.02, 0.04j, 0.7],
+        ],
+        dtype=complex,
+    )
+    eri = np.zeros((3,) * 4, dtype=complex)
+    solver = _solver(tmp_path, 3, 1, bond_dim=8)
+    energy0, state0 = solver.kernel(h1, eri, 3, 1, verbose=0)
+    solver.make_rdm12(state0, 3, 1)
+    driver_id = id(solver.driver)
+    scratch = solver._scratch
+
+    h1_next = h1.copy()
+    h1_next[1, 1] -= 0.03
+    solver.restart_scheduler_step({"orbital_gradient_norm": 5e-4})
+    energy1, _ = solver.kernel(
+        h1_next, eri, 3, 1, ci0=state0, verbose=0
+    )
+    reference, _ = zfci.FCISolver().kernel(h1_next, eri, 3, 1)
+
+    assert abs(energy0 - np.linalg.eigvalsh(h1)[0]) <= ENERGY_TOL
+    assert abs(energy1 - reference) <= ENERGY_TOL
+    assert id(solver.driver) != driver_id
+    assert solver._scratch != scratch
+    assert solver.convergence_info["run_mode"] == "casscf-warm-start"
+    assert solver.convergence_info["restart_transport"] == (
+        "fresh-driver-mps-reload"
+    )
+    assert solver.convergence_info["schedule"]["restart"]
+    assert solver.convergence_info["schedule"]["n_sweeps"] == 8
+    assert solver._multi_mps.dot == 1
+    solver.close()
+
+
+def test_multiroot_checkpoint_resume_and_fingerprint_gate(tmp_path):
+    h1 = np.diag([-1.3, -0.4, 0.8]).astype(complex)
+    eri = np.zeros((3,) * 4, dtype=complex)
+    checkpoint = tmp_path / "checkpoint"
+    first = DMRGCI().init(
+        ncas=3,
+        nelecas=1,
+        nroots=2,
+        bond_dims=[8] * 8,
+        noises=[0.0] * 8,
+        thrds=[1e-14] * 8,
+        n_sweeps=8,
+        tol=1e-12,
+        scratch=tmp_path / "scratch-first",
+        checkpoint_dir=checkpoint,
+        n_threads=1,
+        stack_memory=256,
+        random_seed=2468,
+    )
+    energy0, _ = first.kernel(h1, eri, 3, 1, verbose=0)
+    manifest_path = checkpoint / "dmrgci-checkpoint.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["status"] == "complete"
+    assert (checkpoint / "mps" / "GS-mps_info.bin").is_file()
+    # A killed process leaves status=running; the last completed sweep is
+    # nevertheless a valid pyblock2 restart image.
+    manifest["status"] = "running"
+    manifest_path.write_text(json.dumps(manifest))
+    first.close()
+
+    resumed = DMRGCI().init(
+        ncas=3,
+        nelecas=1,
+        nroots=2,
+        bond_dims=[8] * 8,
+        noises=[0.0] * 8,
+        thrds=[1e-14] * 8,
+        n_sweeps=8,
+        tol=1e-12,
+        scratch=tmp_path / "scratch-resumed",
+        checkpoint_dir=checkpoint,
+        resume=True,
+        n_threads=1,
+        stack_memory=256,
+        random_seed=999,
+    )
+    energy1, _ = resumed.kernel(h1, eri, 3, 1, verbose=0)
+    assert np.max(abs(energy1 - energy0)) <= ENERGY_TOL
+    assert resumed.convergence_info["run_mode"] == "checkpoint-resume"
+    assert resumed.convergence_info["schedule"]["restart"]
+    assert not resumed.resume
+    resumed.close()
+
+    mismatched = DMRGCI().init(
+        ncas=3,
+        nelecas=1,
+        nroots=2,
+        bond_dims=[8] * 8,
+        noises=[0.0] * 8,
+        thrds=[1e-14] * 8,
+        n_sweeps=8,
+        tol=1e-12,
+        scratch=tmp_path / "scratch-mismatch",
+        checkpoint_dir=checkpoint,
+        resume=True,
+        n_threads=1,
+        stack_memory=256,
+    )
+    h1_mismatch = h1.copy()
+    h1_mismatch[0, 0] += 1e-6
+    with np.testing.assert_raises_regex(ValueError, "fingerprint"):
+        mismatched.kernel(h1_mismatch, eri, 3, 1, verbose=0)
+    mismatched.close()
 
 
 def _complex_hamiltonians():

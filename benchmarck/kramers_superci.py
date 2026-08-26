@@ -22,7 +22,7 @@ from pyscf import __version__ as pyscf_version
 from pyscf import gto, scf
 
 from socutils.cd.cd import CD
-from socutils.dmrg import DMRGCI
+from socutils.dmrg import DMRGCI, pyscf_dmrg_schedule
 from socutils.dmrg.kramers import identify_kramers_orbitals, kramers_residual
 from socutils.mcscf import zmcscf
 from socutils.scf import spinor_hf
@@ -57,10 +57,27 @@ except ModuleNotFoundError:  # Supports ``python -m benchmarck...`` as well.
 
 
 METHODS = ("exact-superci", "dmrg-superci")
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 
 
 def _protocol(args, element, method=None):
+    if args.dmrg_schedule == "pyscf":
+        dmrg_schedule = pyscf_dmrg_schedule(
+            max_bond_dimension=args.bond_dimension,
+            start_bond_dimension=args.dmrg_start_bond_dimension,
+            tol=args.dmrg_tol,
+            noise_scale=args.dmrg_noise_scale,
+            max_davidson_threshold=args.dmrg_thrd,
+        ).as_dict()
+    else:
+        dmrg_schedule = {
+            "bond_dims": [args.bond_dimension] * args.dmrg_sweeps,
+            "thrds": [args.dmrg_thrd] * args.dmrg_sweeps,
+            "noises": [0.0] * args.dmrg_sweeps,
+            "n_sweeps": args.dmrg_sweeps,
+            "twosite_to_onesite": 2,
+            "restart": False,
+        }
     protocol = {
         "version": PROTOCOL_VERSION,
         "element": element,
@@ -107,16 +124,24 @@ def _protocol(args, element, method=None):
             "projected_hamiltonian_residual": "H_projected - S_projected E",
         },
         "dmrg": {
+            "schedule": args.dmrg_schedule,
             "bond_dimension": args.bond_dimension,
+            "start_bond_dimension": args.dmrg_start_bond_dimension,
             "ecore_in_mpo": False,
             "root_strategy": "state-averaged MultiMPS",
             "local_eigensolver": "Block2 Normal (Olsen)",
-            "twosite_to_onesite": 2,
-            "n_sweeps": args.dmrg_sweeps,
+            "schedule_reference": "pyscf/dmrgscf dmrgci.py",
+            "n_sweeps": dmrg_schedule["n_sweeps"],
+            "expanded_schedule": dmrg_schedule,
             "energy_tolerance": args.dmrg_tol,
             "local_squared_residual_threshold": args.dmrg_thrd,
             "davidson_max_iter": args.dmrg_davidson_max_iter,
-            "noise": 0.0,
+            "noise_type": args.dmrg_noise_type,
+            "noise_scale": args.dmrg_noise_scale,
+            "restart_switch_tolerance": args.dmrg_switch_tol,
+            "restart_sweeps": args.dmrg_restart_sweeps,
+            "checkpoint": args.dmrg_checkpoint,
+            "checkpoint_per_sweep": args.dmrg_checkpoint_per_sweep,
             "random_seed": args.random_seed,
             "n_threads": args.threads,
             "stack_memory_mb": args.dmrg_stack_memory,
@@ -312,22 +337,48 @@ def _run_or_load_scf(args, element):
 def _configure_casscf(args, mol, mean_field, method, dmrg_scratch):
     mc = zmcscf.CASSCF(mean_field, ncas=NCAS, nelecas=NELECAS)
     if method == "dmrg-superci":
+        dmrg_options = {
+            "ncas": NCAS,
+            "nelecas": NELECAS,
+            "nroots": NROOTS,
+            "tol": args.dmrg_tol,
+            "scratch": dmrg_scratch / "work",
+            "checkpoint_per_sweep": args.dmrg_checkpoint_per_sweep,
+            "n_threads": args.threads,
+            "stack_memory": args.dmrg_stack_memory,
+            "random_seed": args.random_seed,
+            "dav_max_iter": args.dmrg_davidson_max_iter,
+            "schedule_noise_scale": args.dmrg_noise_scale,
+            "schedule_thrd_max": args.dmrg_thrd,
+            "dmrg_switch_tol": args.dmrg_switch_tol,
+            "restart_sweeps": args.dmrg_restart_sweeps,
+            "npdm_site_type": 2,
+            "npdm_cutoff": 1e-24,
+        }
+        if args.dmrg_checkpoint:
+            dmrg_options["checkpoint_dir"] = dmrg_scratch / "checkpoint"
+        if args.dmrg_noise_type != "Default":
+            dmrg_options["noise_type"] = args.dmrg_noise_type
+        if args.dmrg_schedule == "pyscf":
+            dmrg_options.update(
+                {
+                    "schedule_mode": "pyscf",
+                    "max_bond_dimension": args.bond_dimension,
+                    "start_bond_dimension": args.dmrg_start_bond_dimension,
+                }
+            )
+        else:
+            dmrg_options.update(
+                {
+                    "schedule_mode": "explicit",
+                    "bond_dims": [args.bond_dimension] * args.dmrg_sweeps,
+                    "noises": [0.0] * args.dmrg_sweeps,
+                    "thrds": [args.dmrg_thrd] * args.dmrg_sweeps,
+                    "n_sweeps": args.dmrg_sweeps,
+                }
+            )
         solver = DMRGCI(mol).init(
-            ncas=NCAS,
-            nelecas=NELECAS,
-            nroots=NROOTS,
-            bond_dims=[args.bond_dimension] * args.dmrg_sweeps,
-            noises=[0.0] * args.dmrg_sweeps,
-            thrds=[args.dmrg_thrd] * args.dmrg_sweeps,
-            n_sweeps=args.dmrg_sweeps,
-            tol=args.dmrg_tol,
-            scratch=dmrg_scratch,
-            n_threads=args.threads,
-            stack_memory=args.dmrg_stack_memory,
-            random_seed=args.random_seed,
-            dav_max_iter=args.dmrg_davidson_max_iter,
-            npdm_site_type=2,
-            npdm_cutoff=1e-24,
+            **dmrg_options,
         ).kramers_restricted(
             energy_tolerance=args.kramers_energy_tol,
             residual_tolerance=args.kramers_residual_tol,
@@ -444,6 +495,14 @@ def run_worker(args, element, method):
         )
 
         def macro_callback(environment):
+            environment = dict(environment)
+            if method == "dmrg-superci":
+                environment["dmrg_restart_for_next_kernel"] = (
+                    mc.fcisolver.restart_scheduler_step(environment)
+                )
+                environment["dmrg_restart_diagnostics"] = dict(
+                    mc.fcisolver.restart_diagnostics
+                )
             _write_json(
                 progress_path,
                 {
@@ -566,9 +625,15 @@ def run_matrix(args):
                 "superci-davidson-tol": args.superci_davidson_tol,
                 "superci-davidson-max-space": args.superci_davidson_max_space,
                 "bond-dimension": args.bond_dimension,
+                "dmrg-schedule": args.dmrg_schedule,
+                "dmrg-start-bond-dimension": args.dmrg_start_bond_dimension,
                 "dmrg-sweeps": args.dmrg_sweeps,
                 "dmrg-tol": args.dmrg_tol,
                 "dmrg-thrd": args.dmrg_thrd,
+                "dmrg-noise-type": args.dmrg_noise_type,
+                "dmrg-noise-scale": args.dmrg_noise_scale,
+                "dmrg-switch-tol": args.dmrg_switch_tol,
+                "dmrg-restart-sweeps": args.dmrg_restart_sweeps,
                 "dmrg-davidson-max-iter": args.dmrg_davidson_max_iter,
                 "dmrg-stack-memory": args.dmrg_stack_memory,
                 "random-seed": args.random_seed,
@@ -584,6 +649,10 @@ def run_matrix(args):
                 command.extend(("--" + name, str(value)))
             if args.force:
                 command.append("--force")
+            if args.dmrg_checkpoint_per_sweep:
+                command.append("--dmrg-checkpoint-per-sweep")
+            if not args.dmrg_checkpoint:
+                command.append("--no-dmrg-checkpoint")
             log_path = args.logs_dir / ("%s-%s.log" % (element, method))
             print("RUN  %s %s -> %s" % (element, method, log_path), flush=True)
             environment = dict(os.environ)
@@ -592,6 +661,7 @@ def run_matrix(args):
                     "OMP_NUM_THREADS": str(args.threads),
                     "OPENBLAS_NUM_THREADS": str(args.threads),
                     "MKL_NUM_THREADS": str(args.threads),
+                    "PYTHONUNBUFFERED": "1",
                 }
             )
             with log_path.open("w", encoding="utf-8") as log_handle:
@@ -618,7 +688,7 @@ def run_matrix(args):
         "--results-dir",
         str(args.results_dir),
         "--output-dir",
-        str(Path(__file__).resolve().parent / "kramers"),
+        str(args.results_dir.parent),
     ]
     subprocess.run(summary_command, check=False)
     if failed:
@@ -659,9 +729,34 @@ def parse_args(argv=None):
     parser.add_argument("--superci-davidson-tol", type=float, default=1e-7)
     parser.add_argument("--superci-davidson-max-space", type=int, default=30)
     parser.add_argument("--bond-dimension", type=int, default=32)
+    parser.add_argument(
+        "--dmrg-schedule", choices=("pyscf", "flat"), default="pyscf"
+    )
+    parser.add_argument("--dmrg-start-bond-dimension", type=int, default=16)
     parser.add_argument("--dmrg-sweeps", type=int, default=8)
-    parser.add_argument("--dmrg-tol", type=float, default=1e-12)
-    parser.add_argument("--dmrg-thrd", type=float, default=1e-20)
+    parser.add_argument("--dmrg-tol", type=float, default=1e-10)
+    parser.add_argument("--dmrg-thrd", type=float, default=1e-12)
+    parser.add_argument(
+        "--dmrg-noise-type",
+        choices=(
+            "Default",
+            "Wavefunction",
+            "DensityMatrix",
+            "Perturbative",
+            "ReducedPerturbative",
+            "ReducedPerturbativeCollected",
+        ),
+        default="Default",
+    )
+    parser.add_argument("--dmrg-noise-scale", type=float, default=1.0)
+    parser.add_argument("--dmrg-switch-tol", type=float, default=1e-3)
+    parser.add_argument("--dmrg-restart-sweeps", type=int, default=8)
+    parser.add_argument(
+        "--dmrg-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--dmrg-checkpoint-per-sweep", action="store_true")
     parser.add_argument("--dmrg-davidson-max-iter", type=int, default=1000)
     parser.add_argument("--dmrg-stack-memory", type=float, default=512.0)
     parser.add_argument("--random-seed", type=int, default=2468)

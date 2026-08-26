@@ -346,16 +346,91 @@ uv run pytest -q
 Milestone commit: `dmrg: add validated Kramers-restricted X2C-DMRG-SCF`
 (`e6a4ab4f2343fdce54d749633feb391d7e92d8e0`).
 
+## Phase 5: direct-pyblock2 schedule and continuation
+
+The schedule and restart policy now follow the current official
+[PySCF `dmrgscf` implementation](https://github.com/pyscf/dmrgscf/blob/master/pyscf/dmrgscf/dmrgci.py).
+The repository copy used during the audit and the fetched upstream source had
+the same SHA-256 digest. PySCF writes piecewise-constant anchor rows for
+`block2main`; `pyscf_dmrg_schedule` expands those rows into the per-sweep
+`bond_dims`, `thrds`, and `noises` arrays accepted by `DMRGDriver.dmrg`.
+Both interfaces define the Davidson threshold and noise in units of norm
+squared, so the numeric values are passed directly rather than squared again.
+
+The generated cold schedule retains the PySCF policy:
+
+1. start at `M=50` below `maxM=200`, otherwise at `M=200`, unless `startM`
+   is supplied;
+2. double M every four sweeps until `maxM`;
+3. reduce the local threshold and noise by decades every two sweeps;
+4. finish the noise schedule at `tol/10` with zero noise; and
+5. leave eight possible one-site sweeps after the generated two-site endpoint.
+
+The legacy explicit-array interface remains available with
+`schedule_mode="explicit"`. The generated path also permits a noise scale and
+an upper bound on the local squared-residual threshold. Their defaults leave
+the official schedule unchanged; they are explicit protocol parameters for
+near-degenerate multi-root calculations.
+
+PySCF's restart callback is reproduced by `restart_scheduler_()`. An orbital
+gradient below `1e-3`, or a density change below `1e-2` when supplied, enables
+the next CI warm start. The restart uses maximum M, zero noise, `tol/10`
+(subject to an explicitly tighter threshold cap), one-site DMRG, and at most
+eight sweeps. An arbitrary external `ci0` remains untrusted. Instead, the
+solver copies its own structurally compatible saved MPS into a new scratch
+directory, constructs a fresh pyblock2 driver and MPO, and reloads that MPS.
+This matches the lifecycle of `block2main fullrestart` and treats the old
+coefficients only as a guess for the new-orbital Hamiltonian.
+
+For process-level continuation, `checkpoint_dir` asks pyblock2 to copy a
+loadable MPS after every completed sweep. A JSON manifest records orbital and
+electron counts, root count and weights, MPO cutoffs, core shift, and a
+SHA-256 hash over the complex one- and two-electron integrals. A new solver
+with `resume=True` loads either a completed or interrupted checkpoint only
+when that exact fingerprint matches. The checkpoint is not deleted by
+`close()`. Optional per-sweep archives are available but disabled by default
+because of their storage cost.
+
+The protocol-7 Kramers halogen matrix uses CAS(7,8), six equal roots,
+`M=16 -> 32`, `tol=1e-10`, the official noise decay, a `1e-12` local-threshold
+cap, and the `1e-3` restart gate. Every cold call converged in 23 sweeps; every
+final warm call converged in two. All ten exact/DMRG workers completed:
+
+| atom | DMRG - exact total E (Eh) | max root difference (Eh) | gradient difference | final S-I | final H-SE (Eh) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| F | 2.842e-14 | 8.527e-14 | 4.391e-15 | 1.475e-15 | 7.106e-14 |
+| Cl | -4.547e-13 | 3.979e-13 | -3.440e-15 | 1.894e-15 | 5.686e-14 |
+| Br | -1.364e-12 | 1.364e-12 | -3.896e-14 | 9.414e-16 | 8.415e-15 |
+| I | 3.638e-12 | 3.638e-12 | 5.948e-14 | 1.555e-15 | 1.162e-14 |
+| At | 1.091e-11 | 1.091e-11 | 6.470e-14 | 1.471e-15 | 1.198e-14 |
+
+Unit tests cover literal schedule expansion, both callback vocabularies,
+single-root SCF warm starts after NPDM generation, multi-root interrupted
+checkpoint reload, and rejection of a one-integral fingerprint mismatch. The
+complete repository suite passes 33 tests.
+
 ## Known limitations at this milestone
 
 Both general and Kramers modes conserve particle number only. `ci0` is
-explicitly ignored because an MPS from the preceding CASSCF macroiteration is
-not valid after an orbital rotation without a validated MPS orbital transform.
-The CASCI solver boundary receives the reconstructed active four-index tensor;
-Block2 does not consume Cholesky factors directly.  Kramers mode retains the
-full spinor space and requires a complete even root manifold for odd-electron
-systems; pair members used by PySCF state averaging must have equal weights.
-Kramers-restricted Super-CIPT is outside the later Phase-4 scope.
+explicitly ignored; the conditional internal MPS restart is an untransformed
+warm guess for a changed orbital Hamiltonian, not an assertion that the two
+wavefunctions are identical. Every restarted result must therefore satisfy
+the normal energy, root-space, RDM, and orbital-convergence gates. A strict
+disk resume covers one active Hamiltonian only; restarting an SCF process also
+requires restoring its matching orbital iterate. The CASCI solver boundary
+receives the reconstructed active four-index tensor; Block2 does not consume
+Cholesky factors directly. Kramers mode retains the full spinor space and
+requires a complete even root manifold for odd-electron systems; pair members
+used by PySCF state averaging must have equal weights. Kramers-restricted
+Super-CIPT is outside the later Phase-4 scope.
+
+With the locked Block2 wheel, the six-root SGFCPX two-site NPDM calculation
+prints MKL `ZGEMM` parameter-8 diagnostics for zero-sized symmetry blocks.
+The same messages occur with the old flat schedule, cold starts, and no
+checkpoint, so they are not caused by schedule generation or continuation.
+They do not occur in exact CI or the smaller DMRG tests; all accepted halogen
+NPDMs still pass Hermiticity, contraction, Kramers, energy, and exact-CI
+comparisons. This noisy upstream path remains worth reporting to Block2.
 
 The immutable old-code baseline, paper equation map, Pykylin replacement, and
 Phase-4 exact/Block2 Super-CIPT results are recorded separately in

@@ -42,9 +42,20 @@ adapter then validates complete Kramers manifolds from the raw energies and
   failure if its full generalized residual does not converge. Its overlap
   metric uses the full active 1-RDM, is covariant to active-orbital rotations,
   and canonically removes only roundoff-level zero-metric directions.
-- DMRG uses bond dimension 32, eight zero-noise sweeps, active-energy tolerance
-  `1e-12`, local squared residual threshold `1e-20`, Davidson maximum 1000,
-  seed 2468, one thread, and NPDM site type/cutoff 2/`1e-24`.
+- DMRG directly expands the official PySCF `dmrgscf` schedule for pyblock2:
+  bond dimension 16 for sweeps 0--3 and 32 thereafter, the official
+  piecewise noise decay, active-energy tolerance `1e-10`, and a stricter
+  `1e-12` cap on the local squared-residual threshold for the six nearly
+  degenerate complex roots. The cold schedule switches to one-site at sweep
+  22 (30-sweep maximum; these jobs converged in 23). Once the orbital gradient
+  is below `1e-3`, subsequent CI calls reload the validated MPS into a fresh
+  driver and use at most eight zero-noise, max-M one-site sweeps (two were
+  sufficient in every final call). Davidson maximum is 1000, seed 2468, one
+  thread, and NPDM site type/cutoff is 2/`1e-24`.
+- Every DMRG sweep updates `checkpoint/mps` beneath its job scratch directory.
+  The adjacent manifest records the structural problem and a SHA-256
+  fingerprint of the exact Hamiltonian; solver-level `resume=True` refuses a
+  mismatched fingerprint.
 - Kramers energy, raw-RDM, and active-orbital validation tolerances are `1e-8`.
 
 ## Run and resume
@@ -74,3 +85,10 @@ Runtime logs are under `logs/`; durable JSON is under `results/`. Regenerate
 ```bash
 uv --cache-dir .cache/uv run python benchmarck/summarize_kramers_superci.py
 ```
+
+The matrix driver resumes at worker granularity by skipping a matching
+successful JSON result. The MPS checkpoint is a lower-level CI restart: pass
+the same active Hamiltonian and `resume=True` to a newly configured `DMRGCI`.
+Resuming an interrupted SCF macroiteration additionally requires restoring
+the matching orbital iterate; the Hamiltonian fingerprint intentionally
+rejects an unrelated initial-orbital calculation.

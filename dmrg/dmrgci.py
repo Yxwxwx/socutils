@@ -7,7 +7,10 @@ one Block2 site is one spinor orbital and the only conserved quantum number is
 particle number.
 """
 
+from dataclasses import dataclass
 import gc
+import hashlib
+import json
 import math
 import os
 import shutil
@@ -19,6 +22,163 @@ from pyscf import lib
 from pyscf.lib import StreamObject, logger
 
 from .kramers import KramersResultAdapter
+
+
+@dataclass(frozen=True)
+class DMRGSweepSchedule:
+    """A pyblock2 sweep schedule expanded from PySCF DMRG anchor points."""
+
+    anchor_sweeps: tuple
+    anchor_bond_dims: tuple
+    anchor_thrds: tuple
+    anchor_noises: tuple
+    bond_dims: tuple
+    thrds: tuple
+    noises: tuple
+    n_sweeps: int
+    twosite_to_onesite: int | None
+    restart: bool = False
+
+    def as_dict(self):
+        """Return a JSON-friendly diagnostic representation."""
+        return {
+            "anchor_sweeps": list(self.anchor_sweeps),
+            "anchor_bond_dims": list(self.anchor_bond_dims),
+            "anchor_thrds": list(self.anchor_thrds),
+            "anchor_noises": list(self.anchor_noises),
+            "bond_dims": list(self.bond_dims),
+            "thrds": list(self.thrds),
+            "noises": list(self.noises),
+            "n_sweeps": self.n_sweeps,
+            "twosite_to_onesite": self.twosite_to_onesite,
+            "restart": self.restart,
+        }
+
+
+def _expand_schedule(anchor_sweeps, values, n_sweeps):
+    expanded = []
+    anchor = 0
+    for sweep in range(n_sweeps):
+        while (
+            anchor + 1 < len(anchor_sweeps)
+            and anchor_sweeps[anchor + 1] <= sweep
+        ):
+            anchor += 1
+        expanded.append(values[anchor])
+    return tuple(expanded)
+
+
+def pyscf_dmrg_schedule(
+    max_bond_dimension=1000,
+    tol=1e-7,
+    start_bond_dimension=None,
+    restart=False,
+    restart_sweeps=8,
+    noise_scale=1.0,
+    max_davidson_threshold=None,
+):
+    """Translate PySCF's official Block schedule to direct pyblock2 arrays.
+
+    The reference interface writes piecewise-constant anchor rows to a Block
+    input file.  pyblock2 instead accepts one array indexed by sweep, so the
+    anchor rows are expanded here without changing their ranges.  A restart
+    follows the reference ``fullrestart`` path: maximum bond dimension,
+    zero noise, one-site sweeps, and a local threshold of ``tol / 10``.
+    """
+    max_bond_dimension = int(max_bond_dimension)
+    tol = float(tol)
+    restart_sweeps = int(restart_sweeps)
+    noise_scale = float(noise_scale)
+    if max_davidson_threshold is not None:
+        max_davidson_threshold = float(max_davidson_threshold)
+    if max_bond_dimension <= 0:
+        raise ValueError("max_bond_dimension must be positive")
+    if tol <= 0.0 or not numpy.isfinite(tol):
+        raise ValueError("tol must be finite and positive")
+    if tol / 10.0 <= 0.0:
+        raise ValueError("tol is too small to form a finite restart threshold")
+    if restart_sweeps <= 1:
+        raise ValueError("restart_sweeps must be at least two")
+    if noise_scale < 0.0 or not numpy.isfinite(noise_scale):
+        raise ValueError("noise_scale must be finite and nonnegative")
+    if (
+        max_davidson_threshold is not None
+        and (
+            max_davidson_threshold <= 0.0
+            or not numpy.isfinite(max_davidson_threshold)
+        )
+    ):
+        raise ValueError(
+            "max_davidson_threshold must be finite and positive"
+        )
+
+    def local_threshold(value):
+        if max_davidson_threshold is None:
+            return value
+        return min(value, max_davidson_threshold)
+
+    if restart:
+        anchor_sweeps = (0,)
+        anchor_bond_dims = (max_bond_dimension,)
+        anchor_thrds = (local_threshold(tol / 10.0),)
+        anchor_noises = (0.0,)
+        n_sweeps = restart_sweeps
+        twosite_to_onesite = None
+    else:
+        if start_bond_dimension is None:
+            start_bond_dimension = 50 if max_bond_dimension < 200 else 200
+        start_bond_dimension = int(start_bond_dimension)
+        if start_bond_dimension <= 0:
+            raise ValueError("start_bond_dimension must be positive")
+
+        sweeps = []
+        bond_dims = []
+        thrds = []
+        noises = []
+        sweep = 0
+        bond_dimension = start_bond_dimension
+        local_thrd = 1e-4
+        while bond_dimension < max_bond_dimension:
+            sweeps.append(sweep)
+            bond_dims.append(bond_dimension)
+            thrds.append(local_threshold(local_thrd))
+            noises.append(noise_scale * local_thrd)
+            sweep += 4
+            bond_dimension *= 2
+        while local_thrd > tol:
+            sweeps.append(sweep)
+            bond_dims.append(max_bond_dimension)
+            thrds.append(local_threshold(local_thrd))
+            noises.append(noise_scale * local_thrd)
+            sweep += 2
+            local_thrd /= 10.0
+        sweeps.append(sweep)
+        bond_dims.append(max_bond_dimension)
+        thrds.append(local_threshold(tol / 10.0))
+        noises.append(0.0)
+        sweep += 2
+
+        anchor_sweeps = tuple(sweeps)
+        anchor_bond_dims = tuple(bond_dims)
+        anchor_thrds = tuple(thrds)
+        anchor_noises = tuple(noises)
+        twosite_to_onesite = sweep + 2
+        n_sweeps = twosite_to_onesite + 8
+
+    return DMRGSweepSchedule(
+        anchor_sweeps=anchor_sweeps,
+        anchor_bond_dims=anchor_bond_dims,
+        anchor_thrds=anchor_thrds,
+        anchor_noises=anchor_noises,
+        bond_dims=_expand_schedule(
+            anchor_sweeps, anchor_bond_dims, n_sweeps
+        ),
+        thrds=_expand_schedule(anchor_sweeps, anchor_thrds, n_sweeps),
+        noises=_expand_schedule(anchor_sweeps, anchor_noises, n_sweeps),
+        n_sweeps=n_sweeps,
+        twosite_to_onesite=twosite_to_onesite,
+        restart=bool(restart),
+    )
 
 
 def block2_integrals(h1e, eri, norb):
@@ -149,9 +309,11 @@ class DMRGCI(StreamObject):
     :class:`pyblock2.driver.core.DMRGDriver` is created.  ``stack_memory`` is a
     cap because Block2's stack is only one part of its total memory use.
 
-    The solver deliberately does not reuse ``ci0``.  A CASSCF macroiteration
-    changes the orbital basis, and a previous MPS is not valid in the new basis
-    unless it is transformed consistently.
+    An arbitrary external ``ci0`` is not trusted.  When the restart scheduler
+    requests it, however, the solver can reuse its own structurally validated
+    MPS as a warm guess for the next CASSCF Hamiltonian.  This is deliberately
+    distinguished from an exact disk resume, whose Hamiltonian fingerprint is
+    checked before the checkpoint is loaded.
     """
 
     spin_square = None
@@ -177,18 +339,37 @@ class DMRGCI(StreamObject):
         self.nelecas = None
         self.nroots = 1
         self.wfnsym = None
-        self.bond_dims = [250]
-        self.noises = [1e-5] * 4 + [0.0]
-        self.thrds = [1e-8] * 4 + [1e-10]
-        self.n_sweeps = 20
-        self.tol = 1e-9
+        self.schedule_mode = "pyscf"
+        self.max_bond_dimension = 1000
+        self.start_bond_dimension = None
+        self.restart_sweeps = 8
+        self.schedule_noise_scale = 1.0
+        self.schedule_thrd_max = None
+        self.tol = 1e-7
+        self.schedule_sweeps = []
+        self.schedule_bond_dims = []
+        self.schedule_thrds = []
+        self.schedule_noises = []
+        self.bond_dims = []
+        self.noises = []
+        self.thrds = []
+        self.n_sweeps = 0
+        self.twosite_to_onesite = None
+        self.generate_schedule()
+        self.dmrg_switch_tol = 1e-3
+        self.restart = False
+        self._restart = False
+        self.restart_diagnostics = {}
+        self.checkpoint_dir = None
+        self.resume = False
+        self.checkpoint_per_sweep = False
         self.cutoff = 1e-20
         self.integral_cutoff = 1e-20
         self.dav_type = None
         self.dav_max_iter = 4000
         self.dav_def_max_size = 50
         self.dav_rel_conv_thrd = 0.0
-        self.twosite_to_onesite = None
+        self.noise_type = None
         self.random_seed = 1234
         self.npdm_site_type = 2
         self.npdm_cutoff = 1e-24
@@ -207,6 +388,7 @@ class DMRGCI(StreamObject):
         self._multi_mps = None
         self._scratch = None
         self._rdm_cache = {}
+        self._mps_signature = None
         self.e_tot = None
         self.e_cas = None
         self.converged = False
@@ -225,6 +407,19 @@ class DMRGCI(StreamObject):
         thrds=None,
         n_sweeps=None,
         tol=None,
+        schedule_mode=None,
+        max_bond_dimension=None,
+        start_bond_dimension=None,
+        maxM=None,
+        startM=None,
+        restart=None,
+        dmrg_switch_tol=None,
+        restart_sweeps=None,
+        schedule_noise_scale=None,
+        schedule_thrd_max=None,
+        checkpoint_dir=None,
+        resume=None,
+        checkpoint_per_sweep=None,
         scratch=None,
         keep_scratch=None,
         n_threads=None,
@@ -235,12 +430,24 @@ class DMRGCI(StreamObject):
         dav_max_iter=None,
         dav_def_max_size=None,
         dav_rel_conv_thrd=None,
+        noise_type=None,
         twosite_to_onesite=None,
         random_seed=None,
         npdm_site_type=None,
         npdm_cutoff=None,
     ):
-        """Configure the active space, sweep schedule, and solver controls."""
+        """Configure the active space, sweep schedule, and solver controls.
+
+        ``schedule_mode="pyscf"`` expands the official PySCF DMRG schedule;
+        ``maxM``/``startM`` are accepted as aliases for the descriptive bond
+        dimension names. Supplying any legacy sweep arrays selects
+        ``"explicit"`` mode unless a mode was stated explicitly.
+
+        ``restart`` is a one-shot request to reuse this solver's compatible
+        MPS. The callback returned by :meth:`restart_scheduler_` controls
+        subsequent CASSCF warm starts. ``resume=True`` is distinct: it is a
+        one-shot, exact-Hamiltonian disk reload from ``checkpoint_dir``.
+        """
         self.ncas = int(ncas)
         self.nelecas = _electron_number(nelecas)
         self.nroots = int(nroots)
@@ -249,21 +456,93 @@ class DMRGCI(StreamObject):
         if self.nroots <= 0:
             raise ValueError("nroots must be positive")
 
-        if bond_dims is not None:
-            self.bond_dims = [int(x) for x in bond_dims]
-        if noises is not None:
-            self.noises = [float(x) for x in noises]
-        if thrds is not None:
-            self.thrds = [float(x) for x in thrds]
-        if not self.bond_dims or not self.noises or not self.thrds:
-            raise ValueError("bond_dims, noises, and thrds must be nonempty")
-        if min(self.bond_dims) <= 0 or min(self.noises) < 0 or min(self.thrds) <= 0:
-            raise ValueError("invalid DMRG sweep schedule")
-
-        if n_sweeps is not None:
-            self.n_sweeps = int(n_sweeps)
         if tol is not None:
             self.tol = float(tol)
+        if maxM is not None:
+            if (
+                max_bond_dimension is not None
+                and int(max_bond_dimension) != int(maxM)
+            ):
+                raise ValueError("maxM and max_bond_dimension disagree")
+            max_bond_dimension = maxM
+        if startM is not None:
+            if (
+                start_bond_dimension is not None
+                and int(start_bond_dimension) != int(startM)
+            ):
+                raise ValueError("startM and start_bond_dimension disagree")
+            start_bond_dimension = startM
+        if max_bond_dimension is not None:
+            self.max_bond_dimension = int(max_bond_dimension)
+        if start_bond_dimension is not None:
+            self.start_bond_dimension = int(start_bond_dimension)
+        if restart_sweeps is not None:
+            self.restart_sweeps = int(restart_sweeps)
+        if schedule_noise_scale is not None:
+            self.schedule_noise_scale = float(schedule_noise_scale)
+        if schedule_thrd_max is not None:
+            self.schedule_thrd_max = float(schedule_thrd_max)
+
+        explicit_controls = any(
+            value is not None
+            for value in (bond_dims, noises, thrds, n_sweeps)
+        )
+        if schedule_mode is None:
+            mode = "explicit" if explicit_controls else self.schedule_mode
+        else:
+            mode = str(schedule_mode).lower().replace("_", "-")
+            mode = {
+                "auto": "pyscf",
+                "default": "pyscf",
+                "manual": "explicit",
+            }.get(mode, mode)
+        if mode not in ("pyscf", "explicit"):
+            raise ValueError("schedule_mode must be 'pyscf' or 'explicit'")
+        if mode == "pyscf" and explicit_controls:
+            raise ValueError(
+                "explicit sweep arrays/n_sweeps cannot be combined with "
+                "schedule_mode='pyscf'"
+            )
+        self.schedule_mode = mode
+        if mode == "pyscf":
+            self.generate_schedule()
+        else:
+            # Generated schedules carry their own two-site endpoint.  It must
+            # not leak into a subsequently supplied explicit schedule.
+            self.twosite_to_onesite = None
+            if bond_dims is not None:
+                self.bond_dims = [int(x) for x in bond_dims]
+            if noises is not None:
+                self.noises = [float(x) for x in noises]
+            if thrds is not None:
+                self.thrds = [float(x) for x in thrds]
+            if n_sweeps is not None:
+                self.n_sweeps = int(n_sweeps)
+            self.max_bond_dimension = max(self.bond_dims)
+            self.schedule_sweeps = []
+            self.schedule_bond_dims = []
+            self.schedule_thrds = []
+            self.schedule_noises = []
+
+        if not self.bond_dims or not self.noises or not self.thrds:
+            raise ValueError("bond_dims, noises, and thrds must be nonempty")
+        if (
+            min(self.bond_dims) <= 0
+            or min(self.noises) < 0
+            or min(self.thrds) <= 0
+        ):
+            raise ValueError("invalid DMRG sweep schedule")
+
+        if restart is not None:
+            self.restart = bool(restart)
+        if dmrg_switch_tol is not None:
+            self.dmrg_switch_tol = float(dmrg_switch_tol)
+        if checkpoint_dir is not None:
+            self.checkpoint_dir = os.path.abspath(os.fspath(checkpoint_dir))
+        if resume is not None:
+            self.resume = bool(resume)
+        if checkpoint_per_sweep is not None:
+            self.checkpoint_per_sweep = bool(checkpoint_per_sweep)
         if scratch is not None:
             self.scratch = os.path.abspath(os.fspath(scratch))
         if keep_scratch is not None:
@@ -284,6 +563,8 @@ class DMRGCI(StreamObject):
             self.dav_def_max_size = int(dav_def_max_size)
         if dav_rel_conv_thrd is not None:
             self.dav_rel_conv_thrd = float(dav_rel_conv_thrd)
+        if noise_type is not None:
+            self.noise_type = str(noise_type)
         if twosite_to_onesite is not None:
             self.twosite_to_onesite = int(twosite_to_onesite)
         if random_seed is not None:
@@ -295,9 +576,126 @@ class DMRGCI(StreamObject):
 
         if self.n_sweeps <= 0 or self.tol <= 0:
             raise ValueError("n_sweeps and tol must be positive")
+        if self.dmrg_switch_tol <= 0 or self.restart_sweeps <= 1:
+            raise ValueError(
+                "dmrg_switch_tol must be positive and restart_sweeps >= 2"
+            )
+        if self.schedule_noise_scale < 0.0:
+            raise ValueError("schedule_noise_scale must be nonnegative")
+        if self.schedule_thrd_max is not None and self.schedule_thrd_max <= 0.0:
+            raise ValueError("schedule_thrd_max must be positive")
+        if self.resume and self.checkpoint_dir is None:
+            raise ValueError("resume=True requires checkpoint_dir")
         if self.n_threads <= 0 or self.stack_memory <= 0:
             raise ValueError("n_threads and stack_memory must be positive")
         return self
+
+    def generate_schedule(self):
+        """Generate and install the official PySCF-style cold schedule."""
+        schedule = pyscf_dmrg_schedule(
+            max_bond_dimension=self.max_bond_dimension,
+            start_bond_dimension=self.start_bond_dimension,
+            tol=self.tol,
+            restart=False,
+            restart_sweeps=self.restart_sweeps,
+            noise_scale=self.schedule_noise_scale,
+            max_davidson_threshold=self.schedule_thrd_max,
+        )
+        self.schedule_sweeps = list(schedule.anchor_sweeps)
+        self.schedule_bond_dims = list(schedule.anchor_bond_dims)
+        self.schedule_thrds = list(schedule.anchor_thrds)
+        self.schedule_noises = list(schedule.anchor_noises)
+        self.bond_dims = list(schedule.bond_dims)
+        self.thrds = list(schedule.thrds)
+        self.noises = list(schedule.noises)
+        self.n_sweeps = schedule.n_sweeps
+        self.twosite_to_onesite = schedule.twosite_to_onesite
+        return self
+
+    def clearSchedule(self):
+        """Clear generated anchor rows, matching the PySCF DMRGCI API."""
+        self.schedule_sweeps = []
+        self.schedule_bond_dims = []
+        self.schedule_thrds = []
+        self.schedule_noises = []
+        return self
+
+    @property
+    def maxM(self):
+        return self.max_bond_dimension
+
+    @maxM.setter
+    def maxM(self, value):
+        self.max_bond_dimension = int(value)
+
+    @property
+    def startM(self):
+        return self.start_bond_dimension
+
+    @startM.setter
+    def startM(self, value):
+        self.start_bond_dimension = None if value is None else int(value)
+
+    @property
+    def maxIter(self):
+        return self.n_sweeps
+
+    @maxIter.setter
+    def maxIter(self, value):
+        self.n_sweeps = int(value)
+
+    @property
+    def scheduleSweeps(self):
+        return self.schedule_sweeps
+
+    @property
+    def scheduleMaxMs(self):
+        return self.schedule_bond_dims
+
+    @property
+    def scheduleTols(self):
+        return self.schedule_thrds
+
+    @property
+    def scheduleNoises(self):
+        return self.schedule_noises
+
+    def restart_scheduler_step(self, environment):
+        """Update the next-kernel warm-start flag from one macroiteration."""
+        gradient = environment.get(
+            "norm_gorb", environment.get("orbital_gradient_norm")
+        )
+        density_change = environment.get("norm_ddm")
+        reasons = []
+        if gradient is not None and numpy.isfinite(gradient):
+            if float(gradient) < self.dmrg_switch_tol:
+                reasons.append("orbital_gradient")
+        if density_change is not None and numpy.isfinite(density_change):
+            if float(density_change) < 10.0 * self.dmrg_switch_tol:
+                reasons.append("density_change")
+        self._restart = bool(reasons)
+        self.restart_diagnostics = {
+            "enabled_for_next_kernel": self._restart,
+            "orbital_gradient_norm": (
+                None if gradient is None else float(gradient)
+            ),
+            "density_change_norm": (
+                None if density_change is None else float(density_change)
+            ),
+            "switch_tolerance": self.dmrg_switch_tol,
+            "reasons": reasons,
+        }
+        if self._restart:
+            logger.debug(
+                self,
+                "DMRG warm restart enabled for next macroiteration: %s",
+                ", ".join(reasons),
+            )
+        return self._restart
+
+    def restart_scheduler_(self):
+        """Return a PySCF callback implementing the official restart gate."""
+        return self.restart_scheduler_step
 
     @property
     def M(self):
@@ -332,8 +730,7 @@ class DMRGCI(StreamObject):
             raise ValueError("a molecule is required to identify Kramers orbitals")
         return self.kramers_adapter.set_orbitals(mol, mo_coeff, overlap)
 
-    def _release_run(self, remove_scratch=True):
-        run_scratch = self._scratch
+    def _clear_results(self):
         self._rdm_cache.clear()
         self.rdm_diagnostics.clear()
         self.kramers_diagnostics.clear()
@@ -343,8 +740,14 @@ class DMRGCI(StreamObject):
             self.kramers_adapter.clear_results()
         self.ci = None
         self.kets = None
-        self._multi_mps = None
         self._active_mpo = None
+        self._multi_mps = None
+        self._mps_signature = None
+        gc.collect()
+
+    def _release_run(self, remove_scratch=True):
+        run_scratch = self._scratch
+        self._clear_results()
         self.driver = None
         self._scratch = None
         gc.collect()
@@ -375,6 +778,259 @@ class DMRGCI(StreamObject):
         if stack_mb <= 0:
             raise ValueError("no positive memory is available to Block2")
         return int(stack_mb * 1_000_000)
+
+    @staticmethod
+    def _expanded_values(values, n_sweeps):
+        return tuple(values[min(sweep, len(values) - 1)] for sweep in range(n_sweeps))
+
+    def _schedule_snapshot(self, restart=False):
+        if restart:
+            return pyscf_dmrg_schedule(
+                max_bond_dimension=max(self.bond_dims),
+                start_bond_dimension=self.start_bond_dimension,
+                tol=self.tol,
+                restart=True,
+                restart_sweeps=self.restart_sweeps,
+                noise_scale=self.schedule_noise_scale,
+                max_davidson_threshold=self.schedule_thrd_max,
+            )
+
+        bond_dims = self._expanded_values(self.bond_dims, self.n_sweeps)
+        thrds = self._expanded_values(self.thrds, self.n_sweeps)
+        noises = self._expanded_values(self.noises, self.n_sweeps)
+        if self.schedule_sweeps:
+            anchor_sweeps = tuple(self.schedule_sweeps)
+            anchor_bond_dims = tuple(self.schedule_bond_dims)
+            anchor_thrds = tuple(self.schedule_thrds)
+            anchor_noises = tuple(self.schedule_noises)
+        else:
+            anchor_sweeps = []
+            anchor_bond_dims = []
+            anchor_thrds = []
+            anchor_noises = []
+            previous = None
+            for sweep, values in enumerate(zip(bond_dims, thrds, noises)):
+                if values != previous:
+                    anchor_sweeps.append(sweep)
+                    anchor_bond_dims.append(values[0])
+                    anchor_thrds.append(values[1])
+                    anchor_noises.append(values[2])
+                    previous = values
+            anchor_sweeps = tuple(anchor_sweeps)
+            anchor_bond_dims = tuple(anchor_bond_dims)
+            anchor_thrds = tuple(anchor_thrds)
+            anchor_noises = tuple(anchor_noises)
+        return DMRGSweepSchedule(
+            anchor_sweeps=anchor_sweeps,
+            anchor_bond_dims=anchor_bond_dims,
+            anchor_thrds=anchor_thrds,
+            anchor_noises=anchor_noises,
+            bond_dims=bond_dims,
+            thrds=thrds,
+            noises=noises,
+            n_sweeps=self.n_sweeps,
+            twosite_to_onesite=self.twosite_to_onesite,
+            restart=False,
+        )
+
+    def _state_average_weights(self, nroots):
+        if nroots == 1:
+            return numpy.ones(1, dtype=float)
+        weights = numpy.asarray(
+            getattr(self, "weights", numpy.ones(nroots) / nroots),
+            dtype=float,
+        )
+        if weights.shape != (nroots,) or not numpy.all(numpy.isfinite(weights)):
+            raise ValueError(
+                "state-average weights must be one finite value per root"
+            )
+        if numpy.any(weights <= 0.0) or weights.sum() <= 0.0:
+            raise ValueError("state-average weights must be positive")
+        return weights / weights.sum()
+
+    @staticmethod
+    def _wavefunction_problem(norb, nelec, nroots, weights):
+        return (
+            "SGFCPX",
+            int(norb),
+            int(nelec),
+            int(nroots),
+            tuple(float(value) for value in weights),
+        )
+
+    def _checkpoint_problem(
+        self, h1e, eri, norb, nelec, nroots, weights, ecore
+    ):
+        structural = {
+            "symmetry": "SGFCPX",
+            "norb": int(norb),
+            "nelec": int(nelec),
+            "nroots": int(nroots),
+            "weights": [float(value) for value in weights],
+        }
+        controls = {
+            "ecore": float(ecore),
+            "mpo_cutoff": float(self.cutoff),
+            "integral_cutoff": float(self.integral_cutoff),
+        }
+        digest = hashlib.sha256()
+        digest.update(
+            json.dumps(
+                {"structural": structural, "controls": controls},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        for name, values in (("h1e", h1e), ("eri", eri)):
+            array = numpy.ascontiguousarray(values)
+            digest.update(name.encode("ascii"))
+            digest.update(array.dtype.str.encode("ascii"))
+            digest.update(repr(array.shape).encode("ascii"))
+            digest.update(array.view(numpy.uint8))
+        return {
+            "structural": structural,
+            "controls": controls,
+            "hamiltonian_sha256": digest.hexdigest(),
+        }
+
+    def _checkpoint_paths(self):
+        if self.checkpoint_dir is None:
+            return None, None, None
+        root = os.path.abspath(self.checkpoint_dir)
+        return (
+            os.path.join(root, "dmrgci-checkpoint.json"),
+            os.path.join(root, "mps"),
+            os.path.join(root, "sweeps"),
+        )
+
+    @staticmethod
+    def _read_json(path):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+        except FileNotFoundError:
+            return None
+
+    @staticmethod
+    def _write_json_atomic(path, payload):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = "%s.tmp-%d" % (path, os.getpid())
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temporary, path)
+
+    def _load_checkpoint(self, problem, required=False):
+        manifest_path, mps_path, _ = self._checkpoint_paths()
+        if manifest_path is None:
+            if required:
+                raise ValueError("checkpoint resume requested without checkpoint_dir")
+            return None
+        manifest = self._read_json(manifest_path)
+        if manifest is None:
+            if required:
+                raise FileNotFoundError(
+                    "no DMRG checkpoint manifest at %s" % manifest_path
+                )
+            return None
+        if (
+            manifest.get("format") != "socutils.dmrgci.checkpoint"
+            or manifest.get("version") != 1
+        ):
+            raise ValueError("unsupported DMRG checkpoint format")
+        stored = manifest.get("problem", {})
+        if stored.get("hamiltonian_sha256") != problem["hamiltonian_sha256"]:
+            raise ValueError(
+                "DMRG checkpoint Hamiltonian fingerprint does not match"
+            )
+        info_paths = (
+            os.path.join(mps_path, "GS-mps_info.bin"),
+            os.path.join(mps_path, "mps_info.bin"),
+        )
+        if not any(os.path.isfile(path) for path in info_paths):
+            if required:
+                raise FileNotFoundError("DMRG checkpoint contains no loadable MPS")
+            return None
+        return manifest
+
+    def _begin_checkpoint(self, problem, run_mode):
+        manifest_path, mps_path, sweeps_path = self._checkpoint_paths()
+        if manifest_path is None:
+            return None, None
+        previous = self._read_json(manifest_path)
+        previous_structure = (
+            None
+            if previous is None
+            else previous.get("problem", {}).get("structural")
+        )
+        if previous_structure not in (None, problem["structural"]):
+            if os.path.isdir(mps_path):
+                shutil.rmtree(mps_path)
+            if os.path.isdir(sweeps_path):
+                shutil.rmtree(sweeps_path)
+        os.makedirs(mps_path, exist_ok=True)
+        per_sweep = None
+        if self.checkpoint_per_sweep:
+            per_sweep = os.path.join(
+                sweeps_path, problem["hamiltonian_sha256"]
+            )
+            os.makedirs(per_sweep, exist_ok=True)
+        manifest = {
+            "format": "socutils.dmrgci.checkpoint",
+            "version": 1,
+            "status": "running",
+            "mps_tag": "GS",
+            "problem": problem,
+            "run_mode": run_mode,
+        }
+        self._write_json_atomic(manifest_path, manifest)
+        return mps_path, per_sweep
+
+    def _complete_checkpoint(self, schedule, run_mode):
+        manifest_path, _, _ = self._checkpoint_paths()
+        if manifest_path is None:
+            return
+        manifest = self._read_json(manifest_path)
+        if manifest is None:
+            return
+        manifest.update(
+            {
+                "status": "complete",
+                "run_mode": run_mode,
+                "converged": bool(self.converged),
+                "energies": numpy.asarray(self.e_tot).tolist(),
+                "schedule": schedule.as_dict(),
+            }
+        )
+        self._write_json_atomic(manifest_path, manifest)
+
+    @staticmethod
+    def _copy_checkpoint_mps(source, destination):
+        if not os.path.isdir(source):
+            raise FileNotFoundError("DMRG checkpoint MPS directory is missing")
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+
+    @staticmethod
+    def _copy_internal_mps(source, destination, tag="GS"):
+        """Copy one saved MPS image without carrying an obsolete MPO."""
+        if not os.path.isdir(source):
+            raise FileNotFoundError("internal DMRG MPS directory is missing")
+        copied_info = False
+        os.makedirs(destination, exist_ok=True)
+        for name in os.listdir(source):
+            path = os.path.join(source, name)
+            if not os.path.isfile(path):
+                continue
+            if (
+                name == "mps_info.bin"
+                or name.startswith(tag + "-")
+                or (".%s." % tag) in name
+            ):
+                shutil.copy2(path, os.path.join(destination, name))
+                if name in ("mps_info.bin", "%s-mps_info.bin" % tag):
+                    copied_info = True
+        if not copied_info:
+            raise FileNotFoundError("internal DMRG state contains no MPS info")
 
     def _validate_problem(self, norb, nelec, nroots):
         nelec = _electron_number(nelec)
@@ -418,46 +1074,117 @@ class DMRGCI(StreamObject):
             nroots = self.nroots
         nroots = int(nroots)
         nelec = self._validate_problem(norb, nelec, nroots)
+        weights = self._state_average_weights(nroots)
+        wavefunction_problem = self._wavefunction_problem(
+            norb, nelec, nroots, weights
+        )
         effective_dav_type = self.dav_type
-        effective_twosite_to_onesite = self.twosite_to_onesite
-        if (
-            nroots > 1
-            and int(norb) > 2
-            and effective_twosite_to_onesite is None
-        ):
-            # Retain two two-site sweeps for initial optimization and leave at
-            # least one one-site sweep even for deliberately short schedules.
-            effective_twosite_to_onesite = 2 if self.n_sweeps >= 3 else 0
         h1_block2, eri_block2 = block2_integrals(h1e, eri, norb)
         ecore_value = _real_energy(ecore)
         if numpy.asarray(ecore_value).ndim != 0:
             raise ValueError("ecore must be a scalar")
         ecore_value = float(ecore_value)
+        checkpoint_problem = self._checkpoint_problem(
+            h1_block2,
+            eri_block2,
+            norb,
+            nelec,
+            nroots,
+            weights,
+            ecore_value,
+        )
+
+        resume_checkpoint = bool(self.resume)
+        if resume_checkpoint:
+            self._load_checkpoint(checkpoint_problem, required=True)
+        restart_requested = bool(self.restart or self._restart)
+        in_memory_compatible = bool(
+            self.driver is not None
+            and self._multi_mps is not None
+            and self._mps_signature == wavefunction_problem
+        )
+        use_internal_mps = (
+            restart_requested
+            and in_memory_compatible
+            and not resume_checkpoint
+        )
+        if resume_checkpoint:
+            run_mode = "checkpoint-resume"
+        elif use_internal_mps:
+            run_mode = "casscf-warm-start"
+        else:
+            run_mode = "cold-start"
+        if restart_requested and run_mode == "cold-start":
+            logger.warn(
+                self,
+                "DMRG restart was requested but no compatible internal MPS "
+                "exists; falling back to the full cold schedule",
+            )
         if ci0 is not None:
             logger.debug(
                 self,
-                "Ignoring ci0: an MPS is not reused without a validated orbital-basis transform",
+                "Ignoring external ci0; DMRG restart accepts only the solver's "
+                "validated internal MPS or a fingerprinted checkpoint",
             )
 
-        self._release_run(remove_scratch=True)
+        schedule = self._schedule_snapshot(
+            restart=run_mode != "cold-start"
+        )
+        effective_twosite_to_onesite = schedule.twosite_to_onesite
+        if (
+            run_mode == "cold-start"
+            and nroots > 1
+            and int(norb) > 2
+            and effective_twosite_to_onesite is None
+        ):
+            # Retain two two-site sweeps for initial optimization and leave at
+            # least one one-site sweep even for deliberately short schedules.
+            effective_twosite_to_onesite = (
+                2 if schedule.n_sweeps >= 3 else 0
+            )
+
+        if run_mode == "cold-start":
+            self._release_run(remove_scratch=True)
+            os.makedirs(self.scratch, exist_ok=True)
+            run_scratch = tempfile.mkdtemp(prefix="dmrgci_", dir=self.scratch)
+            self._scratch = run_scratch
+        else:
+            os.makedirs(self.scratch, exist_ok=True)
+            run_scratch = tempfile.mkdtemp(prefix="dmrgci_", dir=self.scratch)
+            try:
+                if resume_checkpoint:
+                    _, checkpoint_mps, _ = self._checkpoint_paths()
+                    self._copy_checkpoint_mps(checkpoint_mps, run_scratch)
+                else:
+                    self._copy_internal_mps(self._scratch, run_scratch)
+            except Exception:
+                shutil.rmtree(run_scratch)
+                raise
+            self._release_run(remove_scratch=True)
+            self._scratch = run_scratch
+        driver = None
+        ket = None
+
         self.e_tot = None
         self.e_cas = None
         self.converged = False
         self.convergence_info = {}
-        os.makedirs(self.scratch, exist_ok=True)
-        run_scratch = tempfile.mkdtemp(prefix="dmrgci_", dir=self.scratch)
-        self._scratch = run_scratch
         iprint = 1 if logger.new_logger(self, verbose).verbose >= logger.NOTE else 0
         stack_bytes = self._stack_bytes(max_memory)
 
         self.dump_flags(verbose=verbose)
         try:
+            checkpoint_mps, checkpoint_sweeps = self._begin_checkpoint(
+                checkpoint_problem, run_mode
+            )
             driver = DMRGDriver(
                 stack_mem=stack_bytes,
                 scratch=run_scratch,
                 clean_scratch=True,
                 symm_type=SymmetryTypes.SGFCPX,
                 n_threads=self.n_threads,
+                restart_dir=checkpoint_mps,
+                restart_dir_per_sweep=checkpoint_sweeps,
             )
             driver.bw.b.Random.rand_seed(self.random_seed)
             driver.initialize_system(
@@ -465,6 +1192,8 @@ class DMRGCI(StreamObject):
                 n_elec=nelec,
                 orb_sym=[0] * int(norb),
             )
+            if run_mode != "cold-start":
+                ket = driver.load_mps("GS", nroots=nroots)
             mpo = driver.get_qc_mpo(
                 h1e=h1_block2,
                 g2e=eri_block2,
@@ -474,11 +1203,11 @@ class DMRGCI(StreamObject):
                 iprint=iprint,
             )
             dmrg_kwargs = {
-                "n_sweeps": self.n_sweeps,
+                "n_sweeps": schedule.n_sweeps,
                 "tol": self.tol,
-                "bond_dims": self.bond_dims,
-                "noises": self.noises,
-                "thrds": self.thrds,
+                "bond_dims": list(schedule.bond_dims),
+                "noises": list(schedule.noises),
+                "thrds": list(schedule.thrds),
                 "iprint": iprint,
                 "dav_type": effective_dav_type,
                 "dav_max_iter": self.dav_max_iter,
@@ -488,39 +1217,32 @@ class DMRGCI(StreamObject):
                 "twosite_to_onesite": effective_twosite_to_onesite,
                 "real_density_matrix": False,
             }
+            if self.noise_type is not None:
+                dmrg_kwargs["noise_type"] = self.noise_type
             run_records = []
-            ket = driver.get_random_mps(
-                tag="GS",
-                bond_dim=self.bond_dims[0],
-                nroots=nroots,
-            )
-            if nroots > 1:
-                weights = numpy.asarray(
-                    getattr(self, "weights", numpy.ones(nroots) / nroots),
-                    dtype=float,
+            if ket is None:
+                ket = driver.get_random_mps(
+                    tag="GS",
+                    bond_dim=schedule.bond_dims[0],
+                    nroots=nroots,
                 )
-                if weights.shape != (nroots,) or not numpy.all(
-                    numpy.isfinite(weights)
-                ):
-                    raise ValueError(
-                        "state-average weights must be one finite value per root"
-                    )
-                if numpy.any(weights <= 0.0) or weights.sum() <= 0.0:
-                    raise ValueError("state-average weights must be positive")
-                weights = weights / weights.sum()
+            elif run_mode != "cold-start":
+                ket, forward = driver.adjust_mps(ket, dot=1)
+                dmrg_kwargs["forward"] = forward
+            if nroots > 1:
                 ket.weights = driver.bw.VectorFP(weights.tolist())
             energy = driver.dmrg(mpo, ket, **dmrg_kwargs)
-            run_records.append(self._capture_dmrg_run(driver))
+            run_records.append(self._capture_dmrg_run(driver, schedule))
             if nroots > 1:
                 kets = [
                     driver.split_mps(ket, root, tag="KET-%d" % root)
                     for root in range(nroots)
                 ]
                 ci = kets
-                self._multi_mps = ket
             else:
                 kets = [ket]
                 ci = ket
+            self._multi_mps = ket
 
             if nroots > 1:
                 identity_mpo = driver.get_identity_mpo()
@@ -562,7 +1284,7 @@ class DMRGCI(StreamObject):
                 )
                 root_validation_tolerance = max(
                     1e-7,
-                    10.0 * math.sqrt(min(self.thrds)),
+                    10.0 * math.sqrt(min(schedule.thrds)),
                     10.0 * self.tol,
                 )
                 if max(
@@ -582,6 +1304,7 @@ class DMRGCI(StreamObject):
             self._active_mpo = mpo
             self.kets = kets
             self.ci = ci
+            self._mps_signature = wavefunction_problem
             self.nroots = nroots
             self.ncas = int(norb)
             self.nelecas = nelec
@@ -592,6 +1315,20 @@ class DMRGCI(StreamObject):
                 {
                     "constant_energy_shift": ecore_value,
                     "sweep_energy_origin": "active-space Hamiltonian without ecore",
+                    "run_mode": run_mode,
+                    "restart_transport": (
+                        None
+                        if run_mode == "cold-start"
+                        else "fresh-driver-mps-reload"
+                    ),
+                    "restart_requested": restart_requested,
+                    "schedule_mode": self.schedule_mode,
+                    "schedule": schedule.as_dict(),
+                    "checkpoint_dir": self.checkpoint_dir,
+                    "checkpoint_fingerprint": checkpoint_problem[
+                        "hamiltonian_sha256"
+                    ],
+                    "restart_scheduler": dict(self.restart_diagnostics),
                 }
             )
             if nroots > 1:
@@ -608,13 +1345,20 @@ class DMRGCI(StreamObject):
                 self.convergence_info["root_eigen_equation_error"] = (
                     root_eigen_equation_error
                 )
+            self._complete_checkpoint(schedule, run_mode)
+            if self.restart:
+                self.restart = False
+            if self.resume:
+                self.resume = False
             return self.e_tot, self.ci
         except Exception:
             self._release_run(remove_scratch=True)
             raise
 
-    def _capture_dmrg_run(self, driver):
+    def _capture_dmrg_run(self, driver, schedule=None):
         """Copy convergence data before a subsequent root overwrites it."""
+        if schedule is None:
+            schedule = self._schedule_snapshot(restart=False)
         history = [_history_row(row) for row in driver._dmrg.energies]
         nsweep = len(history)
         if nsweep >= 2:
@@ -622,8 +1366,12 @@ class DMRGCI(StreamObject):
         else:
             energy_change = numpy.inf
         schedule_index = max(nsweep - 1, 0)
-        final_noise = self.noises[min(schedule_index, len(self.noises) - 1)]
-        final_thrd = self.thrds[min(schedule_index, len(self.thrds) - 1)]
+        final_noise = schedule.noises[
+            min(schedule_index, len(schedule.noises) - 1)
+        ]
+        final_thrd = schedule.thrds[
+            min(schedule_index, len(schedule.thrds) - 1)
+        ]
         discarded = numpy.asarray(
             list(driver._dmrg.discarded_weights), dtype=float
         )
@@ -865,14 +1613,29 @@ class DMRGCI(StreamObject):
         log.info("ncas                         = %s", self.ncas)
         log.info("nelecas                      = %s", self.nelecas)
         log.info("nroots                       = %d", self.nroots)
+        log.info("schedule mode                = %s", self.schedule_mode)
+        log.info("schedule anchor sweeps       = %s", self.schedule_sweeps)
+        log.info("schedule anchor M            = %s", self.schedule_bond_dims)
+        log.info("schedule anchor thresholds   = %s", self.schedule_thrds)
+        log.info("schedule anchor noises       = %s", self.schedule_noises)
         log.info("bond dimensions              = %s", self.bond_dims)
         log.info("noises                       = %s", self.noises)
         log.info("Davidson squared residuals   = %s", self.thrds)
+        log.info("two-site to one-site sweep   = %s", self.twosite_to_onesite)
+        log.info("restart / scheduled restart  = %s / %s", self.restart, self._restart)
+        log.info("restart switch tolerance     = %g", self.dmrg_switch_tol)
+        log.info("restart sweeps               = %d", self.restart_sweeps)
+        log.info("schedule noise scale         = %g", self.schedule_noise_scale)
+        log.info("schedule Davidson thrd max   = %s", self.schedule_thrd_max)
         log.info("Davidson max iterations      = %d", self.dav_max_iter)
+        log.info("noise type                   = %s", self.noise_type)
         log.info("n_threads                    = %d", self.n_threads)
         log.info("stack memory cap             = %.1f MB", self.stack_memory)
         log.info("scratch parent               = %s", self.scratch)
         log.info("keep scratch                 = %s", self.keep_scratch)
+        log.info("checkpoint directory         = %s", self.checkpoint_dir)
+        log.info("resume checkpoint            = %s", self.resume)
+        log.info("checkpoint each sweep        = %s", self.checkpoint_per_sweep)
         log.info("energy tolerance             = %g", self.tol)
         log.info("maximum sweeps               = %d", self.n_sweeps)
         log.info("NPDM site type/cutoff        = %d / %g", self.npdm_site_type, self.npdm_cutoff)

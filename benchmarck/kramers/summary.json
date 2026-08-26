@@ -87,80 +87,80 @@
       "energy_change_eh": null,
       "macro_iteration": 0,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.5090401683854618,
-      "total_energy_eh": -99.38144062096363
+      "orbital_gradient_norm": 0.5090401683854613,
+      "total_energy_eh": -99.38144062096364
     },
     {
       "converged": false,
       "element": "F",
-      "energy_change_eh": -0.08997913248553857,
+      "energy_change_eh": -0.08997913248552436,
       "macro_iteration": 1,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.1693929086861834,
+      "orbital_gradient_norm": 0.16939290868618215,
       "total_energy_eh": -99.47141975344917
     },
     {
       "converged": false,
       "element": "F",
-      "energy_change_eh": -0.014108284441789465,
+      "energy_change_eh": -0.014108284441846308,
       "macro_iteration": 2,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.050484461769726034,
-      "total_energy_eh": -99.48552803789096
+      "orbital_gradient_norm": 0.050484461769729615,
+      "total_energy_eh": -99.48552803789102
     },
     {
       "converged": false,
       "element": "F",
-      "energy_change_eh": -0.00046435696572189045,
+      "energy_change_eh": -0.0004643569657076796,
       "macro_iteration": 3,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.0036854425007616194,
-      "total_energy_eh": -99.48599239485668
+      "orbital_gradient_norm": 0.003685442500774472,
+      "total_energy_eh": -99.48599239485672
     },
     {
       "converged": false,
       "element": "F",
-      "energy_change_eh": -5.522955746073421e-06,
+      "energy_change_eh": -5.5229556892300025e-06,
       "macro_iteration": 4,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.001620093465488053,
-      "total_energy_eh": -99.48599791781243
+      "orbital_gradient_norm": 0.0016200934654913442,
+      "total_energy_eh": -99.48599791781241
     },
     {
       "converged": false,
       "element": "F",
-      "energy_change_eh": -4.748231390294677e-07,
+      "energy_change_eh": -4.748231532403224e-07,
       "macro_iteration": 5,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.0006451598442595068,
+      "orbital_gradient_norm": 0.0006451598442548238,
       "total_energy_eh": -99.48599839263557
     },
     {
       "converged": false,
       "element": "F",
-      "energy_change_eh": -9.129826139542274e-08,
+      "energy_change_eh": -9.129828981713217e-08,
       "macro_iteration": 6,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.0003110980707156014,
-      "total_energy_eh": -99.48599848393383
+      "orbital_gradient_norm": 0.00031109807071658644,
+      "total_energy_eh": -99.48599848393386
     },
     {
       "converged": false,
       "element": "F",
-      "energy_change_eh": -1.9141822349411086e-08,
+      "energy_change_eh": -1.9141850771120517e-08,
       "macro_iteration": 7,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.00014093174035935264,
-      "total_energy_eh": -99.48599850307565
+      "orbital_gradient_norm": 0.00014093174036775043,
+      "total_energy_eh": -99.4859985030757
     },
     {
       "converged": true,
       "element": "F",
-      "energy_change_eh": -4.080504822923103e-09,
+      "energy_change_eh": -4.080476401213673e-09,
       "macro_iteration": 8,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 6.586259002798369e-05,
-      "total_energy_eh": -99.48599850715615
+      "orbital_gradient_norm": 6.586259002888892e-05,
+      "total_energy_eh": -99.48599850715618
     },
     {
       "converged": false,
@@ -240,7 +240,7 @@
       "energy_change_eh": null,
       "macro_iteration": 0,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.23719301373321022,
+      "orbital_gradient_norm": 0.23719301373321067,
       "total_energy_eh": -460.8417259728208
     },
     {
@@ -249,26 +249,26 @@
       "energy_change_eh": -0.03851862369663195,
       "macro_iteration": 1,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.08467681915148242,
+      "orbital_gradient_norm": 0.08467681915147938,
       "total_energy_eh": -460.88024459651746
     },
     {
       "converged": false,
       "element": "Cl",
-      "energy_change_eh": -0.006612367781826833,
+      "energy_change_eh": -0.006612367781997364,
       "macro_iteration": 2,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.023787169521207983,
-      "total_energy_eh": -460.8868569642993
+      "orbital_gradient_norm": 0.02378716952119991,
+      "total_energy_eh": -460.88685696429945
     },
     {
       "converged": false,
       "element": "Cl",
-      "energy_change_eh": -0.0003412561173377071,
+      "energy_change_eh": -0.00034125611739455053,
       "macro_iteration": 3,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.004198776096279985,
-      "total_energy_eh": -460.8871982204166
+      "orbital_gradient_norm": 0.004198776096287495,
+      "total_energy_eh": -460.88719822041685
     },
     {
       "converged": false,
@@ -276,35 +276,35 @@
       "energy_change_eh": -5.263941261546279e-06,
       "macro_iteration": 4,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.0008059722403142122,
-      "total_energy_eh": -460.8872034843579
+      "orbital_gradient_norm": 0.0008059722403316734,
+      "total_energy_eh": -460.8872034843581
     },
     {
       "converged": false,
       "element": "Cl",
-      "energy_change_eh": -2.1838116026628995e-07,
+      "energy_change_eh": -2.1838127395312767e-07,
       "macro_iteration": 5,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.00022590435871352286,
-      "total_energy_eh": -460.88720370273904
+      "orbital_gradient_norm": 0.00022590435871998083,
+      "total_energy_eh": -460.8872037027394
     },
     {
       "converged": false,
       "element": "Cl",
-      "energy_change_eh": -1.4330339581647422e-08,
+      "energy_change_eh": -1.4329771147458814e-08,
       "macro_iteration": 6,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 5.80919331188522e-05,
-      "total_energy_eh": -460.8872037170694
+      "orbital_gradient_norm": 5.809193313066377e-05,
+      "total_energy_eh": -460.88720371706916
     },
     {
       "converged": true,
       "element": "Cl",
-      "energy_change_eh": -1.0486473911441863e-09,
+      "energy_change_eh": -1.0492158253327943e-09,
       "macro_iteration": 7,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 1.6622729833392575e-05,
-      "total_energy_eh": -460.88720371811803
+      "orbital_gradient_norm": 1.6622729836108017e-05,
+      "total_energy_eh": -460.88720371811837
     },
     {
       "converged": false,
@@ -375,35 +375,35 @@
       "energy_change_eh": null,
       "macro_iteration": 0,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.20355661917500087,
+      "orbital_gradient_norm": 0.20355661917500026,
       "total_energy_eh": -2604.319896588757
     },
     {
       "converged": false,
       "element": "Br",
-      "energy_change_eh": -0.03151041991532111,
+      "energy_change_eh": -0.031510419915775856,
       "macro_iteration": 1,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.0741890612839965,
-      "total_energy_eh": -2604.351407008672
+      "orbital_gradient_norm": 0.0741890612839974,
+      "total_energy_eh": -2604.3514070086726
     },
     {
       "converged": false,
       "element": "Br",
-      "energy_change_eh": -0.006078067454836855,
+      "energy_change_eh": -0.006078067454382108,
       "macro_iteration": 2,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.026473581485008682,
+      "orbital_gradient_norm": 0.026473581485000418,
       "total_energy_eh": -2604.357485076127
     },
     {
       "converged": false,
       "element": "Br",
-      "energy_change_eh": -0.0004642476014851127,
+      "energy_change_eh": -0.0004642476023946074,
       "macro_iteration": 3,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.0043979047799383554,
-      "total_energy_eh": -2604.3579493237285
+      "orbital_gradient_norm": 0.004397904779965364,
+      "total_energy_eh": -2604.3579493237294
     },
     {
       "converged": false,
@@ -411,8 +411,8 @@
       "energy_change_eh": -4.577424988383427e-06,
       "macro_iteration": 4,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.0003996874146452282,
-      "total_energy_eh": -2604.3579539011535
+      "orbital_gradient_norm": 0.0003996874146321465,
+      "total_energy_eh": -2604.3579539011544
     },
     {
       "converged": false,
@@ -420,17 +420,17 @@
       "energy_change_eh": -8.413735486101359e-08,
       "macro_iteration": 5,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 8.378498912271536e-05,
-      "total_energy_eh": -2604.357953985291
+      "orbital_gradient_norm": 8.378498906108215e-05,
+      "total_energy_eh": -2604.3579539852917
     },
     {
       "converged": true,
       "element": "Br",
-      "energy_change_eh": -3.192326403222978e-09,
+      "energy_change_eh": -3.1927811505738646e-09,
       "macro_iteration": 6,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 2.3944361700533307e-05,
-      "total_energy_eh": -2604.357953988483
+      "orbital_gradient_norm": 2.394436167292047e-05,
+      "total_energy_eh": -2604.3579539884845
     },
     {
       "converged": false,
@@ -501,7 +501,7 @@
       "energy_change_eh": null,
       "macro_iteration": 0,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.16609738476396324,
+      "orbital_gradient_norm": 0.1660973847639631,
       "total_energy_eh": -7111.677498872418
     },
     {
@@ -510,53 +510,53 @@
       "energy_change_eh": -0.0228680335530953,
       "macro_iteration": 1,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.06238839865339926,
+      "orbital_gradient_norm": 0.062388398653395453,
       "total_energy_eh": -7111.700366905971
     },
     {
       "converged": false,
       "element": "I",
-      "energy_change_eh": -0.0048188777600444155,
+      "energy_change_eh": -0.004818877759134921,
       "macro_iteration": 2,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.024096026073944787,
-      "total_energy_eh": -7111.705185783731
+      "orbital_gradient_norm": 0.02409602607393961,
+      "total_energy_eh": -7111.7051857837305
     },
     {
       "converged": false,
       "element": "I",
-      "energy_change_eh": -0.00046286784527183045,
+      "energy_change_eh": -0.00046286784709081985,
       "macro_iteration": 3,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.003630659225915858,
-      "total_energy_eh": -7111.705648651577
+      "orbital_gradient_norm": 0.0036306592257721714,
+      "total_energy_eh": -7111.705648651578
     },
     {
       "converged": false,
       "element": "I",
-      "energy_change_eh": -5.058762326370925e-06,
+      "energy_change_eh": -5.058760507381521e-06,
       "macro_iteration": 4,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.00047609842110444943,
-      "total_energy_eh": -7111.705653710339
+      "orbital_gradient_norm": 0.0004760984212303546,
+      "total_energy_eh": -7111.705653710338
     },
     {
       "converged": false,
       "element": "I",
-      "energy_change_eh": -1.2042528396705166e-07,
+      "energy_change_eh": -1.2042619346175343e-07,
       "macro_iteration": 5,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 7.647656666094117e-05,
+      "orbital_gradient_norm": 7.647656665124527e-05,
       "total_energy_eh": -7111.705653830764
     },
     {
       "converged": true,
       "element": "I",
-      "energy_change_eh": -4.6948116505518556e-09,
+      "energy_change_eh": -4.6966306399554014e-09,
       "macro_iteration": 6,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 1.5491790034538137e-05,
-      "total_energy_eh": -7111.705653835459
+      "orbital_gradient_norm": 1.5491790045516307e-05,
+      "total_energy_eh": -7111.705653835461
     },
     {
       "converged": false,
@@ -636,7 +636,7 @@
       "energy_change_eh": null,
       "macro_iteration": 0,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.15647458118659835,
+      "orbital_gradient_norm": 0.15647458118659752,
       "total_energy_eh": -22855.595344721944
     },
     {
@@ -645,34 +645,34 @@
       "energy_change_eh": -0.020137676037847996,
       "macro_iteration": 1,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.057146544546468496,
+      "orbital_gradient_norm": 0.05714654454645328,
       "total_energy_eh": -22855.61548239798
     },
     {
       "converged": false,
       "element": "At",
-      "energy_change_eh": -0.004212099564028904,
+      "energy_change_eh": -0.004212099560390925,
       "macro_iteration": 2,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.023709534511887585,
-      "total_energy_eh": -22855.619694497545
+      "orbital_gradient_norm": 0.023709534511906275,
+      "total_energy_eh": -22855.61969449754
     },
     {
       "converged": false,
       "element": "At",
-      "energy_change_eh": -0.0004651856615964789,
+      "energy_change_eh": -0.0004651856543205213,
       "macro_iteration": 3,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.003935711410892571,
-      "total_energy_eh": -22855.620159683207
+      "orbital_gradient_norm": 0.0039357114108479856,
+      "total_energy_eh": -22855.620159683196
     },
     {
       "converged": false,
       "element": "At",
-      "energy_change_eh": -8.625003829365596e-06,
+      "energy_change_eh": -8.625014743302017e-06,
       "macro_iteration": 4,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.0007494342021595104,
+      "orbital_gradient_norm": 0.0007494342020772791,
       "total_energy_eh": -22855.62016830821
     },
     {
@@ -681,29 +681,29 @@
       "energy_change_eh": -3.821551217697561e-07,
       "macro_iteration": 5,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 0.00021154505894831755,
+      "orbital_gradient_norm": 0.00021154505884795363,
       "total_energy_eh": -22855.620168690366
     },
     {
       "converged": false,
       "element": "At",
-      "energy_change_eh": -2.6615452952682972e-08,
+      "energy_change_eh": -2.6622728910297155e-08,
       "macro_iteration": 6,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 7.890197705966571e-05,
-      "total_energy_eh": -22855.62016871698
+      "orbital_gradient_norm": 7.890197703570902e-05,
+      "total_energy_eh": -22855.62016871699
     },
     {
       "converged": true,
       "element": "At",
-      "energy_change_eh": -2.572051016613841e-09,
+      "energy_change_eh": -2.5756889954209328e-09,
       "macro_iteration": 7,
       "method": "dmrg-superci",
-      "orbital_gradient_norm": 3.394256445608628e-05,
-      "total_energy_eh": -22855.620168719553
+      "orbital_gradient_norm": 3.394256437582132e-05,
+      "total_energy_eh": -22855.620168719564
     }
   ],
-  "protocol_version": 5,
+  "protocol_version": 7,
   "states": [
     {
       "element": "F",
@@ -743,37 +743,37 @@
     },
     {
       "element": "F",
-      "energy_eh": -99.4868657490864,
+      "energy_eh": -99.48686574909078,
       "method": "dmrg-superci",
       "state": 1
     },
     {
       "element": "F",
-      "energy_eh": -99.48686574908459,
+      "energy_eh": -99.48686574908757,
       "method": "dmrg-superci",
       "state": 2
     },
     {
       "element": "F",
-      "energy_eh": -99.48686574908378,
+      "energy_eh": -99.48686574908032,
       "method": "dmrg-superci",
       "state": 3
     },
     {
       "element": "F",
-      "energy_eh": -99.48686574908038,
+      "energy_eh": -99.48686574907651,
       "method": "dmrg-superci",
       "state": 4
     },
     {
       "element": "F",
-      "energy_eh": -99.48426402330762,
+      "energy_eh": -99.48426402330819,
       "method": "dmrg-superci",
       "state": 5
     },
     {
       "element": "F",
-      "energy_eh": -99.48426402329429,
+      "energy_eh": -99.48426402329379,
       "method": "dmrg-superci",
       "state": 6
     },
@@ -815,37 +815,37 @@
     },
     {
       "element": "Cl",
-      "energy_eh": -460.8887723526727,
+      "energy_eh": -460.88877235267734,
       "method": "dmrg-superci",
       "state": 1
     },
     {
       "element": "Cl",
-      "energy_eh": -460.8887723526674,
+      "energy_eh": -460.8887723526675,
       "method": "dmrg-superci",
       "state": 2
     },
     {
       "element": "Cl",
-      "energy_eh": -460.8887723526641,
+      "energy_eh": -460.8887723526644,
       "method": "dmrg-superci",
       "state": 3
     },
     {
       "element": "Cl",
-      "energy_eh": -460.8887723526637,
+      "energy_eh": -460.8887723526598,
       "method": "dmrg-superci",
       "state": 4
     },
     {
       "element": "Cl",
-      "energy_eh": -460.88406644902227,
+      "energy_eh": -460.88406644902267,
       "method": "dmrg-superci",
       "state": 5
     },
     {
       "element": "Cl",
-      "energy_eh": -460.88406644901846,
+      "energy_eh": -460.8840664490187,
       "method": "dmrg-superci",
       "state": 6
     },
@@ -887,37 +887,37 @@
     },
     {
       "element": "Br",
-      "energy_eh": -2604.363617372415,
+      "energy_eh": -2604.3636173724503,
       "method": "dmrg-superci",
       "state": 1
     },
     {
       "element": "Br",
-      "energy_eh": -2604.3636173724067,
+      "energy_eh": -2604.3636173724235,
       "method": "dmrg-superci",
       "state": 2
     },
     {
       "element": "Br",
-      "energy_eh": -2604.3636173724058,
+      "energy_eh": -2604.3636173724076,
       "method": "dmrg-superci",
       "state": 3
     },
     {
       "element": "Br",
-      "energy_eh": -2604.3636173724017,
+      "energy_eh": -2604.3636173723535,
       "method": "dmrg-superci",
       "state": 4
     },
     {
       "element": "Br",
-      "energy_eh": -2604.3466272206374,
+      "energy_eh": -2604.346627220639,
       "method": "dmrg-superci",
       "state": 5
     },
     {
       "element": "Br",
-      "energy_eh": -2604.3466272206315,
+      "energy_eh": -2604.346627220633,
       "method": "dmrg-superci",
       "state": 6
     },
@@ -959,37 +959,37 @@
     },
     {
       "element": "I",
-      "energy_eh": -7111.716520647897,
+      "energy_eh": -7111.716520647944,
       "method": "dmrg-superci",
       "state": 1
     },
     {
       "element": "I",
-      "energy_eh": -7111.716520647815,
+      "energy_eh": -7111.7165206478,
       "method": "dmrg-superci",
       "state": 2
     },
     {
       "element": "I",
-      "energy_eh": -7111.71652064781,
+      "energy_eh": -7111.716520647791,
       "method": "dmrg-superci",
       "state": 3
     },
     {
       "element": "I",
-      "energy_eh": -7111.716520647609,
+      "energy_eh": -7111.716520647599,
       "method": "dmrg-superci",
       "state": 4
     },
     {
       "element": "I",
-      "energy_eh": -7111.68392021082,
+      "energy_eh": -7111.683920210826,
       "method": "dmrg-superci",
       "state": 5
     },
     {
       "element": "I",
-      "energy_eh": -7111.683920210811,
+      "energy_eh": -7111.683920210808,
       "method": "dmrg-superci",
       "state": 6
     },
@@ -1031,37 +1031,37 @@
     },
     {
       "element": "At",
-      "energy_eh": -22855.64922210568,
+      "energy_eh": -22855.649222105698,
       "method": "dmrg-superci",
       "state": 1
     },
     {
       "element": "At",
-      "energy_eh": -22855.649222105636,
+      "energy_eh": -22855.649222105632,
       "method": "dmrg-superci",
       "state": 2
     },
     {
       "element": "At",
-      "energy_eh": -22855.649222105567,
+      "energy_eh": -22855.649222105574,
       "method": "dmrg-superci",
       "state": 3
     },
     {
       "element": "At",
-      "energy_eh": -22855.649222105425,
+      "energy_eh": -22855.649222105432,
       "method": "dmrg-superci",
       "state": 4
     },
     {
       "element": "At",
-      "energy_eh": -22855.56206194762,
+      "energy_eh": -22855.56206194763,
       "method": "dmrg-superci",
       "state": 5
     },
     {
       "element": "At",
-      "energy_eh": -22855.562061947403,
+      "energy_eh": -22855.56206194741,
       "method": "dmrg-superci",
       "state": 6
     }
@@ -1083,7 +1083,7 @@
       "nspinor": 60,
       "orbital_updates": 8,
       "projected_hamiltonian_error_eh": null,
-      "protocol_version": 5,
+      "protocol_version": 7,
       "root_orthogonality_error": null,
       "root_pair_residual": null,
       "scf_energy_eh": -99.51060169781215,
@@ -1094,36 +1094,36 @@
       "total_energy_eh": -99.48599850715621,
       "trajectory_energy_error_eh": 0.0,
       "trajectory_gradient_error": 0.0,
-      "wall_seconds": 2.009763687849045
+      "wall_seconds": 1.088612712919712
     },
     {
-      "active_orbital_closure_error": 2.3820185320938114e-15,
-      "cas_energy_eh": -23.93394894479718,
+      "active_orbital_closure_error": 1.821276142608692e-15,
+      "cas_energy_eh": -23.933948944797137,
       "converged": true,
-      "delta_vs_exact_eh": 5.684341886080802e-14,
+      "delta_vs_exact_eh": 2.842170943040401e-14,
       "element": "F",
-      "final_gradient_norm": 6.586259002798369e-05,
+      "final_gradient_norm": 6.586259002888892e-05,
       "macroiterations": 9,
-      "max_occupation_delta_vs_exact": 3.1308289294429414e-14,
-      "max_root_delta_vs_exact_eh": 4.419575816427823e-12,
-      "maximum_pair_splitting_eh": 1.332978172285948e-11,
+      "max_occupation_delta_vs_exact": 4.440892098500626e-16,
+      "max_root_delta_vs_exact_eh": 8.526512829121202e-14,
+      "maximum_pair_splitting_eh": 1.439559582649963e-11,
       "method": "dmrg-superci",
       "naux": 293,
       "nspinor": 60,
       "orbital_updates": 8,
-      "projected_hamiltonian_error_eh": 1.042056146505396e-11,
-      "protocol_version": 5,
-      "root_orthogonality_error": 1.0719958808093415e-13,
-      "root_pair_residual": 1.7769239174548364e-09,
+      "projected_hamiltonian_error_eh": 7.105920172536119e-14,
+      "protocol_version": 7,
+      "root_orthogonality_error": 1.4752290795525883e-15,
+      "root_pair_residual": 1.0391671551647767e-09,
       "scf_energy_eh": -99.51060169781215,
       "scf_iterations": 9,
-      "solver_orbital_closure_error": 2.3820185320938114e-15,
-      "state_average_tr_residual": 2.098321528467139e-14,
+      "solver_orbital_closure_error": 1.821276142608692e-15,
+      "state_average_tr_residual": 5.773160892360862e-15,
       "status": "ok",
-      "total_energy_eh": -99.48599850715615,
-      "trajectory_energy_error_eh": 5.684341886080802e-14,
-      "trajectory_gradient_error": 1.860013879029232e-14,
-      "wall_seconds": 44.72503965348005
+      "total_energy_eh": -99.48599850715618,
+      "trajectory_energy_error_eh": 4.263256414560601e-14,
+      "trajectory_gradient_error": 7.993849722789936e-15,
+      "wall_seconds": 21.461078211665154
     },
     {
       "active_orbital_closure_error": 1.7937214693574006e-15,
@@ -1141,7 +1141,7 @@
       "nspinor": 68,
       "orbital_updates": 7,
       "projected_hamiltonian_error_eh": null,
-      "protocol_version": 5,
+      "protocol_version": 7,
       "root_orthogonality_error": null,
       "root_pair_residual": null,
       "scf_energy_eh": -460.97293419927445,
@@ -1152,36 +1152,36 @@
       "total_energy_eh": -460.8872037181179,
       "trajectory_energy_error_eh": 0.0,
       "trajectory_gradient_error": 0.0,
-      "wall_seconds": 2.8758355006575584
+      "wall_seconds": 1.7414157167077065
     },
     {
-      "active_orbital_closure_error": 2.0609796008446944e-15,
-      "cas_energy_eh": -14.758573041294255,
+      "active_orbital_closure_error": 2.2780363000931973e-15,
+      "cas_energy_eh": -14.758573041294312,
       "converged": true,
-      "delta_vs_exact_eh": -1.1368683772161603e-13,
+      "delta_vs_exact_eh": -4.547473508864641e-13,
       "element": "Cl",
-      "final_gradient_norm": 1.6622729833392575e-05,
+      "final_gradient_norm": 1.6622729836108017e-05,
       "macroiterations": 8,
-      "max_occupation_delta_vs_exact": 1.8096635301390052e-14,
-      "max_root_delta_vs_exact_eh": 4.263256414560601e-12,
-      "maximum_pair_splitting_eh": 3.808509063674137e-12,
+      "max_occupation_delta_vs_exact": 6.661338147750939e-16,
+      "max_root_delta_vs_exact_eh": 3.979039320256561e-13,
+      "maximum_pair_splitting_eh": 3.979039320256561e-12,
       "method": "dmrg-superci",
       "naux": 338,
       "nspinor": 68,
       "orbital_updates": 7,
-      "projected_hamiltonian_error_eh": 5.995875709649765e-12,
-      "protocol_version": 5,
-      "root_orthogonality_error": 5.986553818700962e-14,
-      "root_pair_residual": 1.1417203476311627e-09,
+      "projected_hamiltonian_error_eh": 5.686005566158151e-14,
+      "protocol_version": 7,
+      "root_orthogonality_error": 1.8943307443209375e-15,
+      "root_pair_residual": 1.0051525700785462e-09,
       "scf_energy_eh": -460.97293419927445,
       "scf_iterations": 8,
-      "solver_orbital_closure_error": 2.0609796008446944e-15,
-      "state_average_tr_residual": 1.7344800894042692e-14,
+      "solver_orbital_closure_error": 2.2780363000931973e-15,
+      "state_average_tr_residual": 5.5511151893521545e-15,
       "status": "ok",
-      "total_energy_eh": -460.88720371811803,
-      "trajectory_energy_error_eh": 5.684341886080801e-13,
-      "trajectory_gradient_error": 2.97910567742532e-14,
-      "wall_seconds": 37.012593757361174
+      "total_energy_eh": -460.88720371811837,
+      "trajectory_energy_error_eh": 4.547473508864641e-13,
+      "trajectory_gradient_error": 1.2691541882107332e-14,
+      "wall_seconds": 19.200506307184696
     },
     {
       "active_orbital_closure_error": 2.379090945779192e-15,
@@ -1199,7 +1199,7 @@
       "nspinor": 86,
       "orbital_updates": 6,
       "projected_hamiltonian_error_eh": null,
-      "protocol_version": 5,
+      "protocol_version": 7,
       "root_orthogonality_error": null,
       "root_pair_residual": null,
       "scf_energy_eh": -2604.4457853624604,
@@ -1210,36 +1210,36 @@
       "total_energy_eh": -2604.357953988483,
       "trajectory_energy_error_eh": 0.0,
       "trajectory_gradient_error": 0.0,
-      "wall_seconds": 5.477854069322348
+      "wall_seconds": 4.048044785857201
     },
     {
-      "active_orbital_closure_error": 2.0459015444837032e-15,
+      "active_orbital_closure_error": 2.061114246950638e-15,
       "cas_energy_eh": -13.184447267853102,
       "converged": true,
-      "delta_vs_exact_eh": 0.0,
+      "delta_vs_exact_eh": -1.3642420526593924e-12,
       "element": "Br",
-      "final_gradient_norm": 2.3944361700533307e-05,
+      "final_gradient_norm": 2.394436167292047e-05,
       "macroiterations": 7,
-      "max_occupation_delta_vs_exact": 1.694200335577989e-13,
-      "max_root_delta_vs_exact_eh": 4.956746124662459e-11,
-      "maximum_pair_splitting_eh": 5.9117155615240335e-12,
+      "max_occupation_delta_vs_exact": 2.4424906541753444e-15,
+      "max_root_delta_vs_exact_eh": 1.3642420526593924e-12,
+      "maximum_pair_splitting_eh": 6.366462912410498e-12,
       "method": "dmrg-superci",
       "naux": 437,
       "nspinor": 86,
       "orbital_updates": 6,
-      "projected_hamiltonian_error_eh": 5.876772123002787e-11,
-      "protocol_version": 5,
-      "root_orthogonality_error": 5.876861107854869e-13,
-      "root_pair_residual": 2.2115891198663607e-09,
+      "projected_hamiltonian_error_eh": 8.414660806243717e-15,
+      "protocol_version": 7,
+      "root_orthogonality_error": 9.414195826991664e-16,
+      "root_pair_residual": 7.97810892071552e-10,
       "scf_energy_eh": -2604.4457853624604,
       "scf_iterations": 9,
-      "solver_orbital_closure_error": 2.0459015444837032e-15,
-      "state_average_tr_residual": 8.69084951008094e-11,
+      "solver_orbital_closure_error": 2.061114246950638e-15,
+      "state_average_tr_residual": 3.774774735909803e-15,
       "status": "ok",
-      "total_energy_eh": -2604.357953988483,
-      "trajectory_energy_error_eh": 9.094947017729282e-13,
-      "trajectory_gradient_error": 7.115922434630662e-14,
-      "wall_seconds": 36.19868844747543
+      "total_energy_eh": -2604.3579539884845,
+      "trajectory_energy_error_eh": 1.3642420526593924e-12,
+      "trajectory_gradient_error": 5.532790751158062e-14,
+      "wall_seconds": 20.57015847414732
     },
     {
       "active_orbital_closure_error": 2.919100251117119e-15,
@@ -1257,7 +1257,7 @@
       "nspinor": 104,
       "orbital_updates": 6,
       "projected_hamiltonian_error_eh": null,
-      "protocol_version": 5,
+      "protocol_version": 7,
       "root_orthogonality_error": null,
       "root_pair_residual": null,
       "scf_energy_eh": -7111.790304601767,
@@ -1268,36 +1268,36 @@
       "total_energy_eh": -7111.705653835465,
       "trajectory_energy_error_eh": 0.0,
       "trajectory_gradient_error": 0.0,
-      "wall_seconds": 11.27219258993864
+      "wall_seconds": 9.921356275677681
     },
     {
-      "active_orbital_closure_error": 2.0699680857078945e-15,
-      "cas_energy_eh": -11.261228756576202,
+      "active_orbital_closure_error": 2.71024719738237e-15,
+      "cas_energy_eh": -11.261228756577111,
       "converged": true,
-      "delta_vs_exact_eh": 5.4569682106375694e-12,
+      "delta_vs_exact_eh": 3.637978807091713e-12,
       "element": "I",
-      "final_gradient_norm": 1.5491790034538137e-05,
+      "final_gradient_norm": 1.5491790045516307e-05,
       "macroiterations": 7,
-      "max_occupation_delta_vs_exact": 1.6198153929281034e-13,
-      "max_root_delta_vs_exact_eh": 5.093170329928398e-11,
-      "maximum_pair_splitting_eh": 9.094947017729282e-12,
+      "max_occupation_delta_vs_exact": 2.7755575615628914e-15,
+      "max_root_delta_vs_exact_eh": 3.637978807091713e-12,
+      "maximum_pair_splitting_eh": 1.8189894035458565e-11,
       "method": "dmrg-superci",
       "naux": 459,
       "nspinor": 104,
       "orbital_updates": 6,
-      "projected_hamiltonian_error_eh": 5.7446964752443065e-11,
-      "protocol_version": 5,
-      "root_orthogonality_error": 5.747243472576245e-13,
-      "root_pair_residual": 7.80195768278909e-10,
+      "projected_hamiltonian_error_eh": 1.1620911391327426e-14,
+      "protocol_version": 7,
+      "root_orthogonality_error": 1.5547649994934692e-15,
+      "root_pair_residual": 7.11351535244732e-10,
       "scf_energy_eh": -7111.790304601767,
       "scf_iterations": 10,
-      "solver_orbital_closure_error": 2.0699680857078945e-15,
-      "state_average_tr_residual": 2.2027320689896778e-13,
+      "solver_orbital_closure_error": 2.71024719738237e-15,
+      "state_average_tr_residual": 6.217267837148392e-15,
       "status": "ok",
-      "total_energy_eh": -7111.705653835459,
-      "trajectory_energy_error_eh": 6.366462912410498e-12,
-      "trajectory_gradient_error": 1.3167609635034855e-13,
-      "wall_seconds": 40.4264421723783
+      "total_energy_eh": -7111.705653835461,
+      "trajectory_energy_error_eh": 5.4569682106375694e-12,
+      "trajectory_gradient_error": 1.7616501790315708e-13,
+      "wall_seconds": 25.576550282537937
     },
     {
       "active_orbital_closure_error": 2.515943901745829e-15,
@@ -1315,7 +1315,7 @@
       "nspinor": 136,
       "orbital_updates": 7,
       "projected_hamiltonian_error_eh": null,
-      "protocol_version": 5,
+      "protocol_version": 7,
       "root_orthogonality_error": null,
       "root_pair_residual": null,
       "scf_energy_eh": -22855.698244015508,
@@ -1326,36 +1326,36 @@
       "total_energy_eh": -22855.620168719575,
       "trajectory_energy_error_eh": 0.0,
       "trajectory_gradient_error": 0.0,
-      "wall_seconds": 60.15579881891608
+      "wall_seconds": 58.90854185819626
     },
     {
-      "active_orbital_closure_error": 2.3097287602606696e-15,
-      "cas_energy_eh": -10.938835076241958,
+      "active_orbital_closure_error": 2.7791098871816535e-15,
+      "cas_energy_eh": -10.938835076245596,
       "converged": true,
-      "delta_vs_exact_eh": 2.1827872842550278e-11,
+      "delta_vs_exact_eh": 1.0913936421275139e-11,
       "element": "At",
-      "final_gradient_norm": 3.394256445608628e-05,
+      "final_gradient_norm": 3.394256437582132e-05,
       "macroiterations": 8,
-      "max_occupation_delta_vs_exact": 7.849276784099857e-14,
-      "max_root_delta_vs_exact_eh": 2.9103830456733704e-11,
+      "max_occupation_delta_vs_exact": 1.6209256159527285e-14,
+      "max_root_delta_vs_exact_eh": 1.0913936421275139e-11,
       "maximum_pair_splitting_eh": 2.1827872842550278e-10,
       "method": "dmrg-superci",
       "naux": 666,
       "nspinor": 136,
       "orbital_updates": 7,
-      "projected_hamiltonian_error_eh": 2.455020600509799e-11,
-      "protocol_version": 5,
-      "root_orthogonality_error": 2.9994739324388084e-13,
-      "root_pair_residual": 1.055443437523571e-09,
+      "projected_hamiltonian_error_eh": 1.1978093541372753e-14,
+      "protocol_version": 7,
+      "root_orthogonality_error": 1.4713073293813407e-15,
+      "root_pair_residual": 1.0538436809354807e-09,
       "scf_energy_eh": -22855.698244015508,
       "scf_iterations": 39,
-      "solver_orbital_closure_error": 2.3097287602606696e-15,
-      "state_average_tr_residual": 1.3399730648279514e-10,
+      "solver_orbital_closure_error": 2.7791098871816535e-15,
+      "state_average_tr_residual": 5.6564585119905724e-11,
       "status": "ok",
-      "total_energy_eh": -22855.620168719553,
-      "trajectory_energy_error_eh": 2.1827872842550278e-11,
-      "trajectory_gradient_error": 1.4496357673282612e-13,
-      "wall_seconds": 75.89131686463952
+      "total_energy_eh": -22855.620168719564,
+      "trajectory_energy_error_eh": 1.0913936421275139e-11,
+      "trajectory_gradient_error": 7.503980076206673e-14,
+      "wall_seconds": 55.653554789721966
     }
   ]
 }

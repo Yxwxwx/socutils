@@ -446,7 +446,9 @@ def _ci_convergence_snapshot(solver):
     info = getattr(solver, 'convergence_info', None) or {}
     keys = ('sweeps', 'energy_change', 'discarded_weight',
             'local_residual_bound', 'bond_dimension', 'npdm_site_type',
-            'npdm_cutoff')
+            'npdm_cutoff', 'run_mode', 'restart_transport',
+            'restart_requested', 'schedule_mode',
+            'effective_twosite_to_onesite')
     return {key: info[key] for key in keys if key in info}
 
 

@@ -24,10 +24,10 @@ solver = DMRGCI(mol).init(
     ncas=2,
     nelecas=1,
     nroots=2,
-    bond_dims=[64] * 8,
-    noises=[0.0] * 8,
-    thrds=[1e-16] * 8,
-    n_sweeps=8,
+    schedule_mode="pyscf",
+    max_bond_dimension=64,
+    start_bond_dimension=16,
+    schedule_thrd_max=1e-14,
     tol=1e-10,
     n_threads=1,
     stack_memory=512,
@@ -36,6 +36,9 @@ solver = DMRGCI(mol).init(
 mc = zmcscf.CASSCF(mf, ncas=2, nelecas=1)
 mc.fcisolver = solver
 mc.state_average_([0.5, 0.5])
+# The current gradient controls whether the next CI solve uses the short,
+# one-site max-M restart schedule.  initial_dmrg() installs this automatically.
+mc.callback = solver.restart_scheduler_()
 mc.canonicalize_ = False
 mc.kernel()
 

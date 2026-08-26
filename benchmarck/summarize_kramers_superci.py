@@ -227,7 +227,11 @@ def summarize(results_dir, output_dir):
             path.write_text("", encoding="utf-8")
             return
         with path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(records[0]))
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=list(records[0]),
+                lineterminator="\n",
+            )
             writer.writeheader()
             writer.writerows(records)
 
@@ -251,8 +255,8 @@ def summarize(results_dir, output_dir):
     lines = [
         "# Kramers-restricted six-state halogen Super-CI results",
         "",
-        "Both methods use the same KR-X2C reference and Kramers-restricted ",
-        "orbital optimization. `macroiterations` includes the initial and final ",
+        "Both methods use the same KR-X2C reference and Kramers-restricted",
+        "orbital optimization. `macroiterations` includes the initial and final",
         "energy/gradient evaluations; `updates` counts applied orbital steps.",
         "Only results from the newest available protocol version (%s) are included."
         % current_protocol_version,

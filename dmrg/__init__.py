@@ -1,6 +1,10 @@
 """DMRG solver and Kramers result adapter for relativistic spinor CASCI."""
 
-from socutils.dmrg.dmrgci import DMRGCI
+from socutils.dmrg.dmrgci import (
+    DMRGCI,
+    DMRGSweepSchedule,
+    pyscf_dmrg_schedule,
+)
 from socutils.dmrg.kramers import (
     KramersOrbitalMap,
     KramersManifoldRDM,
@@ -26,7 +30,7 @@ def _inject_initial_dmrg():
         return
 
     def _initial_dmrg(self, nroots=1, bond_dims=None, noises=None,
-                      thrds=None, n_sweeps=None, tol=1e-6, scratch=None,
+                      thrds=None, n_sweeps=None, tol=1e-7, scratch=None,
                       n_threads=None, **kwargs):
         """Attach a :class:`DMRGCI` solver and return *self*."""
         fcisolv = DMRGCI(self._scf.mol)
@@ -38,6 +42,7 @@ def _inject_initial_dmrg():
             n_threads=n_threads, **kwargs,
         )
         self.fcisolver = fcisolv
+        self.callback = fcisolv.restart_scheduler_()
         return self
 
     CASBase.initial_dmrg = _initial_dmrg
