@@ -12,6 +12,7 @@ from socutils.dmrg.kramers import (
     identify_kramers_orbitals,
     kramers_residual,
     time_reverse_integrals,
+    time_reverse_one_body,
 )
 from socutils.fci import zfci
 from socutils.mcscf import zmcscf
@@ -61,6 +62,77 @@ def _exact_root_space(solver, states, dm1s, norb, nelec):
                     states[bra], states[ket], norb, nelec
                 )
     return root_space
+
+
+def test_fourfold_degenerate_manifold_is_basis_invariant():
+    """Arbitrary roots in two degenerate doublets need manifold validation."""
+    time_reversal = _nonadjacent_time_reversal()
+    rng = np.random.default_rng(719)
+    trial = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    root_vectors = np.linalg.qr(trial)[0]
+    dm1s = [
+        np.outer(root_vectors[:, root].conj(), root_vectors[:, root])
+        for root in range(4)
+    ]
+    dm2s = [np.zeros((4,) * 4, dtype=complex) for _ in range(4)]
+
+    adapter = KramersResultAdapter(time_reversal)
+    pairs = adapter.analyze(
+        np.zeros(4),
+        dm1s,
+        dm2s,
+        weights=np.ones(4) / 4,
+        overlap=np.eye(4),
+        projected_hamiltonian=np.zeros((4, 4)),
+    )
+
+    assert pairs == ()
+    assert adapter.root_pairs == ()
+    assert adapter.root_manifolds == ((0, 1, 2, 3),)
+    assert adapter.diagnostics["unresolved_manifolds"] == ((0, 1, 2, 3),)
+    assert adapter.diagnostics["raw_ensemble_residual"] <= 1e-12
+    assert len(adapter.manifold_results) == 1
+    result = adapter.manifold_results[0]
+    assert result.diagnostics["basis_invariant_validation"]
+    assert np.max(abs(result.dm1 - np.eye(4) / 4)) <= 1e-12
+    assert np.max(abs(result.dm2)) == 0.0
+
+
+def test_one_body_time_reversal_projection_is_idempotent():
+    time_reversal = _nonadjacent_time_reversal()
+    rng = np.random.default_rng(991)
+    generator = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    generator = generator - generator.T.conj()
+    projected = (
+        generator + time_reverse_one_body(time_reversal, generator)
+    ) * 0.5
+
+    assert np.max(abs(projected + projected.T.conj())) <= 1e-12
+    assert np.max(
+        abs(projected - time_reverse_one_body(time_reversal, projected))
+    ) <= 1e-12
+
+
+def test_projected_hamiltonian_check_cancels_large_constant_energy():
+    time_reversal = np.array([[0.0, -1.0], [1.0, 0.0]], dtype=complex)
+    dm1s = [np.diag([1.0, 0.0]), np.diag([0.0, 1.0])]
+    dm2s = [np.zeros((2,) * 4), np.zeros((2,) * 4)]
+    energies = np.array([-30000.0, -30000.0])
+    overlap = np.array(
+        [[1.0, 5e-13j], [-5e-13j, 1.0]], dtype=complex
+    )
+    projected_hamiltonian = overlap * energies[np.newaxis, :]
+
+    adapter = KramersResultAdapter(time_reversal)
+    adapter.analyze(
+        energies,
+        dm1s,
+        dm2s,
+        overlap=overlap,
+        projected_hamiltonian=projected_hamiltonian,
+    )
+    assert adapter.diagnostics["root_orthogonality_error"] == 5e-13
+    assert adapter.diagnostics["projected_hamiltonian_error"] == 0.0
 
 
 def _dmrg_solver(tmp_path, norb, nelec, nroots, mol=None):
@@ -186,7 +258,12 @@ def test_odd_electron_kramers_pair_exact_dmrg_and_transition(tmp_path):
     assert dm2_error <= 1e-7
     assert max(rdm_energy_errors) <= 1e-9
     assert solver.converged
-    assert solver.convergence_info["root_strategy"] == "state-specific-projection"
+    assert solver.convergence_info["root_strategy"] == "state-averaged-multimps"
+    assert solver.convergence_info["effective_dav_type"] == "Normal"
+    assert solver.convergence_info["effective_twosite_to_onesite"] == 2
+    assert np.max(
+        abs(np.asarray(solver.convergence_info["state_average_weights"]) - 0.5)
+    ) <= 1e-15
     assert np.max(abs(solver.root_overlap - np.eye(2))) <= 1e-8
     assert np.max(
         abs(solver.projected_hamiltonian - np.diag(dmrg_energy))
@@ -251,11 +328,21 @@ def test_general_complex_multiroot_path_remains_unrestricted(tmp_path):
         h1e, eri, 3, 1, nroots=2, verbose=0
     )
     solver = _dmrg_solver(tmp_path, 3, 1, 2)
+    solver.weights = np.array([0.7, 0.3])
     dmrg_energy, _ = solver.kernel(h1e, eri, 3, 1, nroots=2, verbose=0)
 
     assert solver.kramers_adapter is None
     assert solver._multi_mps is not None
-    assert solver.convergence_info["root_strategy"] == "state-averaged"
+    assert solver.convergence_info["root_strategy"] == "state-averaged-multimps"
+    assert solver.convergence_info["effective_dav_type"] == "Normal"
+    assert solver.convergence_info["effective_twosite_to_onesite"] == 2
+    assert np.max(
+        abs(
+            np.asarray(solver.convergence_info["state_average_weights"])
+            - [0.7, 0.3]
+        )
+    ) <= 1e-15
+    assert np.max(abs(np.asarray(solver._multi_mps.weights) - [0.7, 0.3])) <= 1e-15
     assert np.max(abs(dmrg_energy - exact_energy)) <= 1e-9
     for root in range(2):
         exact_dm1, exact_dm2 = exact.make_rdm12(
@@ -265,6 +352,23 @@ def test_general_complex_multiroot_path_remains_unrestricted(tmp_path):
         assert np.max(abs(dmrg_dm1 - exact_dm1)) <= 1e-7
         assert np.max(abs(dmrg_dm2 - exact_dm2)) <= 1e-7
     solver.close()
+
+
+def test_complex_multimps_supports_explicit_local_eigensolver(tmp_path):
+    solver = _dmrg_solver(tmp_path, 3, 1, 2)
+    solver.dav_type = "Exact"
+    energies, _ = solver.kernel(
+        np.diag([-1.0, 0.0, 1.0]),
+        np.zeros((3,) * 4),
+        3,
+        1,
+        nroots=2,
+        verbose=0,
+    )
+    assert np.max(abs(energies - [-1.0, 0.0])) <= 1e-10
+    assert solver.convergence_info["effective_dav_type"] == "Exact"
+    assert solver.convergence_info["root_orthogonality_error"] <= 1e-10
+    assert solver.convergence_info["root_eigen_equation_error"] <= 1e-10
 
 
 def _subspace_projector(mo, overlap, columns):
@@ -382,7 +486,7 @@ def test_kramers_restricted_x2c_dmrg_scf_matches_exact(tmp_path):
     assert trajectory_error <= 1e-7
     assert projector_error <= 1e-6
     assert np.max(abs(np.asarray(solver.e_states) - exact.fcisolver.e_states)) <= 1e-8
-    assert solver.convergence_info["root_strategy"] == "state-specific-projection"
+    assert solver.convergence_info["root_strategy"] == "state-averaged-multimps"
     assert solver.kramers_diagnostics["raw_ensemble_residual"] <= 1e-8
     assert solver.kramers_diagnostics["projection_change"] == 0.0
     assert not solver.kramers_diagnostics["projection_applied"]
@@ -398,6 +502,8 @@ def test_kramers_restricted_x2c_dmrg_scf_matches_exact(tmp_path):
         row["subspace_closure_error"] <= 1e-8
         for row in solver.kramers_adapter.orbital_history
     )
+    for row in exact.macro_history[:-1] + dmrg.macro_history[:-1]:
+        assert row["kramers_rotation"]["output_generator_residual"] <= 1e-12
 
     print(
         "kr-x2c-dmrg-scf",

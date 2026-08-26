@@ -1,0 +1,852 @@
+{
+  "macro_history": [
+    {
+      "accepted_energy_change": -0.020137675888690865,
+      "applied_orbital_step_norm": 0.14868832768811982,
+      "cas_energy": -10.921424381605902,
+      "cholesky_active": true,
+      "cholesky_naux": 666,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 2.682298827494378e-13,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "converged": false,
+      "energy_change": null,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 10,
+        "max_stepsize": 0.5,
+        "reason": "converged",
+        "residual_history": [
+          0.031475253940882235,
+          0.006803390419886117,
+          0.0017886662288947633,
+          0.0002958629400016274,
+          4.325847791417578e-05,
+          1.9146806024293678e-05,
+          4.613878117762081e-06,
+          1.0315100964260412e-06,
+          1.1330908689715254e-07,
+          1.5311358295508804e-08
+        ],
+        "residual_norm": 1.5311358295508804e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 0.10513852479155696
+      },
+      "macro_iteration": 0,
+      "natural_occupations": [
+        1.0000000000000002,
+        1.0,
+        0.8333333333333338,
+        0.8333333333333338,
+        0.8333333333333336,
+        0.8333333333333334,
+        0.8333333333333333,
+        0.8333333333333331
+      ],
+      "next_ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 2.842170943040401e-14,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "next_natural_occupations": [
+        0.9999999999999993,
+        0.9999999999999992,
+        0.8333333333333337,
+        0.8333333333333335,
+        0.8333333333333329,
+        0.8333333333333328,
+        0.8333333333333327,
+        0.8333333333333323
+      ],
+      "next_total_energy": -22855.61548239798,
+      "orbital_gradient_norm": 0.15647457997740252,
+      "orbital_step_norm": 0.0,
+      "predicted_energy_change": -0.007288832536706731,
+      "proposed_orbital_step_norm": 0.14868832768811982,
+      "total_energy": -22855.595344722093
+    },
+    {
+      "accepted_energy_change": -0.004212099556752946,
+      "applied_orbital_step_norm": 0.08785027468836931,
+      "cas_energy": -10.92473185556446,
+      "cholesky_active": true,
+      "cholesky_naux": 666,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 2.842170943040401e-14,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "converged": false,
+      "energy_change": -0.020137675888690865,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 10,
+        "max_stepsize": 0.7,
+        "reason": "converged",
+        "residual_history": [
+          0.014060122794172207,
+          0.004511850924783221,
+          0.0006891504614662245,
+          0.00010641337691537742,
+          2.4958173153319083e-05,
+          7.67019183339584e-06,
+          1.5221503047650378e-06,
+          8.220296210831273e-07,
+          1.9443288043031608e-07,
+          3.766648082699269e-08
+        ],
+        "residual_norm": 3.766648082699269e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 0.06211952496124687
+      },
+      "macro_iteration": 1,
+      "natural_occupations": [
+        0.9999999999999993,
+        0.9999999999999992,
+        0.8333333333333337,
+        0.8333333333333335,
+        0.8333333333333329,
+        0.8333333333333328,
+        0.8333333333333327,
+        0.8333333333333323
+      ],
+      "next_ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 3.730349362740526e-14,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "next_natural_occupations": [
+        1.0,
+        1.0,
+        0.8333333333333345,
+        0.8333333333333343,
+        0.8333333333333337,
+        0.8333333333333331,
+        0.8333333333333331,
+        0.833333333333333
+      ],
+      "next_total_energy": -22855.619694497538,
+      "orbital_gradient_norm": 0.05714654409232045,
+      "orbital_step_norm": 0.14868832768811982,
+      "predicted_energy_change": -0.001678185326110602,
+      "proposed_orbital_step_norm": 0.08785027468836931,
+      "total_energy": -22855.61548239798
+    },
+    {
+      "accepted_energy_change": -0.0004651856252166908,
+      "applied_orbital_step_norm": 0.033481201216429654,
+      "cas_energy": -10.92998711259861,
+      "cholesky_active": true,
+      "cholesky_naux": 666,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 3.730349362740526e-14,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "converged": false,
+      "energy_change": -0.004212099556752946,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 10,
+        "max_stepsize": 0.9799999999999999,
+        "reason": "converged",
+        "residual_history": [
+          0.009781659001436455,
+          0.0023363495450806782,
+          0.0006458458423826022,
+          0.00011724436413478563,
+          2.404867823972297e-05,
+          6.476788958130089e-06,
+          1.2726614546780791e-06,
+          4.405353149258363e-07,
+          1.3076013081453384e-07,
+          3.588535668949187e-08
+        ],
+        "residual_norm": 3.588535668949187e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 0.023674784422408713
+      },
+      "macro_iteration": 2,
+      "natural_occupations": [
+        1.0,
+        1.0,
+        0.8333333333333345,
+        0.8333333333333343,
+        0.8333333333333337,
+        0.8333333333333331,
+        0.8333333333333331,
+        0.833333333333333
+      ],
+      "next_ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 4.263256414560601e-14,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "next_natural_occupations": [
+        0.9999999999999998,
+        0.9999999999999996,
+        0.8333333333333339,
+        0.8333333333333333,
+        0.8333333333333331,
+        0.8333333333333331,
+        0.8333333333333328,
+        0.8333333333333327
+      ],
+      "next_total_energy": -22855.620159683163,
+      "orbital_gradient_norm": 0.023709534104341373,
+      "orbital_step_norm": 0.08785027468836931,
+      "predicted_energy_change": -0.00021249894040295588,
+      "proposed_orbital_step_norm": 0.033481201216429654,
+      "total_energy": -22855.619694497538
+    },
+    {
+      "accepted_energy_change": -8.625018381280825e-06,
+      "applied_orbital_step_norm": 0.004169392307512733,
+      "cas_energy": -10.938062113738852,
+      "cholesky_active": true,
+      "cholesky_naux": 666,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 4.263256414560601e-14,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "converged": false,
+      "energy_change": -0.0004651856252166908,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 8,
+        "max_stepsize": 1.0,
+        "reason": "converged",
+        "residual_history": [
+          0.0016821430941493325,
+          0.0005597867430208364,
+          0.0001107894489808126,
+          3.306851896856436e-05,
+          2.26711946266683e-06,
+          5.007475379947371e-07,
+          1.070000437301245e-07,
+          3.688028976725678e-08
+        ],
+        "residual_norm": 3.688028976725678e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 0.0029482055740692814
+      },
+      "macro_iteration": 3,
+      "natural_occupations": [
+        0.9999999999999998,
+        0.9999999999999996,
+        0.8333333333333339,
+        0.8333333333333333,
+        0.8333333333333331,
+        0.8333333333333331,
+        0.8333333333333328,
+        0.8333333333333327
+      ],
+      "next_ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 5.5067062021407764e-14,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "next_natural_occupations": [
+        0.9999999999999996,
+        0.9999999999999996,
+        0.833333333333334,
+        0.8333333333333336,
+        0.8333333333333333,
+        0.8333333333333329,
+        0.8333333333333328,
+        0.8333333333333326
+      ],
+      "next_total_energy": -22855.62016830818,
+      "orbital_gradient_norm": 0.003935711164830946,
+      "orbital_step_norm": 0.033481201216429654,
+      "predicted_energy_change": -3.6757815271628366e-06,
+      "proposed_orbital_step_norm": 0.004169392307512733,
+      "total_energy": -22855.620159683163
+    },
+    {
+      "accepted_energy_change": -3.82191501557827e-07,
+      "applied_orbital_step_norm": 0.0008296604282863858,
+      "cas_energy": -10.938594477796869,
+      "cholesky_active": true,
+      "cholesky_naux": 666,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 5.5067062021407764e-14,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "converged": false,
+      "energy_change": -8.625018381280825e-06,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 7,
+        "max_stepsize": 1.0,
+        "reason": "converged",
+        "residual_history": [
+          0.00021230737336065298,
+          9.333171423261544e-05,
+          1.3631723331746996e-05,
+          2.819696248537022e-06,
+          5.301078341853106e-07,
+          1.0698158047823432e-07,
+          3.8081773993022365e-08
+        ],
+        "residual_norm": 3.8081773993022365e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 0.0005866585149234387
+      },
+      "macro_iteration": 4,
+      "natural_occupations": [
+        0.9999999999999996,
+        0.9999999999999996,
+        0.833333333333334,
+        0.8333333333333336,
+        0.8333333333333333,
+        0.8333333333333329,
+        0.8333333333333328,
+        0.8333333333333326
+      ],
+      "next_ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 2.5224267119483557e-13,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "next_natural_occupations": [
+        0.9999999999999999,
+        0.9999999999999997,
+        0.8333333333333335,
+        0.8333333333333335,
+        0.8333333333333331,
+        0.833333333333333,
+        0.833333333333333,
+        0.8333333333333328
+      ],
+      "next_total_energy": -22855.620168690373,
+      "orbital_gradient_norm": 0.0007494339066373565,
+      "orbital_step_norm": 0.004169392307512733,
+      "predicted_energy_change": -1.64902871518165e-07,
+      "proposed_orbital_step_norm": 0.0008296604282863858,
+      "total_energy": -22855.62016830818
+    },
+    {
+      "accepted_energy_change": -2.6600901037454605e-08,
+      "applied_orbital_step_norm": 0.0002589324574626242,
+      "cas_energy": -10.93883962183827,
+      "cholesky_active": true,
+      "cholesky_naux": 666,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 2.5224267119483557e-13,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "converged": false,
+      "energy_change": -3.82191501557827e-07,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 6,
+        "max_stepsize": 1.0,
+        "reason": "converged",
+        "residual_history": [
+          9.549347501451338e-05,
+          2.281481549087402e-05,
+          4.242324188304606e-06,
+          9.485748958070329e-07,
+          2.476872894259071e-07,
+          4.79903227105251e-08
+        ],
+        "residual_norm": 4.79903227105251e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 0.00018309289654111903
+      },
+      "macro_iteration": 5,
+      "natural_occupations": [
+        0.9999999999999999,
+        0.9999999999999997,
+        0.8333333333333335,
+        0.8333333333333335,
+        0.8333333333333331,
+        0.833333333333333,
+        0.833333333333333,
+        0.8333333333333328
+      ],
+      "next_ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 1.865174681370263e-13,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "next_natural_occupations": [
+        0.9999999999999998,
+        0.9999999999999996,
+        0.8333333333333334,
+        0.8333333333333331,
+        0.8333333333333329,
+        0.8333333333333328,
+        0.8333333333333328,
+        0.8333333333333321
+      ],
+      "next_total_energy": -22855.620168716974,
+      "orbital_gradient_norm": 0.00021154508461071448,
+      "orbital_step_norm": 0.0008296604282863858,
+      "predicted_energy_change": -1.2770299701469428e-08,
+      "proposed_orbital_step_norm": 0.0002589324574626242,
+      "total_energy": -22855.620168690373
+    },
+    {
+      "accepted_energy_change": -2.5429471861571074e-09,
+      "applied_orbital_step_norm": 7.305368280629236e-05,
+      "cas_energy": -10.93880561284459,
+      "cholesky_active": true,
+      "cholesky_naux": 666,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 1.865174681370263e-13,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "converged": false,
+      "energy_change": -2.6600901037454605e-08,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 5,
+        "max_stepsize": 1.0,
+        "reason": "converged",
+        "residual_history": [
+          2.1121302775497877e-05,
+          1.1007821591858392e-05,
+          2.3117858547718903e-06,
+          3.5119552527317203e-07,
+          7.708509947903702e-08
+        ],
+        "residual_norm": 7.708509947903702e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 5.165675450298043e-05
+      },
+      "macro_iteration": 6,
+      "natural_occupations": [
+        0.9999999999999998,
+        0.9999999999999996,
+        0.8333333333333334,
+        0.8333333333333331,
+        0.8333333333333329,
+        0.8333333333333328,
+        0.8333333333333328,
+        0.8333333333333321
+      ],
+      "next_ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 1.5987211554602254e-14,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "next_natural_occupations": [
+        1.0000000000000002,
+        1.0,
+        0.8333333333333339,
+        0.8333333333333338,
+        0.8333333333333335,
+        0.8333333333333333,
+        0.8333333333333331,
+        0.8333333333333328
+      ],
+      "next_total_energy": -22855.620168719517,
+      "orbital_gradient_norm": 7.890459659130247e-05,
+      "orbital_step_norm": 0.0002589324574626242,
+      "predicted_energy_change": -1.4835546859765678e-09,
+      "proposed_orbital_step_norm": 7.305368280629236e-05,
+      "total_energy": -22855.620168716974
+    },
+    {
+      "cas_energy": -10.93883507694045,
+      "cholesky_active": true,
+      "cholesky_naux": 666,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {
+        "bond_dimension": 32,
+        "discarded_weight": 0.0,
+        "energy_change": 1.5987211554602254e-14,
+        "local_residual_bound": 1e-10,
+        "npdm_cutoff": 1e-24,
+        "npdm_site_type": 2,
+        "sweeps": 2
+      },
+      "converged": true,
+      "energy_change": -2.5429471861571074e-09,
+      "macro_iteration": 7,
+      "natural_occupations": [
+        1.0000000000000002,
+        1.0,
+        0.8333333333333339,
+        0.8333333333333338,
+        0.8333333333333335,
+        0.8333333333333333,
+        0.8333333333333331,
+        0.8333333333333328
+      ],
+      "orbital_gradient_norm": 3.394469844675562e-05,
+      "orbital_step_norm": 7.305368280629236e-05,
+      "total_energy": -22855.620168719517
+    }
+  ],
+  "protocol": {
+    "basis": "cc-pvtz-dk",
+    "canonicalize": true,
+    "cholesky_tau": 1e-10,
+    "conv_tol": 1e-08,
+    "conv_tol_grad": 0.0001,
+    "dmrg": {
+      "bond_dimension": 32,
+      "davidson_max_iter": 1000,
+      "ecore_in_mpo": false,
+      "energy_tolerance": 1e-12,
+      "local_squared_residual_threshold": 1e-20,
+      "n_sweeps": 8,
+      "n_threads": 1,
+      "noise": 0.0,
+      "npdm_cutoff": 1e-24,
+      "npdm_site_type": 2,
+      "random_seed": 2468,
+      "stack_memory_mb": 512.0
+    },
+    "element": "At",
+    "hamiltonian": "spin-orbit X2C with Coulomb-only two-electron terms",
+    "initial_charge": -1,
+    "initial_reference": "At- closed-shell X2C SCF",
+    "initial_spin": 0,
+    "max_cycle_macro": 50,
+    "max_memory_mb": 32000.0,
+    "max_stepsize": 0.2,
+    "method": "dmrg-superci",
+    "natorb": false,
+    "ncas": 8,
+    "nelecas": 7,
+    "nroots": 6,
+    "superci_davidson_max_space": 30,
+    "superci_davidson_tol": 1e-07,
+    "symmetry": true,
+    "target": "neutral At",
+    "target_charge": 0,
+    "target_spin": 1,
+    "version": 1,
+    "weights": [
+      0.16666666666666666,
+      0.16666666666666666,
+      0.16666666666666666,
+      0.16666666666666666,
+      0.16666666666666666,
+      0.16666666666666666
+    ]
+  },
+  "result": {
+    "cas_energy": -10.93883507694045,
+    "converged": true,
+    "final_gradient_norm": 3.394469844675562e-05,
+    "macroiterations": 8,
+    "natural_occupations": [
+      1.0000000000000002,
+      1.0,
+      0.8333333333333339,
+      0.8333333333333338,
+      0.8333333333333335,
+      0.8333333333333333,
+      0.8333333333333331,
+      0.8333333333333328
+    ],
+    "orbital_updates": 7,
+    "root_energies": [
+      -22855.649222105672,
+      -22855.649222105625,
+      -22855.649222105523,
+      -22855.649222105407,
+      -22855.56206194754,
+      -22855.562061947337
+    ],
+    "total_energy": -22855.620168719517,
+    "wall_seconds": 58.662003837525845
+  },
+  "scf": {
+    "cache_reused": true,
+    "cderi": "/home/Yxwxwx/code/socutils/benchmarck/.scratch/cc-pvtz-dk/At/cderi.h5",
+    "converged": true,
+    "energy": -22855.698244015486,
+    "history": [
+      {
+        "cycle": 0,
+        "density_change_norm": 1.3466214376475616,
+        "energy": -22855.676683782385,
+        "energy_change": null,
+        "gradient_norm": 0.32759716302423886
+      },
+      {
+        "cycle": 1,
+        "density_change_norm": 0.9816547419786843,
+        "energy": -22855.696470513816,
+        "energy_change": -0.019786731430940563,
+        "gradient_norm": 0.15194252927541893
+      },
+      {
+        "cycle": 2,
+        "density_change_norm": 0.1614640959949782,
+        "energy": -22855.698114910967,
+        "energy_change": -0.0016443971508124378,
+        "gradient_norm": 0.03125702277191463
+      },
+      {
+        "cycle": 3,
+        "density_change_norm": 0.045932799537517076,
+        "energy": -22855.69823212093,
+        "energy_change": -0.00011720996189978905,
+        "gradient_norm": 0.005361855601563432
+      },
+      {
+        "cycle": 4,
+        "density_change_norm": 0.017227506682943945,
+        "energy": -22855.69824333102,
+        "energy_change": -1.1210089724045247e-05,
+        "gradient_norm": 0.0011767707793348201
+      },
+      {
+        "cycle": 5,
+        "density_change_norm": 0.005136561454635395,
+        "energy": -22855.69824401036,
+        "energy_change": -6.793416105210781e-07,
+        "gradient_norm": 0.00011582192635542851
+      },
+      {
+        "cycle": 6,
+        "density_change_norm": 0.0004914193843406206,
+        "energy": -22855.698244015497,
+        "energy_change": -5.136826075613499e-09,
+        "gradient_norm": 4.504601595319071e-06
+      },
+      {
+        "cycle": 7,
+        "density_change_norm": 9.875788377553755e-06,
+        "energy": -22855.698244015504,
+        "energy_change": -7.275957614183426e-12,
+        "gradient_norm": 3.0458375226252806e-07
+      },
+      {
+        "cycle": 8,
+        "density_change_norm": 1.3239152425200568e-06,
+        "energy": -22855.698244015504,
+        "energy_change": 0.0,
+        "gradient_norm": 2.5150305287436235e-08
+      }
+    ],
+    "iterations": 9,
+    "nao_nr": 68,
+    "naux": 666,
+    "nspinor": 136,
+    "wall_seconds": 84.3803987391293
+  },
+  "solver": {
+    "class": "StateAverageDMRGCI",
+    "converged": true,
+    "dmrg_convergence": {
+      "bond_dimension": 32,
+      "canonical_forms": [
+        "CRRRRRRR",
+        "CRRRRRRR",
+        "CRRRRRRR",
+        "CRRRRRRR",
+        "CRRRRRRR",
+        "CRRRRRRR"
+      ],
+      "constant_energy_shift": -22844.681333642577,
+      "converged": true,
+      "davidson_max_iter": 1000,
+      "discarded_weight": 0.0,
+      "energy_change": 1.5987211554602254e-14,
+      "local_residual_bound": 1e-10,
+      "local_squared_residual_threshold": 1e-20,
+      "max_discarded_weight": 4.2279024627678826e-22,
+      "npdm_cutoff": 1e-24,
+      "npdm_site_type": 2,
+      "root_runs": [
+        {
+          "converged": true,
+          "discarded_weight": 0.0,
+          "energy_change": 1.5987211554602254e-14,
+          "local_squared_residual_threshold": 1e-20,
+          "max_discarded_weight": 4.2279024627678826e-22,
+          "sweep_energies": [
+            [
+              -10.967888463095909,
+              -10.967888463049833,
+              -10.967888462945801,
+              -10.967888462831857,
+              -10.880728304965071,
+              -10.880728304762588
+            ],
+            [
+              -10.96788846309592,
+              -10.967888463049826,
+              -10.967888462945801,
+              -10.96788846283184,
+              -10.88072830496506,
+              -10.880728304762588
+            ]
+          ],
+          "sweeps": 2
+        }
+      ],
+      "root_strategy": "state-averaged",
+      "scratch": "/home/Yxwxwx/code/socutils/benchmarck/.scratch/dmrg/At/dmrg-superci/dmrgci_dpv31_x9",
+      "sweep_energies": [
+        [
+          -10.967888463095909,
+          -10.967888463049833,
+          -10.967888462945801,
+          -10.967888462831857,
+          -10.880728304965071,
+          -10.880728304762588
+        ],
+        [
+          -10.96788846309592,
+          -10.967888463049826,
+          -10.967888462945801,
+          -10.96788846283184,
+          -10.88072830496506,
+          -10.880728304762588
+        ]
+      ],
+      "sweep_energy_origin": "active-space Hamiltonian without ecore",
+      "sweeps": 2
+    },
+    "rdm_diagnostics": {
+      "22791710303920": {
+        "annihilation_antisymmetry": 0.0,
+        "contraction_error": 1.7869562028436085e-15,
+        "creation_antisymmetry": 0.0,
+        "dm1_hermiticity": 8.761982090591858e-17,
+        "dm2_hermiticity": 8.761982090591858e-17,
+        "projection_change": 0.0,
+        "trace_error": 5.3291324183071844e-15
+      },
+      "22791710854384": {
+        "annihilation_antisymmetry": 0.0,
+        "contraction_error": 1.8156638296875138e-15,
+        "creation_antisymmetry": 0.0,
+        "dm1_hermiticity": 2.5066973966936767e-16,
+        "dm2_hermiticity": 2.5066973966936767e-16,
+        "projection_change": 0.0,
+        "trace_error": 1.7848223778481938e-15
+      },
+      "22791776698096": {
+        "annihilation_antisymmetry": 0.0,
+        "contraction_error": 6.223535557877517e-15,
+        "creation_antisymmetry": 0.0,
+        "dm1_hermiticity": 9.477517631003859e-17,
+        "dm2_hermiticity": 9.477517631003859e-17,
+        "projection_change": 0.0,
+        "trace_error": 7.105746280840093e-15
+      },
+      "22791777322608": {
+        "annihilation_antisymmetry": 0.0,
+        "contraction_error": 1.7767861572717566e-15,
+        "creation_antisymmetry": 0.0,
+        "dm1_hermiticity": 6.937406772900237e-17,
+        "dm2_hermiticity": 1.193812447098184e-16,
+        "projection_change": 0.0,
+        "trace_error": 3.553463045191582e-15
+      },
+      "22791777323696": {
+        "annihilation_antisymmetry": 0.0,
+        "contraction_error": 9.130888445076195e-16,
+        "creation_antisymmetry": 0.0,
+        "dm1_hermiticity": 1.2208475537112727e-16,
+        "dm2_hermiticity": 1.582691578899265e-16,
+        "projection_change": 0.0,
+        "trace_error": 1.777558072393239e-15
+      },
+      "22791777333104": {
+        "annihilation_antisymmetry": 0.0,
+        "contraction_error": 9.095799398408168e-16,
+        "creation_antisymmetry": 0.0,
+        "dm1_hermiticity": 1.3224856307691816e-16,
+        "dm2_hermiticity": 2.138283853366646e-16,
+        "projection_change": 0.0,
+        "trace_error": 3.555050938027666e-15
+      }
+    },
+    "root_energies": [
+      -22855.649222105672,
+      -22855.649222105625,
+      -22855.649222105523,
+      -22855.649222105407,
+      -22855.56206194754,
+      -22855.562061947337
+    ]
+  },
+  "status": "ok"
+}

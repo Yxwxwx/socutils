@@ -3,6 +3,7 @@
 from socutils.dmrg.dmrgci import DMRGCI
 from socutils.dmrg.kramers import (
     KramersOrbitalMap,
+    KramersManifoldRDM,
     KramersPairRDM,
     KramersResultAdapter,
     align_transition_phase,
@@ -11,6 +12,7 @@ from socutils.dmrg.kramers import (
     identify_kramers_orbitals,
     kramers_residual,
     time_reverse_integrals,
+    time_reverse_one_body,
     time_reverse_rdm1,
     time_reverse_rdm2,
 )

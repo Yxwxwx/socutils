@@ -3,8 +3,10 @@
 The general :mod:`socutils.dmrg.dmrgci` solver uses one Block2 SGF site per
 spinor.  Kramers restriction therefore does not mean discarding half of the
 spinors.  This module instead identifies the time-reversal map in the actual
-MO basis, pairs independently optimized roots, and assembles equal-weight
-pair densities in the full active spinor space.
+MO basis and validates equal-weight densities in the full active spinor
+space.  Isolated doublets are paired root by root.  Higher-dimensional exact
+degeneracies are validated as complete, basis-invariant manifolds because an
+eigensolver may return arbitrary unitary mixtures inside such a manifold.
 
 The RDM convention is the one used by ``zfci`` and ``DMRGCI``::
 
@@ -219,6 +221,19 @@ def time_reverse_rdm2(time_reversal, dm2):
     )
 
 
+def time_reverse_one_body(time_reversal, matrix):
+    r"""Time reverse one-body operator coefficients in a spinor MO basis."""
+    time_reversal = numpy.asarray(time_reversal)
+    matrix = numpy.asarray(matrix)
+    return numpy.einsum(
+        "ap,bq,pq->ab",
+        time_reversal,
+        time_reversal.conj(),
+        matrix.conj(),
+        optimize=True,
+    )
+
+
 def time_reverse_integrals(time_reversal, h1e, eri):
     r"""Time reverse spinor Hamiltonian coefficients.
 
@@ -229,9 +244,7 @@ def time_reverse_integrals(time_reversal, h1e, eri):
     matrix = numpy.asarray(time_reversal)
     h1e = numpy.asarray(h1e)
     eri = numpy.asarray(eri)
-    h1e_tr = numpy.einsum(
-        "ap,bq,pq->ab", matrix, matrix.conj(), h1e.conj(), optimize=True
-    )
+    h1e_tr = time_reverse_one_body(matrix, h1e)
     eri_tr = numpy.einsum(
         "ap,bq,cr,ds,pqrs->abcd",
         matrix,
@@ -267,7 +280,14 @@ def align_transition_phase(candidate, reference=None, tolerance=1e-14):
     if reference is None:
         if not candidate.size:
             return numpy.array(candidate, copy=True), 1.0 + 0.0j
-        value = candidate.ravel()[numpy.argmax(numpy.abs(candidate))]
+        magnitudes = numpy.abs(candidate).ravel()
+        maximum = float(numpy.max(magnitudes))
+        # Symmetry commonly produces several exactly equal largest entries.
+        # Choosing raw argmax makes roundoff decide different phase anchors
+        # for otherwise identical exact-CI and DMRG tensors.  Select the first
+        # member of the numerically tied maximum set instead.
+        tied = numpy.flatnonzero(magnitudes >= maximum * (1.0 - 1e-10))
+        value = candidate.ravel()[int(tied[0])]
         overlap = value.conjugate()
     else:
         overlap = numpy.vdot(candidate, numpy.asarray(reference))
@@ -334,7 +354,10 @@ def canonicalize_root_space_rdm1(root_space, tolerance=1e-12):
     phases = [1.0 + 0.0j]
     for root in range(1, nroot):
         transition = canonical[0, root]
-        value = transition.ravel()[numpy.argmax(numpy.abs(transition))]
+        magnitudes = numpy.abs(transition).ravel()
+        maximum = float(numpy.max(magnitudes))
+        tied = numpy.flatnonzero(magnitudes >= maximum * (1.0 - 1e-10))
+        value = transition.ravel()[int(tied[0])]
         if abs(value) <= tolerance:
             raise ValueError("root-space transition density has no phase anchor")
         phase = value.conjugate() / abs(value)
@@ -372,6 +395,19 @@ class KramersPairRDM:
     diagnostics: dict
 
 
+@dataclass(frozen=True)
+class KramersManifoldRDM:
+    """Equal-weight density of one complete energy-degenerate manifold."""
+
+    roots: tuple
+    energies: tuple
+    dm1: numpy.ndarray
+    dm2: numpy.ndarray
+    raw_dm1: numpy.ndarray
+    raw_dm2: numpy.ndarray
+    diagnostics: dict
+
+
 class KramersResultAdapter:
     """Documented adapter for Kramers-paired full-spinor DMRG results.
 
@@ -390,7 +426,6 @@ class KramersResultAdapter:
         orbital_tolerance=1e-8,
         project=False,
         projection_tolerance=None,
-        root_projection_shift=100.0,
     ):
         self.energy_tolerance = float(energy_tolerance)
         self.residual_tolerance = float(residual_tolerance)
@@ -401,15 +436,13 @@ class KramersResultAdapter:
             if projection_tolerance is None
             else projection_tolerance
         )
-        self.root_projection_shift = float(root_projection_shift)
         if min(
             self.energy_tolerance,
             self.residual_tolerance,
             self.orbital_tolerance,
             self.projection_tolerance,
-            self.root_projection_shift,
         ) <= 0:
-            raise ValueError("Kramers tolerances and projection shift must be positive")
+            raise ValueError("Kramers tolerances must be positive")
 
         self.time_reversal = None
         self.orbital_pairs = ()
@@ -417,16 +450,20 @@ class KramersResultAdapter:
         self.orbital_diagnostics = None
         self.orbital_history = []
         self.root_pairs = ()
+        self.root_manifolds = ()
         self.root_order = ()
         self.pair_results = ()
+        self.manifold_results = ()
         self.diagnostics = {}
         if time_reversal is not None:
             self.set_time_reversal(time_reversal)
 
     def clear_results(self):
         self.root_pairs = ()
+        self.root_manifolds = ()
         self.root_order = ()
         self.pair_results = ()
+        self.manifold_results = ()
         self.diagnostics = {}
 
     def set_time_reversal(self, time_reversal):
@@ -531,6 +568,45 @@ class KramersResultAdapter:
         )
         return pairs, pair_data
 
+    def _energy_manifolds(self, energies):
+        """Group roots without choosing a basis inside exact degeneracies."""
+        order = [int(root) for root in numpy.argsort(energies)]
+        manifolds = []
+        for root in order:
+            if not manifolds:
+                manifolds.append([root])
+                continue
+            first = manifolds[-1][0]
+            if abs(energies[root] - energies[first]) <= self.energy_tolerance:
+                manifolds[-1].append(root)
+            else:
+                manifolds.append([root])
+        # Root labels inside an exactly degenerate manifold carry no energy
+        # ordering.  Keep their stable public order instead of exposing
+        # roundoff-dependent ``argsort`` permutations.
+        return tuple(tuple(sorted(manifold)) for manifold in manifolds)
+
+    def _project_ensemble(self, raw_dm1, raw_dm2, residual_max):
+        if self.project:
+            if residual_max > self.projection_tolerance:
+                raise RuntimeError(
+                    "refusing Kramers projection of a raw residual %.3e"
+                    % residual_max
+                )
+            dm1 = (
+                raw_dm1 + time_reverse_rdm1(self.time_reversal, raw_dm1)
+            ) * 0.5
+            dm2 = (
+                raw_dm2 + time_reverse_rdm2(self.time_reversal, raw_dm2)
+            ) * 0.5
+        else:
+            dm1 = numpy.array(raw_dm1, copy=True)
+            dm2 = numpy.array(raw_dm2, copy=True)
+        projection_change = max(
+            _max_abs(dm1 - raw_dm1), _max_abs(dm2 - raw_dm2)
+        )
+        return dm1, dm2, projection_change
+
     def analyze(
         self,
         energies,
@@ -541,7 +617,16 @@ class KramersResultAdapter:
         overlap=None,
         projected_hamiltonian=None,
     ):
-        """Pair roots and form validated equal-weight ensemble densities."""
+        """Validate Kramers doublets or complete degenerate manifolds.
+
+        A two-dimensional energy manifold has a unique orthogonal
+        time-reversed partner for each state and is therefore checked root by
+        root.  In a four- or higher-dimensional exact degeneracy, individual
+        eigenvectors may be arbitrary unitary mixtures and pairwise diagonal
+        RDM matching is not invariant.  Such a manifold is accepted only when
+        it is complete, has equal state-average weights, and its raw
+        equal-weight 1-/2-RDM is time-reversal symmetric.
+        """
         if self.time_reversal is None:
             raise RuntimeError("time-reversal matrix has not been configured")
         energies = numpy.asarray(energies, dtype=float)
@@ -550,82 +635,114 @@ class KramersResultAdapter:
         if not (len(energies) == len(dm1s) == len(dm2s)):
             raise ValueError("energies and root RDM lists have inconsistent lengths")
 
-        root_pairs, pair_data = self._pair_roots(energies, dm1s, dm2s)
-        results = []
+        root_manifolds = self._energy_manifolds(energies)
+        pair_results = []
+        manifold_results = []
+        root_pairs = []
         raw_max = 0.0
         projection_max = 0.0
-        for pair in root_pairs:
-            i, j = pair
-            _, energy_error, partner_dm1, partner_dm2 = pair_data[pair]
-            if energy_error > self.energy_tolerance:
+        for manifold in root_manifolds:
+            if len(manifold) % 2:
                 raise RuntimeError(
-                    "Kramers-pair energy splitting %.3e exceeds %.3e"
-                    % (energy_error, self.energy_tolerance)
+                    "odd-electron Kramers energy manifold at %.12g Eh has "
+                    "odd dimension %d"
+                    % (energies[manifold[0]], len(manifold))
                 )
-            if max(partner_dm1, partner_dm2) > self.residual_tolerance:
+            manifold_energies = energies[list(manifold)]
+            energy_spread = float(numpy.ptp(manifold_energies))
+            if energy_spread > self.energy_tolerance:
                 raise RuntimeError(
-                    "raw Kramers partner residual is too large "
-                    "(dm1 %.3e, dm2 %.3e)" % (partner_dm1, partner_dm2)
+                    "Kramers manifold energy spread %.3e exceeds %.3e"
+                    % (energy_spread, self.energy_tolerance)
                 )
-            if weights is not None and abs(weights[i] - weights[j]) > 1e-14:
-                raise RuntimeError(
-                    "members of a Kramers pair must have equal state-average weights"
-                )
+            if weights is not None:
+                manifold_weights = numpy.asarray(weights)[list(manifold)]
+                if numpy.ptp(manifold_weights) > 1e-14:
+                    raise RuntimeError(
+                        "members of a Kramers manifold must have equal "
+                        "state-average weights"
+                    )
 
-            raw_dm1 = (dm1s[i] + dm1s[j]) * 0.5
-            raw_dm2 = (dm2s[i] + dm2s[j]) * 0.5
+            raw_dm1 = sum(dm1s[root] for root in manifold) / len(manifold)
+            raw_dm2 = sum(dm2s[root] for root in manifold) / len(manifold)
             residual = kramers_residual(
                 self.time_reversal, raw_dm1, raw_dm2
             )
-            raw_pair_max = max(residual.values())
-            raw_max = max(raw_max, raw_pair_max)
-            if raw_pair_max > self.residual_tolerance:
+            raw_manifold_max = max(residual.values())
+            raw_max = max(raw_max, raw_manifold_max)
+            if raw_manifold_max > self.residual_tolerance:
                 raise RuntimeError(
-                    "raw Kramers ensemble residual %.3e exceeds %.3e"
-                    % (raw_pair_max, self.residual_tolerance)
+                    "raw Kramers manifold residual %.3e exceeds %.3e"
+                    % (raw_manifold_max, self.residual_tolerance)
                 )
-
-            if self.project:
-                if raw_pair_max > self.projection_tolerance:
-                    raise RuntimeError(
-                        "refusing Kramers projection of a raw residual %.3e"
-                        % raw_pair_max
-                    )
-                dm1 = (
-                    raw_dm1
-                    + time_reverse_rdm1(self.time_reversal, raw_dm1)
-                ) * 0.5
-                dm2 = (
-                    raw_dm2
-                    + time_reverse_rdm2(self.time_reversal, raw_dm2)
-                ) * 0.5
-            else:
-                dm1 = numpy.array(raw_dm1, copy=True)
-                dm2 = numpy.array(raw_dm2, copy=True)
-            projection_change = max(
-                _max_abs(dm1 - raw_dm1), _max_abs(dm2 - raw_dm2)
+            dm1, dm2, projection_change = self._project_ensemble(
+                raw_dm1, raw_dm2, raw_manifold_max
             )
             projection_max = max(projection_max, projection_change)
-            diagnostics = {
-                "energy_splitting": float(energy_error),
-                "partner_dm1_residual": float(partner_dm1),
-                "partner_dm2_residual": float(partner_dm2),
+            manifold_diagnostics = {
+                "dimension": len(manifold),
+                "energy_spread": energy_spread,
+                "basis_invariant_validation": len(manifold) > 2,
                 "raw_ensemble_dm1_residual": residual["dm1"],
                 "raw_ensemble_dm2_residual": residual["dm2"],
                 "projection_applied": self.project,
                 "projection_change": projection_change,
             }
-            results.append(
-                KramersPairRDM(
-                    pair,
-                    (float(energies[i]), float(energies[j])),
+            manifold_results.append(
+                KramersManifoldRDM(
+                    manifold,
+                    tuple(float(value) for value in manifold_energies),
                     dm1,
                     dm2,
                     numpy.array(raw_dm1, copy=True),
                     numpy.array(raw_dm2, copy=True),
-                    diagnostics,
+                    manifold_diagnostics,
                 )
             )
+
+            if len(manifold) == 2:
+                i, j = manifold
+                energy_error = abs(energies[i] - energies[j])
+                tr1_i = time_reverse_rdm1(self.time_reversal, dm1s[i])
+                tr1_j = time_reverse_rdm1(self.time_reversal, dm1s[j])
+                tr2_i = time_reverse_rdm2(self.time_reversal, dm2s[i])
+                tr2_j = time_reverse_rdm2(self.time_reversal, dm2s[j])
+                partner_dm1 = max(
+                    _max_abs(dm1s[j] - tr1_i),
+                    _max_abs(dm1s[i] - tr1_j),
+                )
+                partner_dm2 = max(
+                    _max_abs(dm2s[j] - tr2_i),
+                    _max_abs(dm2s[i] - tr2_j),
+                )
+                if max(partner_dm1, partner_dm2) > self.residual_tolerance:
+                    raise RuntimeError(
+                        "raw Kramers partner residual is too large "
+                        "(dm1 %.3e, dm2 %.3e; tolerance %.3e)"
+                        % (
+                            partner_dm1,
+                            partner_dm2,
+                            self.residual_tolerance,
+                        )
+                    )
+                pair_diagnostics = dict(
+                    manifold_diagnostics,
+                    energy_splitting=float(energy_error),
+                    partner_dm1_residual=float(partner_dm1),
+                    partner_dm2_residual=float(partner_dm2),
+                )
+                root_pairs.append(manifold)
+                pair_results.append(
+                    KramersPairRDM(
+                        manifold,
+                        tuple(float(value) for value in manifold_energies),
+                        dm1,
+                        dm2,
+                        numpy.array(raw_dm1, copy=True),
+                        numpy.array(raw_dm2, copy=True),
+                        pair_diagnostics,
+                    )
+                )
 
         orthogonality_error = None
         projected_hamiltonian_error = None
@@ -641,7 +758,15 @@ class KramersResultAdapter:
                 )
         if projected_hamiltonian is not None:
             projected_hamiltonian = numpy.asarray(projected_hamiltonian)
-            target = numpy.diag(energies)
+            # For approximate normalized roots, the projected eigen-equation
+            # is H C = S C E.  Comparing directly with diag(E) spuriously
+            # amplifies a roundoff-level overlap by a heavy atom's large
+            # constant core energy; H - S E cancels that constant exactly.
+            target = (
+                numpy.diag(energies)
+                if overlap is None
+                else overlap * energies[numpy.newaxis, :]
+            )
             projected_hamiltonian_error = _max_abs(
                 projected_hamiltonian - target
             )
@@ -651,17 +776,28 @@ class KramersResultAdapter:
                     % (projected_hamiltonian_error, self.energy_tolerance)
                 )
 
-        self.root_pairs = root_pairs
-        self.root_order = tuple(root for pair in root_pairs for root in pair)
-        self.pair_results = tuple(results)
+        self.root_pairs = tuple(root_pairs)
+        self.root_manifolds = root_manifolds
+        self.root_order = tuple(
+            root for manifold in root_manifolds for root in manifold
+        )
+        self.pair_results = tuple(pair_results)
+        self.manifold_results = tuple(manifold_results)
         self.diagnostics = {
-            "root_pairs": root_pairs,
+            "root_pairs": self.root_pairs,
+            "root_manifolds": self.root_manifolds,
+            "unresolved_manifolds": tuple(
+                manifold for manifold in root_manifolds if len(manifold) > 2
+            ),
             "root_order": self.root_order,
             "raw_ensemble_residual": raw_max,
             "projection_change": projection_max,
             "projection_applied": self.project,
             "root_orthogonality_error": orthogonality_error,
             "projected_hamiltonian_error": projected_hamiltonian_error,
-            "pairs": [dict(result.diagnostics) for result in results],
+            "pairs": [dict(result.diagnostics) for result in pair_results],
+            "manifolds": [
+                dict(result.diagnostics) for result in manifold_results
+            ],
         }
         return self.pair_results

@@ -117,9 +117,12 @@ The CASSCF boundary derives the time-reversal matrix from the *current* active
 MO coefficients at every macroiteration.  It validates active-space closure,
 partner indices, and partner phases rather than assuming that ``2*i`` and
 ``2*i+1`` are paired.  Individual odd-electron roots are not forced to have a
-Kramers-symmetric density.  Instead, roots are independently optimized and
-orthogonalized, paired from their raw RDMs and energies, and then averaged
-with equal weight in the full active spinor space.
+Kramers-symmetric density.  All roots are optimized together in one
+state-averaged ``MultiMPS`` using the same weights as the CASSCF functional.
+Multi-root jobs finish with one-site sweeps, after which ``DMRGCI`` verifies
+the complete split-root overlap and projected eigen-equation matrices.
+Complete degenerate manifolds are then validated and averaged in the full
+active spinor space.
 
 ``mc.fcisolver.kramers_diagnostics`` reports root pairs, raw partner and
 ensemble time-reversal residuals, root orthogonality, the projected

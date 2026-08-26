@@ -26,6 +26,103 @@ def expmat(x):
 
 from scipy.linalg import expm as expmat
 
+
+def _canonical_generalized_eigh(projected_h, projected_s, lindep):
+    """Solve a Hermitian generalized problem on the reliable metric range.
+
+    Super-CI has exact zero-metric orbital directions when an active natural
+    occupation is zero or one.  Finite-accuracy RDMs can turn those zeros into
+    tiny eigenvalues of either sign, for which a Cholesky-based generalized
+    eigensolver is neither defined nor numerically meaningful.  Canonical
+    orthogonalization removes only that unresolved null space and retains a
+    strict guard against a materially indefinite metric.
+    """
+    metric_eigenvalues, metric_eigenvectors = scipy.linalg.eigh(projected_s)
+    metric_scale = max(
+        1.0, float(np.max(np.abs(metric_eigenvalues), initial=0.0))
+    )
+    minimum_metric_eigenvalue = float(metric_eigenvalues[0])
+    negative_noise = max(0.0, -minimum_metric_eigenvalue)
+    negative_tolerance = np.sqrt(lindep) * metric_scale
+    if negative_noise > negative_tolerance:
+        raise RuntimeError(
+            "Super-CI projected metric is materially indefinite: "
+            "minimum eigenvalue %.6e, tolerance %.6e"
+            % (minimum_metric_eigenvalue, negative_tolerance)
+        )
+
+    metric_cutoff = max(lindep * metric_scale, 10.0 * negative_noise)
+    keep = metric_eigenvalues > metric_cutoff
+    if not np.any(keep):
+        raise RuntimeError(
+            "Super-CI projected metric has no numerically independent "
+            "directions"
+        )
+    orthogonalizer = metric_eigenvectors[:, keep] / np.sqrt(
+        metric_eigenvalues[keep]
+    )[None, :]
+    orthogonal_h = reduce(
+        np.dot,
+        (orthogonalizer.T.conj(), projected_h, orthogonalizer),
+    )
+    orthogonal_h = (orthogonal_h + orthogonal_h.T.conj()) * 0.5
+    eigenvalues, orthogonal_eigenvectors = scipy.linalg.eigh(orthogonal_h)
+    eigenvectors = orthogonalizer.dot(orthogonal_eigenvectors)
+    diagnostics = {
+        'metric_rank': int(np.count_nonzero(keep)),
+        'metric_dimension': int(projected_s.shape[0]),
+        'metric_min_eigenvalue': minimum_metric_eigenvalue,
+        'metric_cutoff': float(metric_cutoff),
+        'metric_discarded_directions': int(np.count_nonzero(~keep)),
+    }
+    return eigenvalues, eigenvectors, diagnostics
+
+
+def _physical_active_density(casdm1, tolerance=1e-7):
+    """Return a Hermitian, roundoff-bounded spinor 1-RDM for the metric."""
+    casdm1 = np.asarray(casdm1, dtype=complex)
+    hermiticity_error = float(np.max(abs(casdm1 - casdm1.T.conj())))
+    hermitian_dm1 = (casdm1 + casdm1.T.conj()) * 0.5
+    occupations, orbitals = scipy.linalg.eigh(hermitian_dm1)
+    lower_violation = max(0.0, -float(occupations[0]))
+    upper_violation = max(0.0, float(occupations[-1]) - 1.0)
+    representability_error = max(
+        hermiticity_error, lower_violation, upper_violation
+    )
+    if representability_error > tolerance:
+        raise RuntimeError(
+            "Super-CI active 1-RDM violates spinor N-representability by "
+            "%.6e (tolerance %.6e)"
+            % (representability_error, tolerance)
+        )
+    bounded_occupations = np.clip(occupations, 0.0, 1.0)
+    bounded_dm1 = (orbitals * bounded_occupations).dot(orbitals.T.conj())
+    diagnostics = {
+        'dm1_hermiticity_error': hermiticity_error,
+        'minimum_natural_occupation': float(occupations[0]),
+        'maximum_natural_occupation': float(occupations[-1]),
+        'occupation_bound_correction': float(
+            np.max(abs(bounded_occupations - occupations), initial=0.0)
+        ),
+    }
+    return bounded_dm1, diagnostics
+
+
+def _apply_superci_metric(generator, active_density, ncore, nocc):
+    """Apply the covariant Super-CI overlap metric to a MO generator."""
+    generator = np.asarray(generator, dtype=complex)
+    active_density = np.asarray(active_density, dtype=complex)
+    ncas = nocc - ncore
+    metric_hole = np.eye(ncas, dtype=complex) - active_density
+    result = np.array(generator, copy=True)
+    virtual_active = generator[nocc:, ncore:nocc].dot(active_density)
+    active_core = metric_hole.dot(generator[ncore:nocc, :ncore])
+    result[nocc:, ncore:nocc] = virtual_active
+    result[ncore:nocc, nocc:] = -virtual_active.T.conj()
+    result[ncore:nocc, :ncore] = active_core
+    result[:ncore, ncore:nocc] = -active_core.T.conj()
+    return result
+
 def form_kramers(mo_coeff):
     nao = mo_coeff.shape[0]//2
     # a, b for alpha and beta atomic orbitals
@@ -174,9 +271,11 @@ def davidson(hop, g, hdiag, sop=None, max_stepsize=1.0, tol=5e-6,
         projected_s = xsub.T.conj().dot(ssub)
         projected_h = (projected_h + projected_h.T.conj()) * 0.5
         projected_s = (projected_s + projected_s.T.conj()) * 0.5
-        eigvals, eigvecs = scipy.linalg.eigh(projected_h, projected_s)
+        eigvals, eigvecs, metric_info = _canonical_generalized_eigh(
+            projected_h, projected_s, lindep
+        )
 
-        root = next((i for i in range(m + 1)
+        root = next((i for i in range(eigvecs.shape[1])
                      if 0.1 < abs(eigvecs[0, i]) <= 1.1), None)
         if root is None:
             raise RuntimeError('No root with a usable reference component '
@@ -204,6 +303,7 @@ def davidson(hop, g, hdiag, sop=None, max_stepsize=1.0, tol=5e-6,
             'max_stepsize': float(max_stepsize),
             'root': root,
             'reason': 'converged' if converged else 'maximum_space',
+            **metric_info,
         }
         if log is not None:
             log.debug('Super-CI Davidson iter %d root %d eigenvalue %.12g '
@@ -267,6 +367,79 @@ def _subspace_eigh(casscf, matrix, mo_subspace):
 def _active_natural_orbitals(casscf, casdm1, mo_active):
     """Diagonalize the active 1-RDM using the reference's symmetry when needed."""
     return _subspace_eigh(casscf, -casdm1, mo_active)
+
+
+def _project_kramers_rotation(casscf, mo, generator):
+    """Project an orbital generator onto the time-reversal invariant space."""
+    from socutils.dmrg.kramers import (
+        identify_kramers_orbitals,
+        time_reverse_one_body,
+    )
+    from socutils.scf import spinor_hf
+
+    if not isinstance(casscf._scf, spinor_hf.KRHF):
+        return generator, None
+
+    mapping = identify_kramers_orbitals(
+        casscf.mol,
+        mo,
+        casscf._scf.get_ovlp(),
+        tolerance=1e-8,
+    )
+    # Use the phase-resolved, exactly sparse representation rather than the
+    # measured matrix's roundoff-level off-pair entries.  This makes the
+    # symmetry projection idempotent and prevents a sequence of orbital steps
+    # from accumulating Kramers-closure drift.
+    time_reversal = np.zeros_like(mapping.time_reversal)
+    ncore = casscf.ncore
+    nocc = ncore + casscf.ncas
+
+    def orbital_space(index):
+        if index < ncore:
+            return "core"
+        if index < nocc:
+            return "active"
+        return "virtual"
+
+    for (first, second), phase in zip(mapping.pairs, mapping.phases):
+        if orbital_space(first) != orbital_space(second):
+            raise RuntimeError(
+                "a Kramers orbital pair crosses a core/active/virtual boundary"
+            )
+        phase /= abs(phase)
+        time_reversal[second, first] = phase
+        time_reversal[first, second] = -phase
+
+    input_residual = float(
+        np.max(abs(generator - time_reverse_one_body(time_reversal, generator)))
+    )
+    projected = (
+        generator + time_reverse_one_body(time_reversal, generator)
+    ) * 0.5
+    projected = (projected - projected.T.conj()) * 0.5
+    # Remove any redundant within-space elements after projection.  Because
+    # every Kramers pair lies wholly inside one orbital space, this mask
+    # commutes with time reversal.
+    projected = casscf.unpack_uniq_var(casscf.pack_uniq_var(projected))
+    projected = (
+        projected + time_reverse_one_body(time_reversal, projected)
+    ) * 0.5
+    projected = (projected - projected.T.conj()) * 0.5
+    output_residual = float(
+        np.max(abs(projected - time_reverse_one_body(time_reversal, projected)))
+    )
+    return projected, {
+        "input_generator_residual": input_residual,
+        "output_generator_residual": output_residual,
+        "projection_change_norm": float(norm(projected - generator)),
+        "orbital_closure_before_step": mapping.diagnostics[
+            "subspace_closure_error"
+        ],
+        "orbital_partner_error_before_step": mapping.diagnostics[
+            "partner_orbital_error"
+        ],
+        "pairs": mapping.pairs,
+    }
 
 
 def _ci_convergence_snapshot(solver):
@@ -478,16 +651,17 @@ def gen_g_hop(casscf, mo, casdm1, casdm2, eris):
 
     n_uniq_var = g_orb.shape[0]
     hop = LinearOperator((n_uniq_var,n_uniq_var), matvec=h_op)
+    metric_dm1, metric_diagnostics = _physical_active_density(casdm1)
+    casscf.superci_metric_diagnostics = metric_diagnostics
+
     def s_op(x):
         x1 = casscf.unpack_uniq_var(x)
-        cas_natocc = casdm1.diagonal()
-        for iact in range(ncore,nocc):
-            inatocc = cas_natocc[iact-ncore]
-            x1[nocc:,iact] *= inatocc
-            x1[iact,nocc:] *= inatocc
-            x1[:ncore,iact] *= 1.0 - inatocc
-            x1[iact,:ncore] *= 1.0 - inatocc
-        return casscf.pack_uniq_var(x1)
+        # In a natural-orbital basis these products reduce to the historical
+        # elementwise factors n_t and 1-n_t.  Keeping the full density makes
+        # the Super-CI metric covariant under arbitrary active-space rotations
+        # (including rotations inside exactly degenerate Kramers manifolds).
+        sx1 = _apply_superci_metric(x1, metric_dm1, ncore, nocc)
+        return casscf.pack_uniq_var(sx1)
     sop = LinearOperator((n_uniq_var, n_uniq_var), matvec=s_op)
     def h_diag_inv(x):
         return x/(casscf.pack_uniq_var(h_diag+h_diag.T))
@@ -655,6 +829,7 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
             'ci_solver_diagnostics': _ci_convergence_snapshot(mc.fcisolver),
             'cholesky_active': cholesky_info['active'],
             'cholesky_naux': int(eris.cd_pa.shape[0]),
+            'superci_metric': dict(mc.superci_metric_diagnostics),
         }
         macro_history.append(history_entry)
 
@@ -764,6 +939,14 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
             print('step rescaled')
             dr = dr * (step_control / norm(dr))
             print(norm(dr))
+        dr, kramers_rotation = _project_kramers_rotation(mc, mo, dr)
+        if kramers_rotation is not None:
+            history_entry['kramers_rotation'] = kramers_rotation
+            log.info('Kramers-projected orbital generator: input residual '
+                     '%.6g, output residual %.6g, change %.6g',
+                     kramers_rotation['input_generator_residual'],
+                     kramers_rotation['output_generator_residual'],
+                     kramers_rotation['projection_change_norm'])
         history_entry['applied_orbital_step_norm'] = float(norm(dr))
         applied_x = mc.pack_uniq_var(dr)
         rotation = expmat(dr)
@@ -898,6 +1081,7 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
         'energy_tolerance': float(conv_tol),
         'gradient_tolerance': float(conv_tol_grad),
         'linear_solver': last_linear_info,
+        'metric': dict(mc.superci_metric_diagnostics),
         'cholesky': cholesky_info,
         'macro_iterations': int(imacro),
     }

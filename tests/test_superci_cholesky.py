@@ -168,6 +168,75 @@ def test_superci_davidson_complex_residual():
     assert np.max(abs(step - expected_step)) <= 1e-10
 
 
+def test_superci_davidson_deflates_roundoff_indefinite_metric():
+    hessian = np.diag([1.0, 1.7, 2.4, 3.1]).astype(complex)
+    overlap = np.diag([1.0, 0.6, 0.2, -1e-10]).astype(complex)
+    gradient = np.array([0.03, -0.02j, 0.01, 0.0], dtype=complex)
+
+    step, eigenvalue, info = zmc_superci.davidson(
+        lambda x: hessian.dot(x),
+        gradient,
+        np.diag(hessian).real,
+        sop=lambda x: overlap.dot(x),
+        tol=1e-11,
+        mmax=4,
+    )
+    augmented = np.zeros((5, 5), dtype=complex)
+    metric = np.zeros((5, 5), dtype=complex)
+    augmented[0, 1:] = gradient.conj()
+    augmented[1:, 0] = gradient
+    augmented[1:, 1:] = hessian
+    metric[0, 0] = 1.0
+    metric[1:, 1:] = overlap
+    residual = augmented.dot(np.r_[1.0, step]) - \
+        eigenvalue * metric.dot(np.r_[1.0, step])
+
+    _, _, metric_info = zmc_superci._canonical_generalized_eigh(
+        hessian, overlap, lindep=1e-12
+    )
+
+    assert info['converged']
+    assert metric_info['metric_min_eigenvalue'] < 0.0
+    assert metric_info['metric_discarded_directions'] == 1
+    assert metric_info['metric_rank'] == 3
+    assert np.linalg.norm(residual) <= 1e-11
+    assert abs(step[-1]) <= 1e-12
+
+
+def test_superci_metric_is_active_rotation_covariant_and_bounded():
+    rng = np.random.default_rng(812)
+    trial = rng.normal(size=(2, 2)) + 1j * rng.normal(size=(2, 2))
+    active_rotation = np.linalg.qr(trial)[0]
+    occupations = np.array([1.0 + 2e-10, -3e-10])
+    raw_density = (active_rotation * occupations).dot(
+        active_rotation.T.conj()
+    )
+    active_density, diagnostics = zmc_superci._physical_active_density(
+        raw_density
+    )
+    assert diagnostics['occupation_bound_correction'] == pytest.approx(3e-10)
+    assert np.max(abs(np.linalg.eigvalsh(active_density) - [0.0, 1.0])) <= 1e-12
+
+    generator = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    generator = generator - generator.T.conj()
+    generator[1:3, 1:3] = 0.0
+    basis_change = scipy.linalg.block_diag(1.0, active_rotation, 1.0)
+    rotated_generator = basis_change.T.conj() @ generator @ basis_change
+    rotated_density = (
+        active_rotation.T.conj() @ active_density @ active_rotation
+    )
+    metric_generator = zmc_superci._apply_superci_metric(
+        generator, active_density, ncore=1, nocc=3
+    )
+    rotated_metric_generator = zmc_superci._apply_superci_metric(
+        rotated_generator, rotated_density, ncore=1, nocc=3
+    )
+    expected_rotated = (
+        basis_change.T.conj() @ metric_generator @ basis_change
+    )
+    assert np.max(abs(rotated_metric_generator - expected_rotated)) <= 1e-12
+
+
 @pytest.mark.integration
 def test_fixed_orbital_fci_dmrg_gradient(tilted_hf, tmp_path):
     mol, _, mf_cd, mo = tilted_hf

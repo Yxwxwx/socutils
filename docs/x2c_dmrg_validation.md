@@ -270,16 +270,15 @@ have a time-reversal-symmetric RDM.  The adapter therefore:
 4. forms an equal-weight pair average in the full active spinor space; and
 5. reports the raw ensemble time-reversal residual before any projection.
 
-Exactly degenerate complex Block2 `MultiMPS` roots cannot safely be handled
-by blindly splitting the state-averaged object.  In the four-spinor test the
-reported two energies were exact, but the split states had overlap magnitude
-`2.74e-1`; their RDM-reconstructed energies were `0.0641` and `0.2889` Eh
-instead of `-0.1715` Eh.  Kramers mode consequently optimizes each root as a
-single MPS and projects all earlier roots with a configurable positive shift
-(`root_projection_shift=100` Eh by default).  The resulting overlap and
-projected-Hamiltonian residuals are both checked before the RDMs are accepted.
-The ordinary general-complex multi-root route still uses `MultiMPS` and has a
-dedicated unchanged-path regression.
+Multi-root calculations use one Block2 state-averaged `MultiMPS`, with its
+weights copied from the PySCF state-average wrapper.  Four-spinor diagnostics
+showed that splitting a pure two-site endpoint can produce MPSs inconsistent
+with the reported energies: the default Olsen preconditioner fails at an exact
+degeneracy, while Davidson preconditioning fails in a nondegenerate test.
+Finishing with one-site sweeps removes both failures for Olsen, Davidson,
+exact-local, and unpreconditioned solvers.  `DMRGCI` therefore inserts a
+two-site-to-one-site transition for multi-root jobs and checks both `S - I`
+and `H - S E` for every split root space before accepting any RDM.
 
 RDM projection is off by default.  With `project=True`, the adapter replaces
 an already validated pair density by `(D + Theta(D))/2`; it refuses to do so
@@ -356,8 +355,7 @@ The CASCI solver boundary receives the reconstructed active four-index tensor;
 Block2 does not consume Cholesky factors directly.  Kramers mode retains the
 full spinor space and requires a complete even root manifold for odd-electron
 systems; pair members used by PySCF state averaging must have equal weights.
-The state-specific projection shift is configurable for unusually wide active
-spectra.  Kramers-restricted Super-CIPT is outside the later Phase-4 scope.
+Kramers-restricted Super-CIPT is outside the later Phase-4 scope.
 
 The immutable old-code baseline, paper equation map, Pykylin replacement, and
 Phase-4 exact/Block2 Super-CIPT results are recorded separately in

@@ -1,0 +1,542 @@
+{
+  "macro_history": [
+    {
+      "accepted_energy_change": -0.03151041992168757,
+      "applied_orbital_step_norm": 0.17640619904649996,
+      "cas_energy": -13.147463826057901,
+      "cholesky_active": true,
+      "cholesky_naux": 437,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {},
+      "converged": false,
+      "energy_change": null,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 8,
+        "max_stepsize": 0.5,
+        "reason": "converged",
+        "residual_history": [
+          0.03820669455577303,
+          0.008730456949044932,
+          0.001054882511114218,
+          0.00016560168597935205,
+          3.219949788214578e-05,
+          9.436348252321553e-06,
+          3.089638997321918e-06,
+          8.326782348804063e-08
+        ],
+        "residual_norm": 8.326782348804063e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 0.12473801958912396
+      },
+      "macro_iteration": 0,
+      "natural_occupations": [
+        0.9999999999999999,
+        0.9999999999999993,
+        0.8333333333333336,
+        0.8333333333333335,
+        0.8333333333333334,
+        0.8333333333333333,
+        0.833333333333333,
+        0.8333333333333328
+      ],
+      "next_ci_solver_diagnostics": {},
+      "next_natural_occupations": [
+        0.9999999999999996,
+        0.9999999999999993,
+        0.8333333333333331,
+        0.833333333333333,
+        0.8333333333333329,
+        0.8333333333333327,
+        0.8333333333333326,
+        0.8333333333333325
+      ],
+      "next_total_energy": -2604.35140700868,
+      "orbital_gradient_norm": 0.2035566191761464,
+      "orbital_step_norm": 0.0,
+      "predicted_energy_change": -0.011448460311707471,
+      "proposed_orbital_step_norm": 0.17640619904649996,
+      "total_energy": -2604.319896588758
+    },
+    {
+      "accepted_energy_change": -0.00607806740072192,
+      "applied_orbital_step_norm": 0.10083599576562849,
+      "cas_energy": -13.171269735681108,
+      "cholesky_active": true,
+      "cholesky_naux": 437,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {},
+      "converged": false,
+      "energy_change": -0.03151041992168757,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 9,
+        "max_stepsize": 0.7,
+        "reason": "converged",
+        "residual_history": [
+          0.016379662394677894,
+          0.004925919329060444,
+          0.00039292689422257157,
+          6.84005551414831e-05,
+          1.2695562198425705e-05,
+          5.656966111838964e-06,
+          5.563314735085131e-07,
+          1.7412983863260153e-07,
+          1.0332544144327736e-08
+        ],
+        "residual_norm": 1.0332544144327736e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 0.07130181639357389
+      },
+      "macro_iteration": 1,
+      "natural_occupations": [
+        0.9999999999999996,
+        0.9999999999999993,
+        0.8333333333333331,
+        0.833333333333333,
+        0.8333333333333329,
+        0.8333333333333327,
+        0.8333333333333326,
+        0.8333333333333325
+      ],
+      "next_ci_solver_diagnostics": {},
+      "next_natural_occupations": [
+        1.0000000000000002,
+        1.0,
+        0.833333333333334,
+        0.8333333333333338,
+        0.8333333333333337,
+        0.8333333333333334,
+        0.833333333333333,
+        0.8333333333333329
+      ],
+      "next_total_energy": -2604.3574850760806,
+      "orbital_gradient_norm": 0.07418906144999596,
+      "orbital_step_norm": 0.17640619904649996,
+      "predicted_energy_change": -0.002501423789156872,
+      "proposed_orbital_step_norm": 0.10083599576562849,
+      "total_energy": -2604.35140700868
+    },
+    {
+      "accepted_energy_change": -0.0004642476060325862,
+      "applied_orbital_step_norm": 0.03297937186780722,
+      "cas_energy": -13.179478601729443,
+      "cholesky_active": true,
+      "cholesky_naux": 437,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {},
+      "converged": false,
+      "energy_change": -0.00607806740072192,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 8,
+        "max_stepsize": 0.9799999999999999,
+        "reason": "converged",
+        "residual_history": [
+          0.011498461127585836,
+          0.001984784431335275,
+          0.0004508071425767058,
+          5.6349850637669615e-05,
+          1.4076095696725472e-05,
+          2.6532601455495137e-06,
+          6.910886963332593e-07,
+          9.98176646977898e-08
+        ],
+        "residual_norm": 9.98176646977898e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 0.023319937486999353
+      },
+      "macro_iteration": 2,
+      "natural_occupations": [
+        1.0000000000000002,
+        1.0,
+        0.833333333333334,
+        0.8333333333333338,
+        0.8333333333333337,
+        0.8333333333333334,
+        0.833333333333333,
+        0.8333333333333329
+      ],
+      "next_ci_solver_diagnostics": {},
+      "next_natural_occupations": [
+        1.0000000000000009,
+        0.9999999999999999,
+        0.8333333333333335,
+        0.8333333333333334,
+        0.8333333333333334,
+        0.8333333333333334,
+        0.833333333333333,
+        0.8333333333333329
+      ],
+      "next_total_energy": -2604.3579493236866,
+      "orbital_gradient_norm": 0.026473586304060562,
+      "orbital_step_norm": 0.10083599576562849,
+      "predicted_energy_change": -0.00022533002783022075,
+      "proposed_orbital_step_norm": 0.03297937186780722,
+      "total_energy": -2604.3574850760806
+    },
+    {
+      "accepted_energy_change": -4.577466825139709e-06,
+      "applied_orbital_step_norm": 0.0019136404414359061,
+      "cas_energy": -13.184699172644287,
+      "cholesky_active": true,
+      "cholesky_naux": 437,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {},
+      "converged": false,
+      "energy_change": -0.0004642476060325862,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 7,
+        "max_stepsize": 1.0,
+        "reason": "converged",
+        "residual_history": [
+          0.0007754633158779839,
+          0.0002442612818118107,
+          8.173010840746346e-05,
+          1.1986169405445065e-05,
+          1.2057985276119913e-06,
+          2.6310580190997554e-07,
+          1.653343195101205e-08
+        ],
+        "residual_norm": 1.653343195101205e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 0.0013531481328921476
+      },
+      "macro_iteration": 3,
+      "natural_occupations": [
+        1.0000000000000009,
+        0.9999999999999999,
+        0.8333333333333335,
+        0.8333333333333334,
+        0.8333333333333334,
+        0.8333333333333334,
+        0.833333333333333,
+        0.8333333333333329
+      ],
+      "next_ci_solver_diagnostics": {},
+      "next_natural_occupations": [
+        0.9999999999999998,
+        0.9999999999999996,
+        0.8333333333333415,
+        0.8333333333333334,
+        0.833333333333333,
+        0.8333333333333329,
+        0.8333333333333328,
+        0.8333333333333254
+      ],
+      "next_total_energy": -2604.3579539011535,
+      "orbital_gradient_norm": 0.004397905390091949,
+      "orbital_step_norm": 0.03297937186780722,
+      "predicted_energy_change": -2.0724310135780708e-06,
+      "proposed_orbital_step_norm": 0.0019136404414359061,
+      "total_energy": -2604.3579493236866
+    },
+    {
+      "accepted_energy_change": -8.413780960836448e-08,
+      "applied_orbital_step_norm": 0.00035658463044027357,
+      "cas_energy": -13.184440289962367,
+      "cholesky_active": true,
+      "cholesky_naux": 437,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {},
+      "converged": false,
+      "energy_change": -4.577466825139709e-06,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 5,
+        "max_stepsize": 1.0,
+        "reason": "converged",
+        "residual_history": [
+          0.00010270101028876423,
+          3.972526704072282e-05,
+          1.2995623268638384e-05,
+          5.759710707332604e-07,
+          9.61396090652349e-08
+        ],
+        "residual_norm": 9.61396090652349e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 0.00025214341025121644
+      },
+      "macro_iteration": 4,
+      "natural_occupations": [
+        0.9999999999999998,
+        0.9999999999999996,
+        0.8333333333333415,
+        0.8333333333333334,
+        0.833333333333333,
+        0.8333333333333329,
+        0.8333333333333328,
+        0.8333333333333254
+      ],
+      "next_ci_solver_diagnostics": {},
+      "next_natural_occupations": [
+        0.9999999999999999,
+        0.9999999999999999,
+        0.8333333333333334,
+        0.8333333333333334,
+        0.8333333333333333,
+        0.8333333333333331,
+        0.8333333333333325,
+        0.8333333333333324
+      ],
+      "next_total_energy": -2604.3579539852913,
+      "orbital_gradient_norm": 0.0003996835621755006,
+      "orbital_step_norm": 0.0019136404414359061,
+      "predicted_energy_change": -3.6913848528760384e-08,
+      "proposed_orbital_step_norm": 0.00035658463044027357,
+      "total_energy": -2604.3579539011535
+    },
+    {
+      "accepted_energy_change": -3.192326403222978e-09,
+      "applied_orbital_step_norm": 7.709371250684592e-05,
+      "cas_energy": -13.184461080235906,
+      "cholesky_active": true,
+      "cholesky_naux": 437,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {},
+      "converged": false,
+      "energy_change": -8.413780960836448e-08,
+      "linear_solver": {
+        "converged": true,
+        "iterations": 5,
+        "max_stepsize": 1.0,
+        "reason": "converged",
+        "residual_history": [
+          2.9050097613911283e-05,
+          6.521400889709096e-06,
+          1.266516918895189e-06,
+          1.6766539752338494e-07,
+          4.912826744741607e-08
+        ],
+        "residual_norm": 4.912826744741607e-08,
+        "root": 0,
+        "solver": "davidson",
+        "step_norm": 5.4513486900436885e-05
+      },
+      "macro_iteration": 5,
+      "natural_occupations": [
+        0.9999999999999999,
+        0.9999999999999999,
+        0.8333333333333334,
+        0.8333333333333334,
+        0.8333333333333333,
+        0.8333333333333331,
+        0.8333333333333325,
+        0.8333333333333324
+      ],
+      "next_ci_solver_diagnostics": {},
+      "next_natural_occupations": [
+        1.0,
+        0.9999999999999998,
+        0.8333333333333338,
+        0.8333333333333335,
+        0.8333333333333334,
+        0.833333333333333,
+        0.8333333333333329,
+        0.8333333333333329
+      ],
+      "next_total_energy": -2604.3579539884836,
+      "orbital_gradient_norm": 8.380766356838048e-05,
+      "orbital_step_norm": 0.00035658463044027357,
+      "predicted_energy_change": -1.4340085922436034e-09,
+      "proposed_orbital_step_norm": 7.709371250684592e-05,
+      "total_energy": -2604.3579539852913
+    },
+    {
+      "cas_energy": -13.184447266783081,
+      "cholesky_active": true,
+      "cholesky_naux": 437,
+      "ci_solver_converged": true,
+      "ci_solver_diagnostics": {},
+      "converged": true,
+      "energy_change": -3.192326403222978e-09,
+      "macro_iteration": 6,
+      "natural_occupations": [
+        1.0,
+        0.9999999999999998,
+        0.8333333333333338,
+        0.8333333333333335,
+        0.8333333333333334,
+        0.833333333333333,
+        0.8333333333333329,
+        0.8333333333333329
+      ],
+      "orbital_gradient_norm": 2.394721209613194e-05,
+      "orbital_step_norm": 7.709371250684592e-05,
+      "total_energy": -2604.3579539884836
+    }
+  ],
+  "protocol": {
+    "basis": "cc-pvtz-dk",
+    "canonicalize": true,
+    "cholesky_tau": 1e-10,
+    "conv_tol": 1e-08,
+    "conv_tol_grad": 0.0001,
+    "dmrg": {
+      "bond_dimension": 32,
+      "davidson_max_iter": 1000,
+      "ecore_in_mpo": false,
+      "energy_tolerance": 1e-12,
+      "local_squared_residual_threshold": 1e-20,
+      "n_sweeps": 8,
+      "n_threads": 1,
+      "noise": 0.0,
+      "npdm_cutoff": 1e-24,
+      "npdm_site_type": 2,
+      "random_seed": 2468,
+      "stack_memory_mb": 512.0
+    },
+    "element": "Br",
+    "hamiltonian": "spin-orbit X2C with Coulomb-only two-electron terms",
+    "initial_charge": -1,
+    "initial_reference": "Br- closed-shell X2C SCF",
+    "initial_spin": 0,
+    "max_cycle_macro": 50,
+    "max_memory_mb": 32000.0,
+    "max_stepsize": 0.2,
+    "method": "casscf-superci",
+    "natorb": false,
+    "ncas": 8,
+    "nelecas": 7,
+    "nroots": 6,
+    "superci_davidson_max_space": 30,
+    "superci_davidson_tol": 1e-07,
+    "symmetry": true,
+    "target": "neutral Br",
+    "target_charge": 0,
+    "target_spin": 1,
+    "version": 1,
+    "weights": [
+      0.16666666666666666,
+      0.16666666666666666,
+      0.16666666666666666,
+      0.16666666666666666,
+      0.16666666666666666,
+      0.16666666666666666
+    ]
+  },
+  "result": {
+    "cas_energy": -13.184447266783081,
+    "converged": true,
+    "final_gradient_norm": 2.394721209613194e-05,
+    "macroiterations": 7,
+    "natural_occupations": [
+      1.0,
+      0.9999999999999998,
+      0.8333333333333338,
+      0.8333333333333335,
+      0.8333333333333334,
+      0.833333333333333,
+      0.8333333333333329,
+      0.8333333333333329
+    ],
+    "orbital_updates": 6,
+    "root_energies": [
+      -2604.3636173724412,
+      -2604.3636173724144,
+      -2604.3636173723976,
+      -2604.3636173723457,
+      -2604.3466272206547,
+      -2604.346627220648
+    ],
+    "total_energy": -2604.3579539884836,
+    "wall_seconds": 4.642599627375603
+  },
+  "scf": {
+    "cache_reused": true,
+    "cderi": "/home/Yxwxwx/code/socutils/benchmarck/.scratch/cc-pvtz-dk/Br/cderi.h5",
+    "converged": true,
+    "energy": -2604.44578536246,
+    "history": [
+      {
+        "cycle": 0,
+        "density_change_norm": 0.2398506027664448,
+        "energy": -2604.414649743031,
+        "energy_change": null,
+        "gradient_norm": 0.39759130301393625
+      },
+      {
+        "cycle": 1,
+        "density_change_norm": 0.3900408531519005,
+        "energy": -2604.4425953643013,
+        "energy_change": -0.027945621270191623,
+        "gradient_norm": 0.2286392434352711
+      },
+      {
+        "cycle": 2,
+        "density_change_norm": 0.0627195686781852,
+        "energy": -2604.4457584728675,
+        "energy_change": -0.003163108566241135,
+        "gradient_norm": 0.0181866377260791
+      },
+      {
+        "cycle": 3,
+        "density_change_norm": 0.009032576099414769,
+        "energy": -2604.445783787821,
+        "energy_change": -2.5314953290944686e-05,
+        "gradient_norm": 0.002683916435604744
+      },
+      {
+        "cycle": 4,
+        "density_change_norm": 0.0028785840615269697,
+        "energy": -2604.4457852485248,
+        "energy_change": -1.460703970224131e-06,
+        "gradient_norm": 0.000492694351624069
+      },
+      {
+        "cycle": 5,
+        "density_change_norm": 0.0007107304325854746,
+        "energy": -2604.445785359144,
+        "energy_change": -1.1061911209253594e-07,
+        "gradient_norm": 8.497819952362975e-05
+      },
+      {
+        "cycle": 6,
+        "density_change_norm": 0.0001437192246466209,
+        "energy": -2604.4457853624554,
+        "energy_change": -3.3114702091552317e-09,
+        "gradient_norm": 5.580458371137027e-06
+      },
+      {
+        "cycle": 7,
+        "density_change_norm": 6.66722176645172e-06,
+        "energy": -2604.4457853624626,
+        "energy_change": -7.275957614183426e-12,
+        "gradient_norm": 4.013914512690583e-07
+      },
+      {
+        "cycle": 8,
+        "density_change_norm": 4.646129713518452e-07,
+        "energy": -2604.4457853624617,
+        "energy_change": 9.094947017729282e-13,
+        "gradient_norm": 2.5220707464617064e-08
+      }
+    ],
+    "iterations": 9,
+    "nao_nr": 43,
+    "naux": 437,
+    "nspinor": 86,
+    "wall_seconds": 2.6875781565904617
+  },
+  "solver": {
+    "class": "StateAverageFCISolver",
+    "converged": true,
+    "dmrg_convergence": null,
+    "rdm_diagnostics": null,
+    "root_energies": [
+      -2604.3636173724412,
+      -2604.3636173724144,
+      -2604.3636173723976,
+      -2604.3636173723457,
+      -2604.3466272206547,
+      -2604.346627220648
+    ]
+  },
+  "status": "ok"
+}

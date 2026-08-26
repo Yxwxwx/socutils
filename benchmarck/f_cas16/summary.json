@@ -1,0 +1,76 @@
+{
+  "active_space": "CAS(7 electrons, 16 spinors)",
+  "experiment_cm-1": 404.141,
+  "methods": {
+    "exact-general": {
+      "state_average_energy_eh": -99.5830127817934,
+      "gradient_norm": 2.453189264264058e-05,
+      "macroiterations": 15,
+      "splitting_cm-1": 581.1590733174226,
+      "error_cm-1": 177.01807331742253,
+      "wall_seconds": 1499.8911172449589
+    },
+    "dmrg-general": {
+      "state_average_energy_eh": -99.58301278179178,
+      "gradient_norm": 2.4528821041251997e-05,
+      "macroiterations": 15,
+      "splitting_cm-1": 581.1590902905966,
+      "error_cm-1": 177.0180902905966,
+      "wall_seconds": 1095.5093356780708
+    },
+    "exact-kramers": {
+      "state_average_energy_eh": -99.58301278179022,
+      "gradient_norm": 2.4532197527816144e-05,
+      "macroiterations": 15,
+      "splitting_cm-1": 581.1590520962766,
+      "error_cm-1": 177.01805209627656,
+      "wall_seconds": 1490.5107389464974
+    },
+    "dmrg-kramers": {
+      "state_average_energy_eh": -99.5830127817914,
+      "gradient_norm": 2.4532437904418993e-05,
+      "macroiterations": 15,
+      "splitting_cm-1": 581.1590850819967,
+      "error_cm-1": 177.01808508199673,
+      "wall_seconds": 1096.2533484995365
+    }
+  },
+  "comparisons": {
+    "exact_vs_dmrg_general": {
+      "absolute_state_average_energy_eh": 1.6200374375330284e-12,
+      "absolute_splitting_cm-1": 1.697317406978982e-05,
+      "active_projector_max_abs": 1.1733009586123444e-07
+    },
+    "exact_vs_dmrg_kramers": {
+      "absolute_state_average_energy_eh": 1.1795009413617663e-12,
+      "absolute_splitting_cm-1": 3.298572016774415e-05,
+      "active_projector_max_abs": 6.723139933662026e-08
+    },
+    "general_vs_kramers_exact": {
+      "absolute_state_average_energy_eh": 3.183231456205249e-12,
+      "absolute_splitting_cm-1": 2.1221145971139777e-05,
+      "active_projector_max_abs": 1.316580929833222e-07
+    },
+    "general_vs_kramers_dmrg": {
+      "absolute_state_average_energy_eh": 3.836930773104541e-13,
+      "absolute_splitting_cm-1": 5.208599873185449e-06,
+      "active_projector_max_abs": 1.4563419248325715e-08
+    },
+    "fixed_general": {
+      "root_energy_max_abs_eh": 2.3874235921539366e-12,
+      "splitting_difference_cm-1": -6.549737463501515e-08
+    },
+    "fixed_kramers": {
+      "root_energy_max_abs_eh": 2.1032064978498966e-12,
+      "splitting_difference_cm-1": 5.92594915360678e-08
+    }
+  },
+  "dmrg_kramers_validation": {
+    "root_orthogonality_error": 3.556869761972565e-15,
+    "root_eigen_equation_error_eh": 7.105439339347612e-14,
+    "discarded_weight": 1.865913805096239e-19,
+    "state_average_dm2_kramers_residual": 7.744660335901102e-12,
+    "active_orbital_closure_error": 3.708404609209669e-15,
+    "rdm_projection": false
+  }
+}

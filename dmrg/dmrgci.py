@@ -201,6 +201,7 @@ class DMRGCI(StreamObject):
         self.projected_hamiltonian = None
 
         self.driver = None
+        self._active_mpo = None
         self.ci = None
         self.kets = None
         self._multi_mps = None
@@ -310,10 +311,12 @@ class DMRGCI(StreamObject):
         is attached to ``socutils`` CASSCF; the solver-to-CASSCF hook then
         derives and validates ``U`` from every current active MO subspace.
 
-        Kramers roots are optimized separately with projections against all
-        earlier roots.  This avoids the nonorthogonal split-root ambiguity of
-        a complex Block2 ``MultiMPS`` at exact degeneracy without changing the
-        ordinary SGF multi-root path.
+        Multi-root calculations use Block2's state-averaged ``MultiMPS`` with
+        the same weights as the PySCF state-average wrapper.  They finish with
+        one-site sweeps before the individual roots are split.  A pure
+        two-site endpoint can leave the root vectors at the shared center
+        inconsistent with the reported sweep energies, with the exact failure
+        depending on the local preconditioner and energy degeneracies.
         """
         self.kramers_adapter = KramersResultAdapter(time_reversal, **kwargs)
         self.kramers_diagnostics = {}
@@ -341,6 +344,7 @@ class DMRGCI(StreamObject):
         self.ci = None
         self.kets = None
         self._multi_mps = None
+        self._active_mpo = None
         self.driver = None
         self._scratch = None
         gc.collect()
@@ -400,14 +404,35 @@ class DMRGCI(StreamObject):
         nroots=None,
         **_kwargs,
     ):
-        """Run complex SGF DMRG and return ``(energy, MPS)``."""
+        """Run complex SGF DMRG and return ``(energy, MPS)``.
+
+        The scalar ``ecore`` is kept out of the Block2 MPO and added back to
+        the public energies afterwards.  A constant cannot change an MPS, and
+        excluding it keeps sweep-to-sweep convergence meaningful when a heavy
+        atom's core energy is so large that its double-precision ULP exceeds
+        the requested active-space energy tolerance.
+        """
         from pyblock2.driver.core import DMRGDriver, SymmetryTypes
 
         if nroots is None:
             nroots = self.nroots
         nroots = int(nroots)
         nelec = self._validate_problem(norb, nelec, nroots)
+        effective_dav_type = self.dav_type
+        effective_twosite_to_onesite = self.twosite_to_onesite
+        if (
+            nroots > 1
+            and int(norb) > 2
+            and effective_twosite_to_onesite is None
+        ):
+            # Retain two two-site sweeps for initial optimization and leave at
+            # least one one-site sweep even for deliberately short schedules.
+            effective_twosite_to_onesite = 2 if self.n_sweeps >= 3 else 0
         h1_block2, eri_block2 = block2_integrals(h1e, eri, norb)
+        ecore_value = _real_energy(ecore)
+        if numpy.asarray(ecore_value).ndim != 0:
+            raise ValueError("ecore must be a scalar")
+        ecore_value = float(ecore_value)
         if ci0 is not None:
             logger.debug(
                 self,
@@ -443,7 +468,7 @@ class DMRGCI(StreamObject):
             mpo = driver.get_qc_mpo(
                 h1e=h1_block2,
                 g2e=eri_block2,
-                ecore=ecore,
+                ecore=0.0,
                 cutoff=self.cutoff,
                 integral_cutoff=self.integral_cutoff,
                 iprint=iprint,
@@ -455,46 +480,49 @@ class DMRGCI(StreamObject):
                 "noises": self.noises,
                 "thrds": self.thrds,
                 "iprint": iprint,
-                "dav_type": self.dav_type,
+                "dav_type": effective_dav_type,
                 "dav_max_iter": self.dav_max_iter,
                 "dav_def_max_size": self.dav_def_max_size,
                 "dav_rel_conv_thrd": self.dav_rel_conv_thrd,
                 "cutoff": self.cutoff,
-                "twosite_to_onesite": self.twosite_to_onesite,
+                "twosite_to_onesite": effective_twosite_to_onesite,
                 "real_density_matrix": False,
             }
             run_records = []
-            if self.kramers_adapter is not None and nroots > 1:
-                # In complex SGF mode, splitting an exactly degenerate
-                # state-averaged MultiMPS can produce normalized but mutually
-                # nonorthogonal states whose RDM energies do not equal the
-                # reported roots.  Optimize complete Kramers manifolds as
-                # separate, explicitly projected states instead.
-                kets = []
-                energies = []
-                for root in range(nroots):
-                    ket = driver.get_random_mps(
-                        tag="KRAMERS-%d" % root,
-                        bond_dim=self.bond_dims[0],
-                        nroots=1,
+            ket = driver.get_random_mps(
+                tag="GS",
+                bond_dim=self.bond_dims[0],
+                nroots=nroots,
+            )
+            if nroots > 1:
+                weights = numpy.asarray(
+                    getattr(self, "weights", numpy.ones(nroots) / nroots),
+                    dtype=float,
+                )
+                if weights.shape != (nroots,) or not numpy.all(
+                    numpy.isfinite(weights)
+                ):
+                    raise ValueError(
+                        "state-average weights must be one finite value per root"
                     )
-                    projection = {}
-                    if kets:
-                        projection = {
-                            "proj_mpss": list(kets),
-                            "proj_weights": [
-                                self.kramers_adapter.root_projection_shift
-                            ] * len(kets),
-                        }
-                    root_energy = driver.dmrg(
-                        mpo, ket, **dmrg_kwargs, **projection
-                    )
-                    energies.append(_real_energy(root_energy))
-                    kets.append(ket)
-                    run_records.append(self._capture_dmrg_run(driver))
-                energy = numpy.asarray(energies)
+                if numpy.any(weights <= 0.0) or weights.sum() <= 0.0:
+                    raise ValueError("state-average weights must be positive")
+                weights = weights / weights.sum()
+                ket.weights = driver.bw.VectorFP(weights.tolist())
+            energy = driver.dmrg(mpo, ket, **dmrg_kwargs)
+            run_records.append(self._capture_dmrg_run(driver))
+            if nroots > 1:
+                kets = [
+                    driver.split_mps(ket, root, tag="KET-%d" % root)
+                    for root in range(nroots)
+                ]
                 ci = kets
+                self._multi_mps = ket
+            else:
+                kets = [ket]
+                ci = ket
 
+            if nroots > 1:
                 identity_mpo = driver.get_identity_mpo()
                 self.root_overlap = numpy.empty(
                     (nroots, nroots), dtype=numpy.complex128
@@ -507,8 +535,11 @@ class DMRGCI(StreamObject):
                         overlap_ij = driver.expectation(
                             kets[i], identity_mpo, kets[j]
                         )
-                        hamiltonian_ij = driver.expectation(
+                        active_hamiltonian_ij = driver.expectation(
                             kets[i], mpo, kets[j]
+                        )
+                        hamiltonian_ij = (
+                            active_hamiltonian_ij + ecore_value * overlap_ij
                         )
                         self.root_overlap[i, j] = overlap_ij
                         self.projected_hamiltonian[i, j] = hamiltonian_ij
@@ -517,34 +548,66 @@ class DMRGCI(StreamObject):
                             self.projected_hamiltonian[j, i] = numpy.conj(
                                 hamiltonian_ij
                             )
-            else:
-                ket = driver.get_random_mps(
-                    tag="GS",
-                    bond_dim=self.bond_dims[0],
-                    nroots=nroots,
+                root_orthogonality_error = float(
+                    numpy.max(abs(self.root_overlap - numpy.eye(nroots)))
                 )
-                energy = driver.dmrg(mpo, ket, **dmrg_kwargs)
-                run_records.append(self._capture_dmrg_run(driver))
-                if nroots > 1:
-                    kets = [
-                        driver.split_mps(ket, root, tag="KET-%d" % root)
-                        for root in range(nroots)
-                    ]
-                    ci = kets
-                    self._multi_mps = ket
-                else:
-                    kets = [ket]
-                    ci = ket
+                root_eigen_equation_error = float(
+                    numpy.max(
+                        abs(
+                            self.projected_hamiltonian
+                            - self.root_overlap
+                            * (numpy.asarray(energy) + ecore_value)[None, :]
+                        )
+                    )
+                )
+                root_validation_tolerance = max(
+                    1e-7,
+                    10.0 * math.sqrt(min(self.thrds)),
+                    10.0 * self.tol,
+                )
+                if max(
+                    root_orthogonality_error, root_eigen_equation_error
+                ) > root_validation_tolerance:
+                    raise RuntimeError(
+                        "split state-averaged MultiMPS roots are inconsistent "
+                        "with the reported energies (S-I %.3e, H-SE %.3e); "
+                        "finish the multi-root calculation with one-site sweeps"
+                        % (
+                            root_orthogonality_error,
+                            root_eigen_equation_error,
+                        )
+                    )
 
             self.driver = driver
+            self._active_mpo = mpo
             self.kets = kets
             self.ci = ci
             self.nroots = nroots
             self.ncas = int(norb)
             self.nelecas = nelec
-            self.e_tot = _real_energy(energy)
-            self.e_cas = self.e_tot - numpy.real(ecore)
+            self.e_cas = _real_energy(energy)
+            self.e_tot = self.e_cas + ecore_value
             self._record_convergence(run_records)
+            self.convergence_info.update(
+                {
+                    "constant_energy_shift": ecore_value,
+                    "sweep_energy_origin": "active-space Hamiltonian without ecore",
+                }
+            )
+            if nroots > 1:
+                self.convergence_info["state_average_weights"] = weights
+                self.convergence_info["effective_dav_type"] = (
+                    "Normal" if effective_dav_type is None else effective_dav_type
+                )
+                self.convergence_info["effective_twosite_to_onesite"] = (
+                    effective_twosite_to_onesite
+                )
+                self.convergence_info["root_orthogonality_error"] = (
+                    root_orthogonality_error
+                )
+                self.convergence_info["root_eigen_equation_error"] = (
+                    root_eigen_equation_error
+                )
             return self.e_tot, self.ci
         except Exception:
             self._release_run(remove_scratch=True)
@@ -622,8 +685,8 @@ class DMRGCI(StreamObject):
             "scratch": self._scratch,
             "root_runs": root_runs,
             "root_strategy": (
-                "state-specific-projection"
-                if self.kramers_adapter is not None and len(self.kets) > 1
+                "state-averaged-multimps"
+                if len(self.kets) > 1
                 else "state-averaged"
             ),
         }
@@ -738,6 +801,23 @@ class DMRGCI(StreamObject):
         result = self.kramers_adapter.pair_results[int(pair)]
         return result.dm1, result.dm2
 
+    def make_kramers_manifold_rdm12(self, manifold=0):
+        """Return one validated equal-weight degenerate-manifold 1-/2-RDM.
+
+        For an isolated doublet this is identical to
+        :meth:`make_kramers_pair_rdm12`.  For a higher exact degeneracy it is
+        the basis-invariant density of the complete manifold; arbitrary
+        numerical roots inside that space are intentionally not assigned to
+        non-unique Kramers pairs.
+        """
+        if self.kramers_adapter is None:
+            raise RuntimeError("Kramers mode is not enabled")
+        self._require_run()
+        for root in range(len(self.kets)):
+            self.make_rdm12(root, self.ncas, self.nelecas)
+        result = self.kramers_adapter.manifold_results[int(manifold)]
+        return result.dm1, result.dm2
+
     def kramers_root_space_rdm1(self, pair=0):
         """Return ``<i|p^+q|j>`` for both roots of one Kramers pair."""
         if self.kramers_adapter is None:
@@ -802,10 +882,6 @@ class DMRGCI(StreamObject):
                 "Kramers E/RDM tolerances      = %g / %g",
                 self.kramers_adapter.energy_tolerance,
                 self.kramers_adapter.residual_tolerance,
-            )
-            log.info(
-                "Kramers root projection shift = %g",
-                self.kramers_adapter.root_projection_shift,
             )
             log.info(
                 "Kramers RDM projection        = %s",

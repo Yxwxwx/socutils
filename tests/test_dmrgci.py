@@ -86,6 +86,26 @@ def test_analytic_one_electron_and_determinant_rdms(tmp_path):
     solver.close()
 
 
+def test_large_ecore_is_excluded_from_sweep_convergence(tmp_path):
+    """A heavy-atom core shift must not consume active-energy precision."""
+    h1 = np.diag([-1.25, 0.4, 1.1]).astype(complex)
+    eri = np.zeros((3,) * 4, dtype=complex)
+    ecore = -1.0e8
+    solver = _solver(tmp_path, 3, 1, bond_dim=8)
+    energy, state = solver.kernel(h1, eri, 3, 1, ecore=ecore, verbose=0)
+    dm1, dm2 = solver.make_rdm12(state, 3, 1)
+
+    assert abs(energy - (ecore - 1.25)) <= ENERGY_TOL
+    assert abs(energy_from_rdms(h1, eri, dm1, dm2, ecore) - energy) <= ENERGY_TOL
+    assert solver.converged
+    assert solver.convergence_info["constant_energy_shift"] == ecore
+    assert solver.convergence_info["sweep_energy_origin"] == (
+        "active-space Hamiltonian without ecore"
+    )
+    assert np.max(abs(np.asarray(solver.convergence_info["sweep_energies"]))) < 2
+    solver.close()
+
+
 def _complex_hamiltonians():
     rng = np.random.default_rng(8128)
     norb = 4

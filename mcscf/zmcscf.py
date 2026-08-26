@@ -159,7 +159,8 @@ class CASSCF(zcasci.CASCI):
         'freeze_pair', 'canonicalize_', 'superci_solver', 'superci_bfgs',
         'superci_davidson_tol', 'superci_davidson_max_space',
         'superci_davidson_strict', 'macro_history',
-        'superci_diagnostics', 'cholesky_diagnostics',
+        'superci_diagnostics', 'superci_metric_diagnostics',
+        'cholesky_diagnostics',
         'final_orbital_gradient_norm', 'supercipt_level_shift',
         'supercipt_metric_tol', 'supercipt_denominator_tol',
         'supercipt_history', 'supercipt_diagnostics',
@@ -183,6 +184,7 @@ class CASSCF(zcasci.CASCI):
         self.superci_davidson_strict = True
         self.macro_history = []
         self.superci_diagnostics = None
+        self.superci_metric_diagnostics = None
         self.cholesky_diagnostics = None
         self.final_orbital_gradient_norm = None
         self.supercipt_level_shift = 0.0

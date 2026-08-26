@@ -88,3 +88,11 @@ tmp/
 #
 local/
 note/
+
+# Halogen benchmark runtime data (structured JSON/CSV results are retained)
+benchmarck/.scratch/
+benchmarck/**/.scratch/
+benchmarck/logs/
+benchmarck/results/**/*.progress.json
+benchmarck/kramers/logs/
+benchmarck/kramers/results/**/*.progress.json
