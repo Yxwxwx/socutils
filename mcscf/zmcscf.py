@@ -160,7 +160,9 @@ class CASSCF(zcasci.CASCI):
         'superci_davidson_tol', 'superci_davidson_max_space',
         'superci_davidson_strict', 'macro_history',
         'superci_diagnostics', 'cholesky_diagnostics',
-        'final_orbital_gradient_norm',
+        'final_orbital_gradient_norm', 'supercipt_level_shift',
+        'supercipt_metric_tol', 'supercipt_denominator_tol',
+        'supercipt_history', 'supercipt_diagnostics',
     })
 
     def __init__(self, mf_or_mol, ncas, nelecas, ncore=None, frozen=None, cholesky=True):
@@ -183,6 +185,11 @@ class CASSCF(zcasci.CASCI):
         self.superci_diagnostics = None
         self.cholesky_diagnostics = None
         self.final_orbital_gradient_norm = None
+        self.supercipt_level_shift = 0.0
+        self.supercipt_metric_tol = 1e-6
+        self.supercipt_denominator_tol = 1e-10
+        self.supercipt_history = []
+        self.supercipt_diagnostics = None
 
     def get_fock(self, mo_coeff=None, ci=None, eris=None, casdm1=None, verbose=None):
         return get_fock(self, mo_coeff, ci, eris, casdm1, verbose)
@@ -321,5 +328,47 @@ class CASSCF(zcasci.CASCI):
                       davidson_strict=self.superci_davidson_strict,
                       callback=callback)
         logger.note(self, 'CASSCF energy = %#.15g', self.e_tot)
+        self._finalize()
+        return self.e_tot, self.e_cas, self.ci, self.mo_coeff, self.mo_energy
+
+    def supercipt(self, mo_coeff=None, ci0=None, callback=None, _kern=None):
+        '''Perturbative Super-CI CASSCF orbital optimization.
+
+        This is the Guo--Dutta two-component Super-CIPT optimizer.  It is an
+        explicit alternative to :meth:`superci`; calling :meth:`kernel` keeps
+        using the validated full Super-CI/Davidson optimizer.
+
+        Kramers-restricted orbital equations are intentionally not provided by
+        this path.  General complex spinors, exact CI, state averages and the
+        common Block2 :class:`socutils.dmrg.DMRGCI` solver are supported.
+        '''
+        del ci0  # Orbital changes invalidate untransformed CI/MPS guesses.
+        from socutils.mcscf.zmc_supercipt import mcscf_supercipt
+        if _kern is None:
+            _kern = mcscf_supercipt
+        if mo_coeff is None:
+            mo_coeff = self.mo_coeff
+        else:
+            self.mo_coeff = mo_coeff
+        if callback is None:
+            callback = self.callback
+
+        self.check_sanity()
+        self.dump_flags()
+        self.converged, self.e_tot, self.e_cas, self.ci, \
+                self.mo_coeff, self.mo_energy = _kern(
+                    self, mo_coeff,
+                    max_stepsize=self.max_stepsize,
+                    conv_tol=self.conv_tol,
+                    conv_tol_grad=self.conv_tol_grad,
+                    max_cycle=self.max_cycle_macro,
+                    level_shift=self.supercipt_level_shift,
+                    metric_tol=self.supercipt_metric_tol,
+                    denominator_tol=self.supercipt_denominator_tol,
+                    verbose=self.verbose,
+                    cderi=self._cderi,
+                    callback=callback,
+                )
+        logger.note(self, 'Super-CIPT CASSCF energy = %#.15g', self.e_tot)
         self._finalize()
         return self.e_tot, self.e_cas, self.ci, self.mo_coeff, self.mo_energy

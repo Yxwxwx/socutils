@@ -345,7 +345,7 @@ uv run pytest -q
 ```
 
 Milestone commit: `dmrg: add validated Kramers-restricted X2C-DMRG-SCF`
-(the concrete hash is reported in the next milestone and final run log).
+(`e6a4ab4f2343fdce54d749633feb391d7e92d8e0`).
 
 ## Known limitations at this milestone
 
@@ -358,3 +358,7 @@ full spinor space and requires a complete even root manifold for odd-electron
 systems; pair members used by PySCF state averaging must have equal weights.
 The state-specific projection shift is configurable for unusually wide active
 spectra.  Kramers-restricted Super-CIPT is outside the later Phase-4 scope.
+
+The immutable old-code baseline, paper equation map, Pykylin replacement, and
+Phase-4 exact/Block2 Super-CIPT results are recorded separately in
+`supercipt_validation.md`.

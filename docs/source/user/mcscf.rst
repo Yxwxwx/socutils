@@ -137,6 +137,71 @@ The general complex-spinor route is unchanged when
 against ``fci.FCISolver`` are recorded in
 ``docs/x2c_dmrg_validation.md``.
 
+Perturbative Super-CI (Super-CIPT)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``CASSCF.supercipt()`` is the Guo--Dutta two-component perturbative Super-CI
+orbital optimizer.  It is an explicit alternative API: ``kernel()`` and
+``superci()`` continue to use the full Super-CI/Davidson implementation.
+
+.. code-block:: python
+
+   from socutils.dmrg import DMRGCI
+   from socutils.mcscf import zmcscf
+
+   solver = DMRGCI(mol).init(
+       ncas=4, nelecas=2, nroots=1,
+       bond_dims=[64] * 8,
+       noises=[0.0] * 8,
+       thrds=[1e-20] * 8,
+       n_sweeps=8, tol=1e-12,
+       n_threads=1, stack_memory=256,
+       scratch='/path/to/scratch',
+   )
+   mc = zmcscf.CASSCF(mf, ncas=4, nelecas=2)
+   mc.fcisolver = solver
+   mc.supercipt()
+
+The method uses the same exact-CI/Block2 solver contract and full or Cholesky
+integral containers as Super-CI.  In the repository RDM convention,
+``dm1[p,q] = <p+ q>`` and ``dm2[p,q,r,s] = <p+ r+ s q>``.  The active
+two-particle contraction is
+
+.. code-block:: text
+
+   Q[p,t] = sum_u,v,w eris.paaa[p,u,v,w] * dm2[t,u,v,w]
+
+The removal and addition Koopmans problems use the active density ``D`` and
+hole density ``I-D`` as positive-semidefinite metrics.  Numerically null
+metric directions are removed by canonical orthogonalization.  The three
+paper blocks (core--virtual, core--active, and active--virtual) form one
+anti-Hermitian rotation, whose largest matrix element is capped by
+``max_stepsize`` before applying ``C <- C exp(kappa)``.
+
+Super-CIPT uses the common CASSCF attributes ``max_cycle_macro``,
+``max_stepsize``, ``conv_tol``, and ``conv_tol_grad``.  Its additional
+attributes are:
+
+* ``supercipt_metric_tol`` (``1e-6``) -- discard density/hole-metric
+  eigenvectors at or below this value;
+* ``supercipt_denominator_tol`` (``1e-10``) -- reject a singular Dyall
+  denominator rather than divide silently;
+* ``supercipt_level_shift`` (``0.0``) -- optional sign-preserving shift away
+  from zero.
+
+Convergence requires both the energy and the nonredundant orbital gradient.
+``supercipt_history`` records energies, root energies, gradients, natural
+occupations, RDM-energy checks, metric ranks, denominators, step scales, and
+integral provenance; ``supercipt_diagnostics`` records the final settings and
+status.  PySCF ``state_average_(weights)`` is supported and supplies the same
+weighted energy and RDMs to every Super-CIPT equation.
+
+Kramers-restricted Super-CIPT orbital equations are not implemented.  A KRHF
+reference or Kramers-adapted DMRG solver is rejected with a clear error; use
+the validated full Super-CI path for Kramers-restricted optimization.  The
+paper/source equation map, immutable historical output, and exact/Pykylin/
+Block2 numerical ladder are recorded in ``docs/supercipt_validation.md``.
+
 Options
 ~~~~~~~
 
