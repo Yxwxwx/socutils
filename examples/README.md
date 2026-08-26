@@ -16,6 +16,7 @@ They use the canonical `.x2camf()` / `.x2cmp()` driver API.
 | `08-casci.py` | CASCI on a spinor reference |
 | `09-four_component.py` | four-component Dirac-Hartree-Fock |
 | `10-casscf.py` | Cholesky CASSCF orbital optimization (needs zquatev) |
+| `11-kramers_dmrg_scf.py` | Kramers-pair X2C-DMRG-SCF (needs Block2 + zquatev) |
 
 The `fci/` subfolder has examples for the spinor CI module (`socutils.fci`):
 
@@ -28,5 +29,6 @@ The `fci/` subfolder has examples for the spinor CI module (`socutils.fci`):
 | `fci/04-spin_composition.py` | spin / angular-momentum analysis of states |
 
 Most examples need the optional `x2camf` package for the spin-orbit integrals;
-the Kramers-restricted example additionally needs `zquatev`. See the
+the Kramers-restricted SCF examples additionally need `zquatev`, and the
+Kramers DMRG-SCF example needs Block2. See the
 [installation guide](https://xubwa.github.io/socutils/install.html).

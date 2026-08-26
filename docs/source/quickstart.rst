@@ -91,4 +91,5 @@ Where to go from here
 
 * :doc:`user/scf` -- the spinor SCF classes and options in detail.
 * :doc:`user/somf` -- the spin-orbit mean-field Hamiltonians (X2C, X2CAMF).
-* :doc:`user/mcscf` -- CASCI / CASSCF on a two-component reference.
+* :doc:`user/mcscf` -- CASCI / CASSCF, Block2 DMRG, and Kramers-pair state
+  averaging on a two-component reference.

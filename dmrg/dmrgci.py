@@ -18,6 +18,8 @@ import numpy
 from pyscf import lib
 from pyscf.lib import StreamObject, logger
 
+from .kramers import KramersResultAdapter
+
 
 def block2_integrals(h1e, eri, norb):
     r"""Copy spinor-FCI integrals into the Block2 QC-MPO convention.
@@ -191,6 +193,13 @@ class DMRGCI(StreamObject):
         self.npdm_site_type = 2
         self.npdm_cutoff = 1e-24
 
+        # Explicit opt-in: the general complex-spinor solver remains the
+        # default and keeps its original state-averaged multi-root route.
+        self.kramers_adapter = None
+        self.kramers_diagnostics = {}
+        self.root_overlap = None
+        self.projected_hamiltonian = None
+
         self.driver = None
         self.ci = None
         self.kets = None
@@ -293,10 +302,42 @@ class DMRGCI(StreamObject):
     def M(self):
         return max(self.bond_dims)
 
+    def kramers_restricted(self, time_reversal=None, **kwargs):
+        """Enable Kramers-pair root/result handling and return ``self``.
+
+        ``time_reversal`` is the active-MO matrix ``U`` in
+        ``Theta|p> = sum_q |q> U[q,p]``.  It may be omitted when this solver
+        is attached to ``socutils`` CASSCF; the solver-to-CASSCF hook then
+        derives and validates ``U`` from every current active MO subspace.
+
+        Kramers roots are optimized separately with projections against all
+        earlier roots.  This avoids the nonorthogonal split-root ambiguity of
+        a complex Block2 ``MultiMPS`` at exact degeneracy without changing the
+        ordinary SGF multi-root path.
+        """
+        self.kramers_adapter = KramersResultAdapter(time_reversal, **kwargs)
+        self.kramers_diagnostics = {}
+        return self
+
+    def set_orbital_context(self, mo_coeff, overlap, mol=None):
+        """Receive and validate the current active orbitals from CASSCF."""
+        if self.kramers_adapter is None:
+            return None
+        if mol is None:
+            mol = self.mol
+        if mol is None:
+            raise ValueError("a molecule is required to identify Kramers orbitals")
+        return self.kramers_adapter.set_orbitals(mol, mo_coeff, overlap)
+
     def _release_run(self, remove_scratch=True):
         run_scratch = self._scratch
         self._rdm_cache.clear()
         self.rdm_diagnostics.clear()
+        self.kramers_diagnostics.clear()
+        self.root_overlap = None
+        self.projected_hamiltonian = None
+        if self.kramers_adapter is not None:
+            self.kramers_adapter.clear_results()
         self.ci = None
         self.kets = None
         self._multi_mps = None
@@ -342,6 +383,8 @@ class DMRGCI(StreamObject):
         dimension = math.comb(int(norb), nelec)
         if nroots > dimension:
             raise ValueError("nroots exceeds the determinant-space dimension")
+        if self.kramers_adapter is not None:
+            self.kramers_adapter.validate_problem(norb, nelec, nroots)
         return nelec
 
     def kernel(
@@ -405,39 +448,93 @@ class DMRGCI(StreamObject):
                 integral_cutoff=self.integral_cutoff,
                 iprint=iprint,
             )
-            ket = driver.get_random_mps(
-                tag="GS",
-                bond_dim=self.bond_dims[0],
-                nroots=nroots,
-            )
-            energy = driver.dmrg(
-                mpo,
-                ket,
-                n_sweeps=self.n_sweeps,
-                tol=self.tol,
-                bond_dims=self.bond_dims,
-                noises=self.noises,
-                thrds=self.thrds,
-                iprint=iprint,
-                dav_type=self.dav_type,
-                dav_max_iter=self.dav_max_iter,
-                dav_def_max_size=self.dav_def_max_size,
-                dav_rel_conv_thrd=self.dav_rel_conv_thrd,
-                cutoff=self.cutoff,
-                twosite_to_onesite=self.twosite_to_onesite,
-                real_density_matrix=False,
-            )
-
-            if nroots > 1:
-                kets = [
-                    driver.split_mps(ket, root, tag="KET-%d" % root)
-                    for root in range(nroots)
-                ]
+            dmrg_kwargs = {
+                "n_sweeps": self.n_sweeps,
+                "tol": self.tol,
+                "bond_dims": self.bond_dims,
+                "noises": self.noises,
+                "thrds": self.thrds,
+                "iprint": iprint,
+                "dav_type": self.dav_type,
+                "dav_max_iter": self.dav_max_iter,
+                "dav_def_max_size": self.dav_def_max_size,
+                "dav_rel_conv_thrd": self.dav_rel_conv_thrd,
+                "cutoff": self.cutoff,
+                "twosite_to_onesite": self.twosite_to_onesite,
+                "real_density_matrix": False,
+            }
+            run_records = []
+            if self.kramers_adapter is not None and nroots > 1:
+                # In complex SGF mode, splitting an exactly degenerate
+                # state-averaged MultiMPS can produce normalized but mutually
+                # nonorthogonal states whose RDM energies do not equal the
+                # reported roots.  Optimize complete Kramers manifolds as
+                # separate, explicitly projected states instead.
+                kets = []
+                energies = []
+                for root in range(nroots):
+                    ket = driver.get_random_mps(
+                        tag="KRAMERS-%d" % root,
+                        bond_dim=self.bond_dims[0],
+                        nroots=1,
+                    )
+                    projection = {}
+                    if kets:
+                        projection = {
+                            "proj_mpss": list(kets),
+                            "proj_weights": [
+                                self.kramers_adapter.root_projection_shift
+                            ] * len(kets),
+                        }
+                    root_energy = driver.dmrg(
+                        mpo, ket, **dmrg_kwargs, **projection
+                    )
+                    energies.append(_real_energy(root_energy))
+                    kets.append(ket)
+                    run_records.append(self._capture_dmrg_run(driver))
+                energy = numpy.asarray(energies)
                 ci = kets
-                self._multi_mps = ket
+
+                identity_mpo = driver.get_identity_mpo()
+                self.root_overlap = numpy.empty(
+                    (nroots, nroots), dtype=numpy.complex128
+                )
+                self.projected_hamiltonian = numpy.empty_like(
+                    self.root_overlap
+                )
+                for i in range(nroots):
+                    for j in range(i, nroots):
+                        overlap_ij = driver.expectation(
+                            kets[i], identity_mpo, kets[j]
+                        )
+                        hamiltonian_ij = driver.expectation(
+                            kets[i], mpo, kets[j]
+                        )
+                        self.root_overlap[i, j] = overlap_ij
+                        self.projected_hamiltonian[i, j] = hamiltonian_ij
+                        if i != j:
+                            self.root_overlap[j, i] = numpy.conj(overlap_ij)
+                            self.projected_hamiltonian[j, i] = numpy.conj(
+                                hamiltonian_ij
+                            )
             else:
-                kets = [ket]
-                ci = ket
+                ket = driver.get_random_mps(
+                    tag="GS",
+                    bond_dim=self.bond_dims[0],
+                    nroots=nroots,
+                )
+                energy = driver.dmrg(mpo, ket, **dmrg_kwargs)
+                run_records.append(self._capture_dmrg_run(driver))
+                if nroots > 1:
+                    kets = [
+                        driver.split_mps(ket, root, tag="KET-%d" % root)
+                        for root in range(nroots)
+                    ]
+                    ci = kets
+                    self._multi_mps = ket
+                else:
+                    kets = [ket]
+                    ci = ket
 
             self.driver = driver
             self.kets = kets
@@ -447,14 +544,15 @@ class DMRGCI(StreamObject):
             self.nelecas = nelec
             self.e_tot = _real_energy(energy)
             self.e_cas = self.e_tot - numpy.real(ecore)
-            self._record_convergence()
+            self._record_convergence(run_records)
             return self.e_tot, self.ci
         except Exception:
             self._release_run(remove_scratch=True)
             raise
 
-    def _record_convergence(self):
-        history = [_history_row(row) for row in self.driver._dmrg.energies]
+    def _capture_dmrg_run(self, driver):
+        """Copy convergence data before a subsequent root overwrites it."""
+        history = [_history_row(row) for row in driver._dmrg.energies]
         nsweep = len(history)
         if nsweep >= 2:
             energy_change = float(numpy.max(numpy.abs(history[-1] - history[-2])))
@@ -463,23 +561,57 @@ class DMRGCI(StreamObject):
         schedule_index = max(nsweep - 1, 0)
         final_noise = self.noises[min(schedule_index, len(self.noises) - 1)]
         final_thrd = self.thrds[min(schedule_index, len(self.thrds) - 1)]
-        discarded = numpy.asarray(list(self.driver._dmrg.discarded_weights), dtype=float)
+        discarded = numpy.asarray(
+            list(driver._dmrg.discarded_weights), dtype=float
+        )
         final_discarded = float(discarded[-1]) if discarded.size else numpy.nan
-        self.converged = bool(
+        converged = bool(
             nsweep >= 2
             and numpy.isfinite(energy_change)
             and energy_change <= self.tol
             and final_noise == 0.0
         )
-        self.convergence_info = {
-            "converged": self.converged,
+        return {
+            "converged": converged,
             "sweeps": nsweep,
             "sweep_energies": [row.copy() for row in history],
             "energy_change": energy_change,
             "discarded_weight": final_discarded,
             "max_discarded_weight": (
-                float(numpy.max(numpy.abs(discarded))) if discarded.size else numpy.nan
+                float(numpy.max(numpy.abs(discarded)))
+                if discarded.size else numpy.nan
             ),
+            "local_squared_residual_threshold": final_thrd,
+        }
+
+    def _record_convergence(self, root_runs=None):
+        if root_runs is None:
+            root_runs = [self._capture_dmrg_run(self.driver)]
+        self.converged = all(run["converged"] for run in root_runs)
+        energy_change = max(run["energy_change"] for run in root_runs)
+        final_discarded = max(
+            (run["discarded_weight"] for run in root_runs),
+            default=numpy.nan,
+        )
+        max_discarded = max(
+            (run["max_discarded_weight"] for run in root_runs),
+            default=numpy.nan,
+        )
+        final_thrd = max(
+            run["local_squared_residual_threshold"] for run in root_runs
+        )
+        sweep_energies = (
+            root_runs[0]["sweep_energies"]
+            if len(root_runs) == 1
+            else [run["sweep_energies"] for run in root_runs]
+        )
+        self.convergence_info = {
+            "converged": self.converged,
+            "sweeps": max(run["sweeps"] for run in root_runs),
+            "sweep_energies": sweep_energies,
+            "energy_change": energy_change,
+            "discarded_weight": final_discarded,
+            "max_discarded_weight": max_discarded,
             "local_squared_residual_threshold": final_thrd,
             "local_residual_bound": math.sqrt(final_thrd),
             "davidson_max_iter": self.dav_max_iter,
@@ -488,6 +620,12 @@ class DMRGCI(StreamObject):
             "npdm_site_type": self.npdm_site_type,
             "npdm_cutoff": self.npdm_cutoff,
             "scratch": self._scratch,
+            "root_runs": root_runs,
+            "root_strategy": (
+                "state-specific-projection"
+                if self.kramers_adapter is not None and len(self.kets) > 1
+                else "state-averaged"
+            ),
         }
 
     def _require_run(self):
@@ -560,7 +698,72 @@ class DMRGCI(StreamObject):
                 "projection_change": 0.0,
             }
             self._rdm_cache[key] = (dm1, dm2)
+            self._refresh_kramers_results()
         return self._rdm_cache[key]
+
+    def _refresh_kramers_results(self):
+        """Analyze a complete cached root manifold without forcing NPDM I/O."""
+        adapter = self.kramers_adapter
+        if adapter is None or self.kets is None or len(self.kets) <= 1:
+            return
+        keys = [id(ket) for ket in self.kets]
+        if not all(key in self._rdm_cache for key in keys):
+            return
+        dm1s = [self._rdm_cache[key][0] for key in keys]
+        dm2s = [self._rdm_cache[key][1] for key in keys]
+        weights = getattr(self, "weights", None)
+        adapter.analyze(
+            numpy.asarray(self.e_tot),
+            dm1s,
+            dm2s,
+            weights=weights,
+            overlap=self.root_overlap,
+            projected_hamiltonian=self.projected_hamiltonian,
+        )
+        self.kramers_diagnostics = dict(adapter.diagnostics)
+
+    def make_kramers_pair_rdm12(self, pair=0):
+        """Return one validated equal-weight Kramers-pair 1-/2-RDM.
+
+        Raw individual-root NPDMs are always computed and checked first.  The
+        returned tensors are projected only if projection was explicitly
+        enabled on :meth:`kramers_restricted` and the raw residual passed its
+        configured gate.
+        """
+        if self.kramers_adapter is None:
+            raise RuntimeError("Kramers mode is not enabled")
+        self._require_run()
+        for root in range(len(self.kets)):
+            self.make_rdm12(root, self.ncas, self.nelecas)
+        result = self.kramers_adapter.pair_results[int(pair)]
+        return result.dm1, result.dm2
+
+    def kramers_root_space_rdm1(self, pair=0):
+        """Return ``<i|p^+q|j>`` for both roots of one Kramers pair."""
+        if self.kramers_adapter is None:
+            raise RuntimeError("Kramers mode is not enabled")
+        self.make_kramers_pair_rdm12(pair)
+        roots = self.kramers_adapter.root_pairs[int(pair)]
+        root_space = numpy.empty(
+            (2, 2, self.ncas, self.ncas), dtype=numpy.complex128
+        )
+        for i, bra in enumerate(roots):
+            for j, ket in enumerate(roots):
+                if i == j:
+                    root_space[i, j] = self.make_rdm1(
+                        bra, self.ncas, self.nelecas
+                    )
+                else:
+                    root_space[i, j] = self.trans_rdm1(
+                        bra, ket, self.ncas, self.nelecas
+                    )
+        return root_space
+
+    def canonical_kramers_root_space_rdm1(self, pair=0):
+        """Remove arbitrary unitary root mixing and transition phases."""
+        return self.kramers_adapter.canonicalize_root_space(
+            self.kramers_root_space_rdm1(pair)
+        )
 
     def trans_rdm1(self, cibra, ciket, norb=None, nelec=None, **_kwargs):
         """Return ``<bra|a_p^dagger a_q|ket>`` for two DMRG roots."""
@@ -593,5 +796,20 @@ class DMRGCI(StreamObject):
         log.info("energy tolerance             = %g", self.tol)
         log.info("maximum sweeps               = %d", self.n_sweeps)
         log.info("NPDM site type/cutoff        = %d / %g", self.npdm_site_type, self.npdm_cutoff)
+        log.info("Kramers result adapter       = %s", self.kramers_adapter is not None)
+        if self.kramers_adapter is not None:
+            log.info(
+                "Kramers E/RDM tolerances      = %g / %g",
+                self.kramers_adapter.energy_tolerance,
+                self.kramers_adapter.residual_tolerance,
+            )
+            log.info(
+                "Kramers root projection shift = %g",
+                self.kramers_adapter.root_projection_shift,
+            )
+            log.info(
+                "Kramers RDM projection        = %s",
+                self.kramers_adapter.project,
+            )
         log.info("")
         return self

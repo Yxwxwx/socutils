@@ -80,6 +80,63 @@ Requirements
   See :ref:`the Cholesky decomposition section <cholesky-decomposition>` for the
   CD route and its on-disk caching.
 
+Block2 DMRG and Kramers pairs
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``socutils.dmrg.DMRGCI`` is a PySCF-style Block2 solver for the same complex
+spinor Hamiltonian and full-spinor 1-/2-RDM conventions as ``fci.FCISolver``.
+For an ordinary general-complex calculation, attach it directly.  Kramers
+mode is an explicit additional call; for an odd-electron doublet, request both
+roots and give the pair equal state-average weights:
+
+.. code-block:: python
+
+   from socutils.dmrg import DMRGCI
+   from socutils.mcscf import zmcscf
+
+   dmrg = DMRGCI(mol).init(
+       ncas=2, nelecas=1, nroots=2,
+       bond_dims=[32] * 8,
+       noises=[0.0] * 8,
+       thrds=[1e-20] * 8,       # squared local Davidson residual
+       n_sweeps=8, tol=1e-12,
+       n_threads=1, stack_memory=256,
+       scratch='/path/to/scratch',
+   ).kramers_restricted()
+
+   mc = zmcscf.CASSCF(mf, ncas=2, nelecas=1)
+   mc.fcisolver = dmrg
+   mc.state_average_([0.5, 0.5])
+   mc.kernel()
+
+   # state_average_ installs a PySCF solver view, so read final diagnostics
+   # from the solver held by mc.
+   print(mc.fcisolver.kramers_diagnostics)
+
+The CASSCF boundary derives the time-reversal matrix from the *current* active
+MO coefficients at every macroiteration.  It validates active-space closure,
+partner indices, and partner phases rather than assuming that ``2*i`` and
+``2*i+1`` are paired.  Individual odd-electron roots are not forced to have a
+Kramers-symmetric density.  Instead, roots are independently optimized and
+orthogonalized, paired from their raw RDMs and energies, and then averaged
+with equal weight in the full active spinor space.
+
+``mc.fcisolver.kramers_diagnostics`` reports root pairs, raw partner and
+ensemble time-reversal residuals, root orthogonality, the projected
+Hamiltonian residual, and any projection change.  Projection is disabled by
+default.  ``.kramers_restricted(project=True)`` permits only a final
+roundoff-level ``(D + Theta(D))/2`` projection after the raw residual has
+passed ``projection_tolerance``; it is never a substitute for converging the
+DMRG or fixing an index error.  The pair RDM and phase/mixing-canonicalized
+transition tensor are available through
+``make_kramers_pair_rdm12()`` and
+``canonical_kramers_root_space_rdm1()``.
+
+The general complex-spinor route is unchanged when
+``kramers_restricted()`` is omitted.  Exact settings and numerical validation
+against ``fci.FCISolver`` are recorded in
+``docs/x2c_dmrg_validation.md``.
+
 Options
 ~~~~~~~
 

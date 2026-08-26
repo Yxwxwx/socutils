@@ -139,6 +139,17 @@ def kernel(casci, mo_coeff=None, ci0=None, verbose=logger.NOTE):
 
     if h1eff.shape[0] != ncas:
         raise RuntimeError(f'Active space size error. nmo={mo_coeff.shape[1]:%d} ncore={casci.ncore:%d} ncas={ncas:%d}')
+    # Solver-side symmetry adapters need the *current* active MO subspace.
+    # This hook is a no-op for the general complex solver and avoids putting
+    # time-reversal assumptions into the Super-CI optimizer.
+    set_orbital_context = getattr(casci.fcisolver, 'set_orbital_context', None)
+    if set_orbital_context is not None:
+        active = mo_coeff[:, casci.ncore:casci.ncore + ncas]
+        set_orbital_context(
+            active,
+            casci._scf.get_ovlp(),
+            mol=casci.mol,
+        )
     # FCI
     # fcidump_rel.from_integrals('FCIDUMP', h1eff, eri_cas.reshape(ncas*ncas, ncas*ncas), ncas, nelecas, energy_core.real)
     # print('integral written')

@@ -215,15 +215,146 @@ uv run pytest -q tests/test_x2c_dmrg_scf.py
 uv run pytest -q
 ```
 
-Milestone commit: `dmrg: align Cholesky X2C-DMRG-SCF with super-CI` (the
-concrete hash is reported by the following milestone and the final run log,
-because a commit cannot contain its own content-derived hash).
+Milestone commit: `dmrg: align Cholesky X2C-DMRG-SCF with super-CI`
+(`5bcea1bdab8a77f6620777a017502d3effaa93d6`).
+
+## Phase 3: Kramers-restricted X2C-DMRG-SCF
+
+Kramers support is explicit and solver-side.  Block2 continues to use the
+full SGFCPX spinor space; no half-space RDM is inferred or reconstructed from
+unvalidated blocks.  Enable the result adapter with
+`DMRGCI(...).init(...).kramers_restricted()`.  Omitting that final call leaves
+the general complex-spinor behavior from Phases 1--2 unchanged.
+
+### Actual orbital and time-reversal convention
+
+PySCF's `mol.time_reversal_map()` is a signed, one-based forward map.  If its
+entry for AO spinor `i` is `-j`, then `Theta |i> = -|j>`; applying it to a
+coefficient vector is consequently a scatter to `j`, not a gather from `j`.
+For active MO coefficients `C` and AO overlap `S`, the adapter constructs
+
+```text
+Theta(C)[:,p] = time reversal of MO column p
+U = C^H S Theta(C)
+Theta |p> = sum_q |q> U[q,p]
+```
+
+and validates `U^H U = I`, `U U* = -I`, `U = -U^T`, closure of the active MO
+subspace under time reversal, each partner orbital, and its phase.  Partners
+are selected from the dominant entries of the measured `U`; adjacency is
+never assumed.  For the repository's `zquatev` interleaved H2/STO-3G output,
+the measured pairs are `(0,1)` and `(2,3)`, with
+`Theta C_0 = +C_1` and `Theta C_1 = -C_0`.  The largest closure, partner, and
+phase errors are `4.45e-16`, `4.05e-16`, and zero, respectively.
+
+For the repository RDM axes, time reversal is
+
+```text
+dm1_TR[p,q] = sum_ab U[p,a]* U[q,b] dm1[a,b]*
+dm2_TR[p,q,r,s]
+    = sum_abcd U[p,a]* U[q,b] U[r,c]* U[s,d] dm2[a,b,c,d]*
+```
+
+where `dm2[p,q,r,s] = <p† r† s q>`.  The conjugations are intentionally the
+transpose of the common AO density-matrix formula.  An exterior-power exact
+CI check with complex pair phases verifies both transformations directly.
+
+### Roots, ensembles, and projection
+
+An individual odd-electron member of a Kramers doublet is not required to
+have a time-reversal-symmetric RDM.  The adapter therefore:
+
+1. targets a complete, even number of roots;
+2. pairs roots using their energy splitting and the raw 1-/2-RDM relation;
+3. checks the root overlap and projected Hamiltonian;
+4. forms an equal-weight pair average in the full active spinor space; and
+5. reports the raw ensemble time-reversal residual before any projection.
+
+Exactly degenerate complex Block2 `MultiMPS` roots cannot safely be handled
+by blindly splitting the state-averaged object.  In the four-spinor test the
+reported two energies were exact, but the split states had overlap magnitude
+`2.74e-1`; their RDM-reconstructed energies were `0.0641` and `0.2889` Eh
+instead of `-0.1715` Eh.  Kramers mode consequently optimizes each root as a
+single MPS and projects all earlier roots with a configurable positive shift
+(`root_projection_shift=100` Eh by default).  The resulting overlap and
+projected-Hamiltonian residuals are both checked before the RDMs are accepted.
+The ordinary general-complex multi-root route still uses `MultiMPS` and has a
+dedicated unchanged-path regression.
+
+RDM projection is off by default.  With `project=True`, the adapter replaces
+an already validated pair density by `(D + Theta(D))/2`; it refuses to do so
+when the raw residual exceeds `projection_tolerance`.  A test deliberately
+damages an individual root by `1e-4` and verifies that this gate raises rather
+than concealing the error.  The KR X2C-DMRG-SCF validation below consumes the
+raw equal-weight pair density and applies no projection.
+
+Degenerate transition densities have both independent root phases and an
+arbitrary unitary rotation inside the doublet.  The test assembles the full
+`<i|p†q|j>` tensor, selects the Hermitian one-body operator with the largest
+projected root separation, diagonalizes it in root space, and fixes remaining
+phases from the largest transition entries.  This canonical root-space tensor
+is compared with exact CI; raw CI or MPS coefficients are not compared.
+
+### Numerical gates
+
+The exactly solvable active Hamiltonian has three electrons in four spinors,
+nonadjacent pairs `(0,2)` and `(1,3)`, two different complex partner phases,
+and genuinely complex one- and two-electron integrals.  Block2 uses the same
+Phase-2 exact-representation settings: one thread, seed 2468, bond dimension
+32, eight zero-noise sweeps, `tol=1e-12`, local squared-residual threshold
+`1e-20`, Davidson maximum 1000, NPDM site type 2, and NPDM cutoff `1e-24`.
+
+| active-space quantity | exact FCI versus DMRG difference/residual |
+| --- | ---: |
+| maximum root-energy difference | 1.055e-15 Eh |
+| pair-averaged 1-RDM | 6.438e-16 |
+| pair-averaged 2-RDM | 6.645e-16 |
+| canonical root-space/transition 1-RDM | 1.022e-15 |
+| raw ensemble time-reversal residual | 8.327e-16 |
+| root-overlap residual | 4.442e-16 |
+| projected-Hamiltonian residual | 1.712e-16 Eh |
+
+The full molecular gate is one-electron H/6-31G with Coulomb-only KR-X2CAMF,
+Cholesky threshold `1e-10`, CAS(1 electron, 2 active spinors), two virtual
+spinors, and equal weights `(0.5,0.5)` over the lowest Kramers pair.  A
+Kramers-preserving `0.18`-radian active/virtual tilt makes the orbital
+optimization nontrivial.  Active natural-orbital rotations use the
+repository's Kramers eigensolver at every macroiteration; core/virtual
+canonicalization is immaterial for this zero-core gate and is disabled.
+Super-CI uses energy/gradient thresholds `1e-10` and `1e-7`, maximum step
+`0.1`, Davidson tolerance `1e-11`, maximum subspace 20, and strict residual
+failure.
+
+| KR X2C-SCF quantity | exact FCI | Block2 DMRG | difference/residual |
+| --- | ---: | ---: | ---: |
+| final total energy (Eh) | -0.498241138750104 | -0.498241138750104 | 0.000e+0 |
+| final gradient norm | 3.468701e-8 | 3.468701e-8 | 0.000e+0 |
+| state-averaged 1-RDM | -- | -- | 3.103e-17 |
+| state-averaged 2-RDM | -- | -- | 0.000e+0 |
+| active/virtual projector | -- | -- | 4.887e-23 |
+| 13-macroiteration energy trajectory | -- | -- | 1.110e-16 Eh |
+| raw ensemble time-reversal residual | -- | -- | 2.221e-16 |
+
+Commands for this milestone:
+
+```bash
+uv run pytest -q tests/test_dmrgci_kramers.py
+uv run pytest -q tests/test_dmrgci.py tests/test_dmrgci_x2c.py \
+  tests/test_superci_cholesky.py tests/test_x2c_dmrg_scf.py
+uv run pytest -q
+```
+
+Milestone commit: `dmrg: add validated Kramers-restricted X2C-DMRG-SCF`
+(the concrete hash is reported in the next milestone and final run log).
 
 ## Known limitations at this milestone
 
-The general complex-spinor solver conserves particle number only. `ci0` is
+Both general and Kramers modes conserve particle number only. `ci0` is
 explicitly ignored because an MPS from the preceding CASSCF macroiteration is
 not valid after an orbital rotation without a validated MPS orbital transform.
 The CASCI solver boundary receives the reconstructed active four-index tensor;
-Block2 does not consume Cholesky factors directly.  Kramers-restricted
-adaptation and Super-CIPT are later validation milestones.
+Block2 does not consume Cholesky factors directly.  Kramers mode retains the
+full spinor space and requires a complete even root manifold for odd-electron
+systems; pair members used by PySCF state averaging must have equal weights.
+The state-specific projection shift is configurable for unusually wide active
+spectra.  Kramers-restricted Super-CIPT is outside the later Phase-4 scope.
