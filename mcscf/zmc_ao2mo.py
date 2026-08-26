@@ -133,7 +133,7 @@ def chunked_cholesky(mol, max_error=1e-5, verbose=True, cmax=8):
             info = (nchol, delta_max, step_time, total_time)
             print("# iteration %5d: delta_max = %13.8e: time = %13.8e total_time = %13.8e" % info)
 
-    return chol_vecs[:nchol]
+    return chol_vecs[:nchol + 1]
 
 def chunked_cholesky_threeloop(mol, max_error=1e-5, verbose=True, cmax=15):
     """Modified cholesky decomposition from pyscf eris.
@@ -280,7 +280,7 @@ def chunked_cholesky_threeloop(mol, max_error=1e-5, verbose=True, cmax=15):
             total_time = time.time() - start
             info = (nchol, delta_max, step_time, total_time)
             print("# iteration %5d: delta_max = %13.8e: time = %13.8e total_time = %13.8e" % info, flush=True)
-    return chol_vecs[:nchol]
+    return chol_vecs[:nchol + 1]
 
 def chunked_cholesky_twoloop(mol, max_error=1e-5, verbose=True, cmax=15):
     """Modified cholesky decomposition from pyscf eris.
@@ -359,6 +359,8 @@ def chunked_cholesky_twoloop(mol, max_error=1e-5, verbose=True, cmax=15):
         delta = diag - Mapprox
         nu = np.argmax(np.abs(delta))
         delta_max = np.abs(delta[nu])
+        if delta_max <= max_error:
+            break
         # Compute ERI chunk.
         # shls_slice computes shells of integrals as determined by the angular
         # momentum of the basis function and the number of contraction
@@ -402,7 +404,7 @@ def chunked_cholesky_twoloop(mol, max_error=1e-5, verbose=True, cmax=15):
             info = (nchol, delta_max, step_time, total_time)
             print("# iteration %5d: delta_max = %13.8e: time = %13.8e total_time = %13.8e" % info, flush=True)
 
-    return chol_vecs[:nchol]
+    return chol_vecs[:nchol + 1]
 
 def chunked_cholesky0(mol, max_error=1e-5, verbose=True, cmax=15):
     """Modified cholesky decomposition from pyscf eris.
@@ -481,6 +483,8 @@ def chunked_cholesky0(mol, max_error=1e-5, verbose=True, cmax=15):
         delta = diag - Mapprox
         nu = np.argmax(np.abs(delta))
         delta_max = np.abs(delta[nu])
+        if delta_max <= max_error:
+            break
         # Compute ERI chunk.
         # shls_slice computes shells of integrals as determined by the angular
         # momentum of the basis function and the number of contraction
@@ -511,7 +515,7 @@ def chunked_cholesky0(mol, max_error=1e-5, verbose=True, cmax=15):
             info = (nchol, delta_max, step_time, total_time)
             print("# iteration %5d: delta_max = %13.8e: time = %13.8e total_time = %13.8e" % info, flush=True)
 
-    return chol_vecs[:nchol]
+    return chol_vecs[:nchol + 1]
 
 # level = 1: aaaa
 # level = 2: paaa
@@ -544,7 +548,7 @@ class _CDERIS(lib.StreamObject):
         moo_sph = numpy.dot(c2, mo[:, :nocc])        # (2*nao_nr, nocc)
         mop_sph = numpy.dot(c2, mo)                   # (2*nao_nr, nmo)
 
-        if level is 2:
+        if level == 2:
             if with_df is not None:
                 cd_pa, vk_core = self._build_cd_pa_and_vk(
                     with_df, mol, nao_nr, nmo, ncore, ncas, nocc,
@@ -718,7 +722,9 @@ class _CDERIS(lib.StreamObject):
         # total into half-transform (C kernel, untouched) vs core-K assembly vs
         # cd_pa construction (the two this rewrite changed), so a slow run shows
         # which phase to look at instead of one opaque number.
-        t_half = t_corek = t_cdpa = numpy.zeros(2)
+        t_half = numpy.zeros(2)
+        t_corek = numpy.zeros(2)
+        t_cdpa = numpy.zeros(2)
         b0 = 0
         for eri1 in with_df.loop(blksize):
             tb0 = (logger.process_clock(), logger.perf_counter())
@@ -870,6 +876,11 @@ class _ERIS(object):
         ncore = zcasscf.ncore
         ncas = zcasscf.ncas
         nocc = ncore+ncas
+        self._scf = zcasscf._scf
+        self.mo = mo
+        self.ncore = ncore
+        self.ncas = ncas
+        self.nocc = nocc
 
         mem_incore, mem_outcore, mem_basic = mc_ao2mo._mem_usage(ncore, ncas, nmo)
         mem_now = lib.current_memory()[0]
@@ -889,25 +900,46 @@ class _ERIS(object):
                          (mem_basic+mem_now)/.9, zcasscf.max_memory)
             if level == 1:
                 #r_outcore.general(mol, (moa, moa, moa, moa), self.feri, dataname='aaaa', intor="int2e_spinor")
-                nrr_outcore.general(mol, (moa, moa, moa, moa), self.feri, dataname='aaaa', motype='ghf', verbose=5)
+                nrr_outcore.general(mol, (moa, moa, moa, moa), self.feri,
+                                    dataname='aaaa', motype='ghf',
+                                    verbose=zcasscf.verbose)
                 self.aaaa = \
                         self.feri['aaaa'][:,:].reshape((ncas, ncas, ncas, ncas))
             elif level == 2:   
-                nrr_outcore.general(mol, (moa, moa, mo, moa), self.feri, dataname='aapa', motype='j-spinor', verbose=5)
+                nrr_outcore.general(mol, (moa, moa, mo, moa), self.feri,
+                                    dataname='aapa', motype='j-spinor',
+                                    verbose=zcasscf.verbose)
                 #r_outcore.general(mol, (moa, moa, mo, moa), self.feri, dataname='aapa', intor="int2e_spinor", verbose=5)
                 self.paaa = self.feri['aapa'][:,:].T.reshape((nmo, ncas, ncas, ncas))
                 #r_outcore.general(mol, (mo, moa, moa, moa), self.feri, dataname='paaa', intor="int2e_spinor", verbose=5)
                 #self.paaa = self.feri['paaa'][:,:].reshape((nmo, ncas, ncas, ncas))
             else:
                 #r_outcore.general(mol, (mo, mo, mo, mo), self.feri, dataname='pppp', intor="int2e_spinor", verbose=5)
-                nrr_outcore.general(mol, (mo, mo, mo, mo), self.feri, dataname='pppp', motype='j-spinor', verbose=5)
+                nrr_outcore.general(mol, (mo, mo, mo, mo), self.feri,
+                                    dataname='pppp', motype='j-spinor',
+                                    verbose=zcasscf.verbose)
                 self.pppp = self.feri['pppp'][:,:].reshape((nmo, nmo, nmo, nmo))
             
         if (level == 1):
-            self.aaaa.shape = (ncas, ncas, ncas, ncas)
+            self.aaaa = self.aaaa.reshape((ncas, ncas, ncas, ncas))
         elif (level == 2):
-            self.paaa.shape = (nmo, ncas, ncas, ncas)
+            self.paaa = self.paaa.reshape((nmo, ncas, ncas, ncas))
             self.aaaa = self.paaa[ncore:nocc]
         else:
             self.paaa = self.pppp[:,ncore:nocc,ncore:nocc,ncore:nocc]
             self.aaaa = self.pppp[ncore:nocc,ncore:nocc,ncore:nocc,ncore:nocc]
+
+    def get_jk(self, dm, mo_coeff=None, mo_occ=None):
+        if mo_coeff is not None and mo_occ is not None:
+            dm = lib.tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
+        return self._scf.get_jk(self._scf.mol, dm)
+
+    def get_jk_active_mo(self, casdm1):
+        nmo = self.mo.shape[1]
+        dm_active = numpy.zeros((nmo, nmo), dtype=complex)
+        dm_active[self.ncore:self.nocc, self.ncore:self.nocc] = casdm1
+        dm_active_ao = reduce(numpy.dot, (self.mo, dm_active, self.mo.T.conj()))
+        vj_a, vk_a = self._scf.get_jk(self._scf.mol, dm_active_ao)
+        vj_a_mo = reduce(numpy.dot, (self.mo.T.conj(), vj_a, self.mo))
+        vk_a_mo = reduce(numpy.dot, (self.mo.T.conj(), vk_a, self.mo))
+        return vj_a_mo, vk_a_mo

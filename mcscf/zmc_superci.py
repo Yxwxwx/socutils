@@ -3,7 +3,6 @@
 import sys
 import numpy
 import numpy as np
-import time
 from pyscf import lib, scf, gto, mcscf
 from pyscf.lib import logger
 from functools import reduce
@@ -107,91 +106,176 @@ def compute_lambda_(mat1, mat2, x_):
     return lambda_test, stepsize
 
 
-def davidson(hop, g, hdiag, sop=None, max_stepsize=1.0, tol=5e-6, neig=1, mmax=10):
-    # Setup the subspace trial vectors
-    print('No. of start vectors:', 1)
-    neig = neig
-    print('No. of desired Eigenvalues:', neig)
-    n = g.shape[0] + 1
-    x = np.zeros((n, mmax + 1), dtype=complex)  # holder for trial vectors as iterations progress
-    sigma = np.zeros((n, mmax + 1), dtype=complex)
-    sdotx = np.zeros((n, mmax + 1), dtype=complex)
-    ritz = np.zeros((n, mmax), dtype=complex)
-    #-------------------------------------------------------------------------------
-    # Begin iterations
-    #-------------------------------------------------------------------------------
-    #initial extra (1,0) vector
-    start = time.time()
+def davidson(hop, g, hdiag, sop=None, max_stepsize=1.0, tol=5e-6,
+             neig=1, mmax=10, lindep=1e-12, log=None):
+    """Solve the generalized augmented-Hessian Super-CI equation.
+
+    This Davidson solve is the orbital-equation solve.  Its tolerance and
+    residual are deliberately independent of Block2's local eigensolver.
+    The returned residual is that of the full augmented equation after the
+    eigenvector has been normalized to unit reference component.
+    """
+    if sop is None:
+        raise ValueError('The Super-CI overlap operator is required')
+    if neig != 1:
+        raise NotImplementedError('Only one augmented-Hessian root is supported')
+    if mmax < 1:
+        raise ValueError('mmax must be at least one')
+
+    g = np.asarray(g, dtype=complex)
+    hdiag = np.asarray(hdiag)
+    if g.ndim != 1 or hdiag.shape != g.shape:
+        raise ValueError('g and hdiag must be one-dimensional arrays of equal size')
+
+    gnorm = np.linalg.norm(g)
+    if gnorm <= tol:
+        info = {
+            'converged': True,
+            'iterations': 0,
+            'residual_norm': float(gnorm),
+            'residual_history': [float(gnorm)],
+            'step_norm': 0.0,
+            'max_stepsize': float(max_stepsize),
+            'reason': 'zero_gradient',
+        }
+        return np.zeros_like(g), 0.0, info
+
+    n = g.size + 1
+    x = np.zeros((n, mmax + 1), dtype=complex)
+    sigma = np.zeros_like(x)
+    sdotx = np.zeros_like(x)
     x[0, 0] = 1.0
     sigma[1:, 0] = g
     sdotx[0, 0] = 1.0
-    if sop is None:
-        print('No sop parsed')
-        exit()
 
-    # "first" guess vector
+    denom = hdiag + 1e-3
+    denom = np.where(np.abs(denom) > 1e-8, denom,
+                     np.where(denom.real < 0, -1e-8, 1e-8))
+    x[1:, 1] = -g / denom
+    trial_norm = np.linalg.norm(x[:, 1])
+    if trial_norm <= lindep:
+        x[1:, 1] = -g / gnorm
+    else:
+        x[:, 1] /= trial_norm
 
-    for i in range(1, n):
-        if hdiag[i - 1] + 0.001 > 1.0e-8:
-            x[i, 1] = -g[i - 1] / (hdiag[i - 1] + 0.001)
-        else:
-            x[i, 1] = -g[i - 1] / (hdiag[i - 1] + 0.001 - 1.0e-8)
-
-    x[:, 1] = x[:, 1] / np.linalg.norm(x[:, 1])
+    residual_history = []
+    last_step = None
+    last_eig = None
+    last_info = None
     for m in range(1, mmax + 1):
         sigma[1:, m] = hop(x[1:, m])
-        sigma[0, m] = np.dot(g.conj(), x[1:, m])
+        sigma[0, m] = np.vdot(g, x[1:, m])
         sdotx[1:, m] = sop(x[1:, m])
-        sdotx[0, m] = 0.0j
-        # Matrix-vector products, form the projected Hamiltonian in the subspace
-        T = np.linalg.multi_dot((x[:, :m + 1].T.conj(), sigma[:, :m + 1]))
-        S = np.linalg.multi_dot((x[:, :m + 1].T.conj(), sdotx[:, :m + 1]))
-        mat1 = numpy.zeros((m + 1, m + 1), dtype=complex)
-        mat2 = numpy.zeros((m + 1, m + 1), dtype=complex)
-        mat2[1:, 1:] = T[1:, 1:]
-        mat1 = T - mat2
-        #lambda_, stepsize = compute_lambda_(mat1, mat2, x)
-        lambda_ = 1.0
-        stepsize = 0.0
-        T = mat1 + mat2 * (1.0 / lambda_)
-        e, vects = scipy.linalg.eigh(T[:m + 1, :m + 1], S[:m+1,:m+1])
-        ivec = -1
-        for j in range(m + 1):
-            if abs(vects[0, j]) <= 1.1 and abs(vects[0, j]) > 0.1:
-                ivec = j
-                break
-        if ivec < 0:
-            raise Exception('logical error in AugHess')
-        elif ivec > 0:
-            print('... the vector found in AugHess was not the lowest eigenvector ...')
 
-        ritz[1:, 0] = np.dot(sigma[1:, :m + 1] - lambda_ * e[ivec] * sdotx[1:, :m + 1], vects[:, ivec])
-        err = np.linalg.norm(ritz[:, 0])
-        print(f'iter {m}, ivec {ivec}, c[{ivec}], {vects[0,ivec]:8.4f}, eps={e[ivec]:12.8f}, res={err:8.6e},  lambda={lambda_:6.2f}, step={stepsize:8.4f}')
-        if err < min(1e-3 * stepsize, tol) and m > 4:
-            print('Davidson converged at iteration no.:', m - 1)
-            end = time.time()
-            print('Davidson time:', end - start)
-            x_ = np.dot(x[:, :m + 1], vects[:, ivec])
-            print(f'{x_[0]:.6f}, x_[0]')
-            return x_[1:] / x_[0], e[ivec]
-        elif m is mmax:
-            print('Max iteration reached')
-            x_ = np.dot(x[:, :m + 1], vects[:, ivec])
-            print(f'{x_[0]:.6f}, x_[0]')
-            return x_[1:] / x_[0], e[ivec]
-        else:
-            for idx in range(hdiag.shape[0]):
-                denom = hdiag[idx] - e[ivec] * lambda_
-                if abs(denom) > 1e-8:
-                    ritz[idx + 1, 0] = -ritz[idx + 1, 0] / denom
-                else:
-                    ritz[idx + 1, 0] = -ritz[idx + 1, 0] / 1e-8
-            # orthonormalize ritz vector
+        xsub = x[:, :m + 1]
+        sigsub = sigma[:, :m + 1]
+        ssub = sdotx[:, :m + 1]
+        projected_h = xsub.T.conj().dot(sigsub)
+        projected_s = xsub.T.conj().dot(ssub)
+        projected_h = (projected_h + projected_h.T.conj()) * 0.5
+        projected_s = (projected_s + projected_s.T.conj()) * 0.5
+        eigvals, eigvecs = scipy.linalg.eigh(projected_h, projected_s)
+
+        root = next((i for i in range(m + 1)
+                     if 0.1 < abs(eigvecs[0, i]) <= 1.1), None)
+        if root is None:
+            raise RuntimeError('No root with a usable reference component '
+                               'was found in the augmented-Hessian subspace')
+
+        coeff = eigvecs[:, root]
+        augvec = xsub.dot(coeff)
+        reference = augvec[0]
+        if abs(reference) <= lindep:
+            raise RuntimeError('Augmented-Hessian root has a vanishing reference component')
+        step = augvec[1:] / reference
+        residual = (sigsub.dot(coeff) - eigvals[root] * ssub.dot(coeff)) / reference
+        residual_norm = float(np.linalg.norm(residual))
+        step_norm = float(np.linalg.norm(step))
+        residual_history.append(residual_norm)
+        converged = residual_norm <= tol
+        last_step = step
+        last_eig = float(eigvals[root].real)
+        last_info = {
+            'converged': converged,
+            'iterations': m,
+            'residual_norm': residual_norm,
+            'residual_history': residual_history.copy(),
+            'step_norm': step_norm,
+            'max_stepsize': float(max_stepsize),
+            'root': root,
+            'reason': 'converged' if converged else 'maximum_space',
+        }
+        if log is not None:
+            log.debug('Super-CI Davidson iter %d root %d eigenvalue %.12g '
+                      'residual %.6g step %.6g',
+                      m, root, last_eig, residual_norm, step_norm)
+        if converged:
+            return last_step, last_eig, last_info
+        if m == mmax:
+            return last_step, last_eig, last_info
+
+        correction = np.zeros(n, dtype=complex)
+        correction_denom = hdiag - eigvals[root]
+        correction_denom = np.where(
+            np.abs(correction_denom) > 1e-8,
+            correction_denom,
+            np.where(correction_denom.real < 0, -1e-8, 1e-8))
+        correction[1:] = -residual[1:] / correction_denom
+        # Two passes make the complex Euclidean Gram-Schmidt robust enough for
+        # the small Super-CI spaces used here.  np.vdot supplies the required
+        # conjugation of the existing subspace vectors.
+        for _ in range(2):
             for idx in range(m + 1):
-                ritz[:, 0] = ritz[:, 0] - (np.dot(x[:, idx], ritz[:, 0]) * x[:, idx])
-            ritz[:, 0] = ritz[:, 0] / (np.linalg.norm(ritz[:, 0]))
-            x[:, m + 1] = ritz[:, 0]
+                correction -= np.vdot(x[:, idx], correction) * x[:, idx]
+        correction_norm = np.linalg.norm(correction)
+        if correction_norm <= lindep:
+            last_info['reason'] = 'linear_dependence'
+            return last_step, last_eig, last_info
+        x[:, m + 1] = correction / correction_norm
+
+    return last_step, last_eig, last_info
+
+def _contract_dm2_gradient(eris, casdm2):
+    """Return the ``p,t`` two-particle contribution to the orbital gradient.
+
+    ``casdm2[t,u,v,w]`` follows the socutils/PySCF spinor convention
+    ``<t† v† w u>``.  For full integrals this contracts
+    ``(p u|v w) casdm2[t,u,v,w]``.  The Cholesky form uses the bilinear
+    (unconjugated) reconstruction
+    ``(p u|v w) = sum_P cd_pa[P,p,u] cd_aa[P,v,w]``.
+    """
+    if isinstance(eris, zmc_ao2mo._ERIS):
+        return lib.einsum('puvw,tuvw->pt', eris.paaa, casdm2)
+    if isinstance(eris, zmc_ao2mo._CDERIS):
+        tmp = lib.einsum('Pvw,tuvw->Ptu', eris.cd_aa, casdm2)
+        return lib.einsum('Ppu,Ptu->pt', eris.cd_pa, tmp)
+    raise TypeError('Unsupported ERI container %s' % type(eris).__name__)
+
+
+def _subspace_eigh(casscf, matrix, mo_subspace):
+    """Diagonalize an MO-space matrix using reference symmetry when needed."""
+    from socutils.scf import spinor_hf
+
+    mf = casscf._scf
+    if isinstance(mf, spinor_hf.KRHF):
+        return mf.eig(matrix)
+    if isinstance(mf, spinor_hf.SymmSpinorSCF):
+        return mf.eig(matrix, mo=mo_subspace)
+    return scipy.linalg.eigh(matrix)
+
+
+def _active_natural_orbitals(casscf, casdm1, mo_active):
+    """Diagonalize the active 1-RDM using the reference's symmetry when needed."""
+    return _subspace_eigh(casscf, -casdm1, mo_active)
+
+
+def _ci_convergence_snapshot(solver):
+    info = getattr(solver, 'convergence_info', None) or {}
+    keys = ('sweeps', 'energy_change', 'discarded_weight',
+            'local_residual_bound', 'bond_dimension', 'npdm_site_type',
+            'npdm_cutoff')
+    return {key: info[key] for key in keys if key in info}
+
 
 # note: the ncas, nelecas, ncore should all be counted as the number of spin orbitals
 def gen_g_hop(casscf, mo, casdm1, casdm2, eris):
@@ -231,8 +315,8 @@ def gen_g_hop(casscf, mo, casdm1, casdm2, eris):
         fock_eff = h1e_mo + vhf_ca
         fock_core = fock_eff[:ncore, :ncore]
         fock_vir = fock_eff[nocc:, nocc:]
-        e_core, c_core = casscf._scf.eig(fock_core, mo=mo[:, :ncore])
-        e_vir, c_vir = casscf._scf.eig(fock_vir, mo=mo[:, nocc:])
+        e_core, c_core = _subspace_eigh(casscf, fock_core, mo[:, :ncore])
+        e_vir, c_vir = _subspace_eigh(casscf, fock_vir, mo[:, nocc:])
         mo[:,:ncore] = np.dot(mo[:,:ncore], c_core)
         mo[:,nocc:] = np.dot(mo[:,nocc:], c_vir)
         h1e_mo = reduce(np.dot, (mo.T.conj(), casscf.get_hcore(), mo))
@@ -268,17 +352,7 @@ def gen_g_hop(casscf, mo, casdm1, casdm2, eris):
         h1e_mo[:, ncore:nocc] + vhf_c[:, ncore:nocc], casdm1)[ncore:,:]
     g_new[nocc:,ncore:nocc] = np.dot(h1e_mo[nocc:,ncore:nocc] + vhf_c[nocc:,ncore:nocc], casdm1)
     g_new[ncore:nocc,:ncore] = np.dot(casdm1, h1e_mo[ncore:nocc, :ncore] + vhf_c[ncore:nocc,:ncore])
-    if isinstance(eris, zmc_ao2mo._ERIS):
-        paaa = eris.paaa
-        g_dm2 = lib.einsum('puvw,tuvw->pt', paaa, casdm2)
-    elif isinstance(eris, zmc_ao2mo._CDERIS):
-        cd_pa = eris.cd_pa
-        cd_aa = eris.cd_aa
-        tmp = lib.einsum('Lvw,tuvw->Ltu', cd_aa, casdm2)
-        g_dm2 = lib.einsum('Lpu,Ltu->pt', cd_pa, tmp)
-        del tmp
-    else:
-        raise('eris type not recognized')
+    g_dm2 = _contract_dm2_gradient(eris, casdm2)
     
     # transform g_dm2 to canonical basis
     c = np.eye(nmo, dtype=complex)
@@ -448,9 +522,11 @@ def postprocess_x0(xbar, xs, ys, rhos, a, bfgs_space=10):
 
 
 def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
-                  conv_tol_grad=None, verbose=5, cderi=None, bfgs=False, solver='davidson',  # cderi kept for backward compat
-                  davidson_maxiter=10):
-    bfgs = bfgs
+                  conv_tol_grad=None, verbose=5, cderi=None, bfgs=False,
+                  solver='davidson', davidson_maxiter=10,
+                  davidson_tol=5e-6, davidson_strict=True, callback=None):
+    # cderi is retained for compatibility with callers that supply vectors
+    # directly; normal calculations use the CD object attached to the SCF.
     davidson_mmax = davidson_maxiter
     log = logger.new_logger(mc, verbose)
     cput0 = (logger.process_clock(), logger.perf_counter())
@@ -465,12 +541,40 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
     ncas = mc.ncas
     nocc = ncore + ncas
 
+    if solver not in ('davidson', 'gmres'):
+        raise ValueError("Super-CI solver must be 'davidson' or 'gmres'")
+    log.info('Super-CI orbital solver = %s', solver)
+    if solver == 'davidson':
+        log.info('Super-CI Davidson tolerance = %.3g, maximum space = %d, strict = %s',
+                 davidson_tol, davidson_mmax, davidson_strict)
+
     mci = mc.view(zcasci.CASCI)
     #eris = zmc_ao2mo._ERIS(mc, mo, level=2)
     eris = zmc_ao2mo._CDERIS(mc, mo, cderi=cderi, level=2)
+    if not isinstance(eris, zmc_ao2mo._CDERIS):
+        raise RuntimeError('Super-CI must use the factorized ERI route')
+    with_df = getattr(mc._scf, 'with_df', None)
+    from socutils.cd.cd import CD
+    is_cholesky = isinstance(with_df, CD)
+    cholesky_info = {
+        'active': is_cholesky,
+        'factorized': True,
+        'container': type(eris).__name__,
+        'source': type(with_df).__name__ if with_df is not None else 'legacy-cderi',
+        'naux': int(eris.cd_pa.shape[0]),
+        'threshold': getattr(with_df, 'tau', None),
+    }
+    mc.cholesky_diagnostics = cholesky_info
+    log.info('Super-CI factorized ERI route: source = %s, naux = %d, '
+             'Cholesky = %s, threshold = %s',
+             cholesky_info['source'], cholesky_info['naux'],
+             cholesky_info['active'], cholesky_info['threshold'])
     mci = zmcscf._fake_h_for_fast_casci(mc, mo, eris)
     print('first CI calculation')
     e_tot, e_cas, fcivec = mci.kernel(mo, verbose=verbose)
+    ci_converged = bool(np.all(getattr(mc.fcisolver, 'converged', True)))
+    if not ci_converged:
+        raise RuntimeError('The active-space CI solver did not converge')
     mc.e_tot, mc.e_cas = e_tot, e_cas
     #mc._finalize()
     #e_tot, e_cas, fcivec = mc.casci(mo, ci0=None, eris=eris)
@@ -480,7 +584,7 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
 
     conv = False
     norm_gorb = norm_gci = -1
-    de, elast = e_tot, e_tot
+    de, elast = np.inf, e_tot
 
     t1m = log.timer('Initializing Super-CI based MCSCF', *cput0)
     casdm1, casdm2 = mc.fcisolver.make_rdm12(fcivec, ncas, mc.nelecas)
@@ -500,13 +604,16 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
     trust_radii = 0.5
     e_last = e_tot
     dr = None
+    macro_history = []
+    mc.macro_history = macro_history
+    last_linear_info = None
     while not conv and imacro < mc.max_cycle_macro:
         # compute natural orbital and transform ci to natural orbtial basis
         # no transform function available now so re do a ci calculation
         # do it in gen_g_hop
         if mc.natorb is True: 
             moa = mo[:, ncore:nocc]
-            natocc, c = mc._scf.eig(-casdm1, mo=moa)
+            natocc, c = _active_natural_orbitals(mc, casdm1, moa)
             moa_new = np.dot(moa, c)
             mo[:, ncore:nocc] = moa_new
 
@@ -515,7 +622,13 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
             mci = zmcscf._fake_h_for_fast_casci(mc, mo, eris)
             print('update eris', verbose)
             e_nat_tot, e_cas, fcivec = mci.kernel(mo, ci0=None, verbose=verbose)
+            ci_converged = bool(np.all(
+                getattr(mc.fcisolver, 'converged', True)))
+            if not ci_converged:
+                raise RuntimeError('The active-space CI solver did not converge '
+                                   'after the natural-orbital rotation')
             print(e_tot, e_nat_tot)
+            e_tot = e_nat_tot
             casdm1, casdm2 = mci.fcisolver.make_rdm12(fcivec, ncas, mc.nelecas)
             print('natural occupation number in cas space', casdm1.diagonal())
 
@@ -526,6 +639,24 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
         t2m = log.timer('Compute gradient', *t2m)
         norm_gorb = np.linalg.norm(g)
         g_unpack = mc.unpack_uniq_var(g)
+
+        natural_occupations = np.linalg.eigvalsh(
+            (casdm1 + casdm1.T.conj()) * 0.5).real[::-1]
+        history_entry = {
+            'macro_iteration': imacro,
+            'total_energy': float(np.real(e_tot)),
+            'energy_change': None if not np.isfinite(de) else float(np.real(de)),
+            'cas_energy': float(np.real(e_cas)),
+            'orbital_gradient_norm': float(norm_gorb),
+            'orbital_step_norm': float(norm_rot),
+            'natural_occupations': natural_occupations.tolist(),
+            'converged': False,
+            'ci_solver_converged': ci_converged,
+            'ci_solver_diagnostics': _ci_convergence_snapshot(mc.fcisolver),
+            'cholesky_active': cholesky_info['active'],
+            'cholesky_naux': int(eris.cd_pa.shape[0]),
+        }
+        macro_history.append(history_entry)
 
         g_unpack = mc.unpack_uniq_var(g)
         row, col = np.unravel_index(np.argmax(g_unpack), g_unpack.shape)
@@ -544,35 +675,16 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
         if abs(de) < conv_tol and norm_gorb < conv_tol_grad:
             conv = True
         if conv:
+            history_entry['converged'] = True
+            if callback is not None:
+                callback(dict(history_entry))
             break
 
         gbar = g
 
-        class gmres_counter(object):
-
-            def __init__(self, disp=True):
-                self._disp = disp
-                self.niter = 0
-                self.callbacks = []
-                self.timer = (logger.process_clock(), logger.perf_counter())
-                self.log = logger.Logger(sys.stdout, verbose)
-
-            def __call__(self, rk=None):
-                self.callbacks.append(str(rk))
-                self.niter += 1
-                # if self._disp:
-                self.timer = self.log.timer(
-                    f'GMRES iteration #{self.niter}, residual : {rk:.4e}',
-                    *self.timer)
-
-        #if verbose >= logger.INFO:
-        #    counter = gmres_counter()
-        #else:
-        #    counter = None
-        counter = gmres_counter()
-        print(counter)
         t_gmres = (logger.process_clock(), logger.perf_counter())
         BFGS_SUBSPACE = 6
+        apply_bfgs = False
         if imacro > 0:
             bfgs_on = 1.0
             if not rejected and norm_gorb < bfgs_on:
@@ -591,33 +703,59 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
                 rhos = []
             if bfgs is True and norm_gorb < bfgs_on:
                 gbar, a = precondition_grad(g, xs, ys, rhos, bfgs_space=BFGS_SUBSPACE)
+                apply_bfgs = True
 
+        if solver == 'gmres':
             residuals = []
-            def callback(rk):
-                residuals.append(rk)
-            if solver == 'gmres':
-                x, _ = gmres(hop, -trust_radii*gbar, M=precond, maxiter=50, callback=callback)
-                #x = precond(-trust_radii*gbar) 
-            elif solver == 'davidson':
-                trust_radii = max(trust_radii, 0.2)
-                x, e = davidson(hop, trust_radii*gbar, h_diag, sop=sop, max_stepsize=trust_radii, mmax=davidson_mmax)
-                print('residuals', residuals)
-            if bfgs is True and norm_gorb < bfgs_on:
-                x = 0.5*postprocess_x(x, xs, ys, rhos, a, bfgs_space=BFGS_SUBSPACE)
+
+            def linear_callback(rk):
+                residuals.append(float(rk))
+
+            x, gmres_info = gmres(
+                hop, -trust_radii * gbar, M=precond, maxiter=50,
+                callback=linear_callback, callback_type='pr_norm')
+            last_linear_info = {
+                'solver': 'gmres',
+                'converged': gmres_info == 0,
+                'iterations': len(residuals),
+                'residual_norm': residuals[-1] if residuals else None,
+                'residual_history': residuals,
+                'reason': 'converged' if gmres_info == 0 else 'maximum_iterations',
+            }
         else:
-            residuals = []
-            def callback(rk):
-                residuals.append(rk)
-            if solver == 'gmres':
-                x, _ = gmres(hop, -trust_radii*gbar, M=precond, maxiter=50, callback=callback)
-                #x = precond(-trust_radii*gbar) 
-            elif solver == 'davidson':
-                x, e = davidson(hop, trust_radii*gbar, h_diag, sop=sop, mmax=10)
-                print('residuals', residuals)
+            if imacro > 0:
+                trust_radii = max(trust_radii, 0.2)
+            x, e, last_linear_info = davidson(
+                hop, trust_radii * gbar, h_diag, sop=sop,
+                max_stepsize=trust_radii, tol=davidson_tol,
+                mmax=davidson_mmax, log=log)
+            last_linear_info = dict(last_linear_info, solver='davidson')
+            log.info('Super-CI Davidson final residual %.6g after %d iterations '
+                     '(converged=%s)',
+                     last_linear_info['residual_norm'],
+                     last_linear_info['iterations'],
+                     last_linear_info['converged'])
+        history_entry['linear_solver'] = last_linear_info
+        if not last_linear_info['converged']:
+            message = ('Super-CI %s did not converge: residual %s after %d iterations'
+                       % (solver, last_linear_info['residual_norm'],
+                          last_linear_info['iterations']))
+            if davidson_strict:
+                mc.superci_diagnostics = {
+                    'linear_solver': last_linear_info,
+                    'final_gradient_norm': float(norm_gorb),
+                    'converged': False,
+                }
+                raise RuntimeError(message)
+            log.warn(message)
+        if apply_bfgs:
+            x = 0.5*postprocess_x(x, xs, ys, rhos, a,
+                                  bfgs_space=BFGS_SUBSPACE)
         t2m = log.timer('Solving Super-CI equation', *t_gmres)
 
         dr = mc.unpack_uniq_var(x)
         step_control = max_stepsize
+        history_entry['proposed_orbital_step_norm'] = float(norm(dr))
         for i in range(nmo):
             for j in range(i):
                 if abs(dr[i,j])>1e-2:
@@ -626,6 +764,8 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
             print('step rescaled')
             dr = dr * (step_control / norm(dr))
             print(norm(dr))
+        history_entry['applied_orbital_step_norm'] = float(norm(dr))
+        applied_x = mc.pack_uniq_var(dr)
         rotation = expmat(dr)
 
         norm_rot = np.linalg.norm(rotation-np.eye(nmo, dtype=complex))
@@ -639,15 +779,24 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
         mci = zmcscf._fake_h_for_fast_casci(mc, mo_new, eris)
         print('update eris2')
         e_tot, e_cas, fcivec = mci.kernel(mo_new, ci0=None, verbose=verbose)
+        ci_converged = bool(np.all(getattr(mc.fcisolver, 'converged', True)))
+        if not ci_converged:
+            raise RuntimeError('The active-space CI solver did not converge '
+                               'after the orbital step')
 
         # trus radius control
         #g_new, h_diag, hop, precondition = gen_g_hop(mc, mo_new, casdm1, casdm2, eris)
         #dg = norm(g_new) - norm(g)
         de = e_tot - e_last  #+ dg * .1
-        e2 = 0.5 * np.dot(x.T.conj(), g)
-        r = de / e2
+        e2 = float(0.5 * np.vdot(applied_x, g).real)
+        r = de / e2 if abs(e2) > 1e-16 else np.inf
 
         print(f'Energy change {de:.4e}, predicted change {e2:.4e}')
+        history_entry['next_total_energy'] = float(np.real(e_tot))
+        history_entry['accepted_energy_change'] = float(np.real(de))
+        history_entry['predicted_energy_change'] = float(np.real(e2))
+        history_entry['next_ci_solver_diagnostics'] = \
+            _ci_convergence_snapshot(mc.fcisolver)
         #while(True):
         #    if de < 0.0:
         #        print('energy lowered, exit iteration')
@@ -720,9 +869,13 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
         rejected = False
         mo = mo_new
         e_last = e_tot
-        x_prev = x
+        x_prev = applied_x
         g_prev = g
         casdm1, casdm2 = mc.fcisolver.make_rdm12(fcivec, ncas, mc.nelecas)
+        history_entry['next_natural_occupations'] = np.linalg.eigvalsh(
+            (casdm1 + casdm1.T.conj()) * 0.5).real[::-1].tolist()
+        if callback is not None:
+            callback(dict(history_entry))
         #from socutils.tools import analyze
         #analyze.analyze(mol, mo[:, ncore:nocc], casdm1.diagonal())
         nact = casdm1.shape[0]
@@ -738,6 +891,16 @@ def mcscf_superci(mc, mo_coeff, max_stepsize=0.2, conv_tol=None,
             mc.e_cas = e_cas
             mc._finalize()
     mc.mo_coeff = mo
+    mc.final_orbital_gradient_norm = float(norm_gorb)
+    mc.superci_diagnostics = {
+        'converged': bool(conv),
+        'final_gradient_norm': float(norm_gorb),
+        'energy_tolerance': float(conv_tol),
+        'gradient_tolerance': float(conv_tol_grad),
+        'linear_solver': last_linear_info,
+        'cholesky': cholesky_info,
+        'macro_iterations': int(imacro),
+    }
     return conv, e_tot, e_cas, fcivec, mo, None
 
 

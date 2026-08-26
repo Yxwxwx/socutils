@@ -154,6 +154,15 @@ class CASSCF(zcasci.CASCI):
 
     max_cycle_macro = getattr(__config__, 'mcscf_mc1step_CASSCF_max_cycle_macro', 20)
     irrep=None
+    _keys = zcasci.CASCI._keys.union({
+        'max_cycle_macro', 'max_stepsize', 'conv_tol', 'conv_tol_grad',
+        'freeze_pair', 'canonicalize_', 'superci_solver', 'superci_bfgs',
+        'superci_davidson_tol', 'superci_davidson_max_space',
+        'superci_davidson_strict', 'macro_history',
+        'superci_diagnostics', 'cholesky_diagnostics',
+        'final_orbital_gradient_norm',
+    })
+
     def __init__(self, mf_or_mol, ncas, nelecas, ncore=None, frozen=None, cholesky=True):
         zcasbase.CASBase.__init__(self, mf_or_mol, ncas, nelecas, ncore)
         self.frozen = frozen
@@ -165,6 +174,15 @@ class CASSCF(zcasci.CASCI):
         self.freeze_pair = None
         self.canonicalize_ = True
         self.natorb = True
+        self.superci_solver = 'davidson'
+        self.superci_bfgs = False
+        self.superci_davidson_tol = 5e-6
+        self.superci_davidson_max_space = 10
+        self.superci_davidson_strict = True
+        self.macro_history = []
+        self.superci_diagnostics = None
+        self.cholesky_diagnostics = None
+        self.final_orbital_gradient_norm = None
 
     def get_fock(self, mo_coeff=None, ci=None, eris=None, casdm1=None, verbose=None):
         return get_fock(self, mo_coeff, ci, eris, casdm1, verbose)
@@ -296,7 +314,12 @@ class CASSCF(zcasci.CASCI):
                 self.mo_coeff, self.mo_energy = \
                 _kern(self, mo_coeff, max_stepsize=self.max_stepsize,
                       conv_tol=self.conv_tol, conv_tol_grad=self.conv_tol_grad,
-                      verbose=self.verbose, cderi=self._cderi)
+                      verbose=self.verbose, cderi=self._cderi,
+                      bfgs=self.superci_bfgs, solver=self.superci_solver,
+                      davidson_maxiter=self.superci_davidson_max_space,
+                      davidson_tol=self.superci_davidson_tol,
+                      davidson_strict=self.superci_davidson_strict,
+                      callback=callback)
         logger.note(self, 'CASSCF energy = %#.15g', self.e_tot)
         self._finalize()
         return self.e_tot, self.e_cas, self.ci, self.mo_coeff, self.mo_energy

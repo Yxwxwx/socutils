@@ -58,9 +58,9 @@ rotation step, repeating until the energy and orbital gradient are converged.
 
    mol = gto.M(atom='H 0 0 0; F 0 0 0.917', basis='ccpvdz', verbose=4)
 
-   # the orbital optimizer builds its integrals from a density-fitted
-   # reference, so the mean field must be density-fitted (or .cholesky())
-   mf = spinor_hf.SCF(mol).x2camf().density_fit()
+   # The validated route uses a pivoted-Cholesky factorization.  tau is the
+   # requested maximum AO-integral residual.
+   mf = spinor_hf.SCF(mol).x2camf().cholesky(tau=1e-8)
    mf.kernel()
 
    mc = zmcscf.CASSCF(mf, 8, 6)   # 6 electrons in 8 active spinor orbitals
@@ -102,6 +102,14 @@ The optimization is controlled by attributes set on the ``CASSCF`` object
   mutual rotations are frozen (the rest are still optimized);
 * ``irrep`` (``None``) -- per-orbital symmetry labels; rotations are then allowed
   only between orbitals carrying the same label.
+* ``superci_solver`` (``'davidson'``) -- linear solver for the Super-CI orbital
+  equation; this is independent of any local Davidson solver used by a DMRG CI
+  solver;
+* ``superci_davidson_tol`` (``5e-6``) -- norm tolerance for the full generalized
+  augmented-Hessian residual;
+* ``superci_davidson_max_space`` (``10``) -- maximum Super-CI Davidson subspace;
+* ``superci_davidson_strict`` (``True``) -- raise instead of applying an orbital
+  step when the configured Super-CI residual was not reached.
 
 Convergence and results
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -118,6 +126,14 @@ stops at ``max_cycle_macro``.  ``kernel()`` returns
 * ``mc.mo_coeff`` / ``mc.mo_energy`` -- optimized (canonical) orbitals and their
   energies;
 * ``mc.converged`` -- whether both convergence criteria were met.
+* ``mc.final_orbital_gradient_norm`` -- norm tested at the final macroiteration;
+* ``mc.macro_history`` -- energy, CAS energy, gradient, applied step, natural
+  occupations, CI convergence data, and Super-CI residual for each
+  macroiteration;
+* ``mc.cholesky_diagnostics`` -- whether the factor source is a genuine
+  ``CD`` object, its threshold, vector count, and ERI-container type;
+* ``mc.superci_diagnostics`` -- final convergence thresholds and linear-solver
+  residual.
 
 .. note::
 

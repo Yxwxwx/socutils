@@ -147,7 +147,8 @@ def kernel(casci, mo_coeff=None, ci0=None, verbose=logger.NOTE):
     from socutils.hci import shci
     
     e_tot, fcivec = casci.fcisolver.kernel(h1eff, eri_cas.reshape(ncas, ncas, ncas, ncas), ncas, nelecas,
-                                           ci0=ci0, verbose=5, max_memory=max_memory, ecore=energy_core)
+                                           ci0=ci0, verbose=log.verbose,
+                                           max_memory=max_memory, ecore=energy_core)
     
     #if isinstance(e_tot, list):
     #    e_tot = numpy.average(e_tot)
