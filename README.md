@@ -1,4 +1,18 @@
 This repository adds utility for PySCF to include SOMF corrections within spinor style and GHF style calculations.
+
+The Python environment is locked with `uv` (Python 3.12):
+
+```bash
+uv sync
+make PYTHON=.venv/bin/python
+uv run python -c "import pyscf; import block2; import pyblock2; import socutils"
+```
+
+The lock selects the official Block2 preview index because its 0.5.4rc16
+CPython 3.12 wheel is newer than the compatible stable 0.5.3 release and
+provides the complex `pyblock2.driver` APIs used by the DMRG solver. See
+[`docs/x2c_dmrg_validation.md`](docs/x2c_dmrg_validation.md) for the tested
+tensor conventions and numerical results.
 To do a spinor (j-adapted) style calculation, build a spinor SCF and attach an
 X2CAMF spin-orbit Hamiltonian with the `.x2camf()` shortcut (the spinor analogue
 of PySCF's `scf.RHF(mol).x2c()`):

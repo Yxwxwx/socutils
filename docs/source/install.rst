@@ -9,6 +9,15 @@ socutils is a set of Python modules that build on `PySCF
 
 * **PySCF** -- the underlying quantum-chemistry framework.
 * **NumPy** / **SciPy** -- numerical backend (pulled in by PySCF).
+* **Block2** -- the complex spinor DMRG backend.
+* **h5py** -- HDF5-backed integral and calculation data.
+
+The supported environment is described by ``pyproject.toml`` and exactly
+resolved by ``uv.lock``.  From a clean checkout, install it with:
+
+.. code-block:: bash
+
+   uv sync
 
 Several features rely on small C/C++ libraries.  These are **bundled** with
 socutils (under ``socutils/lib``) and loaded via ctypes -- **no external
@@ -47,7 +56,7 @@ BLAS/LAPACK:
 
 .. code-block:: bash
 
-   make                          # at the repo root; auto-detect BLAS/LAPACK
+   make PYTHON=.venv/bin/python  # at the repo root; use the locked PySCF BLAS
    # or select a vendor library explicitly, e.g.
    make CMAKE_ARGS=-DBLA_VENDOR=OpenBLAS
    make CMAKE_ARGS=-DBLAS_LIBRARIES=/path/to/libopenblas.so
@@ -87,12 +96,17 @@ Backend and dispatcher selection is controlled by environment variables:
 Getting socutils
 ----------------
 
-Clone the repository and make it importable (for example by adding its parent
-directory to ``PYTHONPATH``):
+Clone the repository, synchronize the locked environment, and build the native
+libraries with that environment's interpreter:
 
 .. code-block:: bash
 
    git clone https://github.com/xubwa/socutils
-   export PYTHONPATH=/path/to/parent/of/socutils:$PYTHONPATH
+   cd socutils
+   uv sync
+   make PYTHON=.venv/bin/python
+   uv run python -c "import pyscf; import block2; import pyblock2; import socutils"
 
-You can then ``import socutils`` from Python.
+No external ``PYTHONPATH`` is required.  The lock uses the official Block2
+preview channel for the compatible CPython 3.12 wheel; see
+``docs/x2c_dmrg_validation.md`` for the exact versions and validation record.

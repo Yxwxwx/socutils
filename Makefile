@@ -29,6 +29,7 @@
 PYTHON     ?= python3
 CMAKE      ?= cmake
 CMAKE_ARGS ?=
+PYTHON_EXECUTABLE := $(shell $(PYTHON) -c 'import sys; print(sys.executable)')
 
 LIBDIR   := lib
 BUILDDIR := $(LIBDIR)/build
@@ -40,7 +41,8 @@ all: build
 
 build:
 	@mkdir -p $(BUILDDIR)
-	cd $(BUILDDIR) && $(CMAKE) .. -DCMAKE_BUILD_TYPE=Release $(CMAKE_ARGS)
+	cd $(BUILDDIR) && $(CMAKE) .. -DCMAKE_BUILD_TYPE=Release \
+		-DPYTHON_EXECUTABLE=$(PYTHON_EXECUTABLE) $(CMAKE_ARGS)
 	$(CMAKE) --build $(BUILDDIR) -- -j$(NPROC)
 	@for so in libx2camf_c.so libccsdt_clib.so libzquatev.so libnrr_opt.so; do \
 	    test -f $(LIBDIR)/$$so && echo "built $(LIBDIR)/$$so" \

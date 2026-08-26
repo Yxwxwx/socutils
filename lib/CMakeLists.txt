@@ -26,7 +26,11 @@ set(CMAKE_VERBOSE_MAKEFILE OFF)
 
 if(CMAKE_COMPILER_IS_GNUCC)
   if(UNIX AND NOT APPLE AND NOT DEFINED ENV{LDFLAGS})
-    set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--no-as-needed ${CMAKE_SHARED_LINKER_FLAGS}")
+    # Emit DT_RPATH instead of DT_RUNPATH so the PySCF wheel directory is
+    # also searched for indirect OpenBLAS dependencies (notably its hashed
+    # libgfortran).  RUNPATH is not transitive on glibc.
+    set(CMAKE_SHARED_LINKER_FLAGS
+        "-Wl,--no-as-needed -Wl,--disable-new-dtags ${CMAKE_SHARED_LINKER_FLAGS}")
   endif()
 endif()
 set(CMAKE_C_FLAGS "-Wall ${CMAKE_C_FLAGS}")
@@ -53,8 +57,31 @@ endif()
 set(_blas_user_provided TRUE)
 if(NOT BLAS_LIBRARIES)
   set(_blas_user_provided FALSE)
-  find_package(BLAS REQUIRED)
-  message(STATUS "BLAS libraries: ${BLAS_LIBRARIES}")
+  # Prefer the BLAS bundled with the selected PySCF wheel.  Loading a host MKL
+  # here can otherwise conflict at runtime with the MKL version linked into an
+  # official Block2 wheel.  An explicit BLAS_LIBRARIES still takes precedence.
+  if(NOT PYTHON_EXECUTABLE)
+    find_program(PYTHON_EXECUTABLE NAMES python3 python)
+  endif()
+  if(PYTHON_EXECUTABLE)
+    execute_process(
+      COMMAND ${PYTHON_EXECUTABLE} -c
+              "from pyscf import lib; import os; print(os.path.dirname(os.path.abspath(lib.__file__)))"
+      OUTPUT_VARIABLE PYSCF_LIB_DIR
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE _pyscf_lib_rc)
+  endif()
+  if(_pyscf_lib_rc EQUAL 0 AND PYSCF_LIB_DIR)
+    file(GLOB _pyscf_blas "${PYSCF_LIB_DIR}/libopenblas*.so")
+  endif()
+  if(_pyscf_blas)
+    list(GET _pyscf_blas 0 BLAS_LIBRARIES)
+    set(_blas_user_provided TRUE)
+    message(STATUS "BLAS/LAPACK from selected PySCF: ${BLAS_LIBRARIES}")
+  else()
+    find_package(BLAS REQUIRED)
+    message(STATUS "BLAS libraries: ${BLAS_LIBRARIES}")
+  endif()
 endif()
 if(NOT LAPACK_LIBRARIES)
   if(_blas_user_provided)
@@ -88,7 +115,7 @@ elseif(APPLE)
 else()
   set(CMAKE_SKIP_BUILD_RPATH FALSE)
   set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
-  set(CMAKE_INSTALL_RPATH "\$ORIGIN:\$ORIGIN/deps/lib")
+  set(CMAKE_INSTALL_RPATH "\$ORIGIN:\$ORIGIN/deps/lib:${PYSCF_LIB_DIR}")
 endif()
 
 add_subdirectory(x2camf)

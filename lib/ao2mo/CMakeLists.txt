@@ -12,17 +12,21 @@
 # their old meaning ("unspecified arguments") was only redefined by C23,
 # which gcc >= 14 defaults to.
 
-find_program(PYTHON_EXECUTABLE NAMES python3 python)
+if(NOT PYTHON_EXECUTABLE)
+  find_program(PYTHON_EXECUTABLE NAMES python3 python)
+endif()
 if(NOT PYTHON_EXECUTABLE)
   message(FATAL_ERROR "ao2mo/nrr_opt needs a Python interpreter (to locate pyscf)")
 endif()
 
-execute_process(
-  COMMAND ${PYTHON_EXECUTABLE} -c
-          "from pyscf import lib; import os; print(os.path.dirname(os.path.abspath(lib.__file__)))"
-  OUTPUT_VARIABLE PYSCF_LIB_DIR
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-  RESULT_VARIABLE _pyscf_lib_rc)
+if(NOT PYSCF_LIB_DIR)
+  execute_process(
+    COMMAND ${PYTHON_EXECUTABLE} -c
+            "from pyscf import lib; import os; print(os.path.dirname(os.path.abspath(lib.__file__)))"
+    OUTPUT_VARIABLE PYSCF_LIB_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _pyscf_lib_rc)
+endif()
 if(NOT _pyscf_lib_rc EQUAL 0 OR NOT PYSCF_LIB_DIR)
   message(FATAL_ERROR "ao2mo/nrr_opt: could not import pyscf via ${PYTHON_EXECUTABLE} "
                        "(needed to link against its libao2mo/libnp_helper/libcvhf/libcint)")

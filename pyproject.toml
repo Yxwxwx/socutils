@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "socutils"
+version = "0.1.0"
+description = "Relativistic spin-orbit-coupled electronic-structure utilities for PySCF"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "block2==0.5.4rc16",
+    "h5py>=3.10",
+    "numpy>=1.26",
+    "pyscf==2.14.0",
+    "scipy>=1.11",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[[tool.uv.index]]
+name = "block2-preview"
+url = "https://block-hczhai.github.io/block2-preview/pypi/"
+explicit = true
+
+[tool.uv.sources]
+block2 = { index = "block2-preview" }
+
+[tool.setuptools]
+packages = [
+    "socutils",
+    "socutils.adc",
+    "socutils.cd",
+    "socutils.dmrg",
+    "socutils.fci",
+    "socutils.gw",
+    "socutils.gw.test",
+    "socutils.lib",
+    "socutils.lib.ao2mo",
+    "socutils.lib.zquatev",
+    "socutils.mcscf",
+    "socutils.mp",
+    "socutils.scf",
+    "socutils.somf",
+    "socutils.tdscf",
+    "x2camf",
+]
+include-package-data = true
+
+[tool.setuptools.package-dir]
+socutils = "."
+x2camf = "x2camf_c/x2camf"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: molecular/native integration tests",
+    "expensive: tests unsuitable for the regular development subset",
+]

@@ -142,7 +142,7 @@ def kernel(casci, mo_coeff=None, ci0=None, verbose=logger.NOTE):
     # FCI
     # fcidump_rel.from_integrals('FCIDUMP', h1eff, eri_cas.reshape(ncas*ncas, ncas*ncas), ncas, nelecas, energy_core.real)
     # print('integral written')
-    max_memory = max(4000, casci.max_memory - lib.current_memory()[0])
+    max_memory = max(400, casci.max_memory - lib.current_memory()[0])
     from pyscf import fci
     from socutils.hci import shci
     
@@ -152,11 +152,12 @@ def kernel(casci, mo_coeff=None, ci0=None, verbose=logger.NOTE):
     #if isinstance(e_tot, list):
     #    e_tot = numpy.average(e_tot)
     t1 = log.timer('FCI solver', *t1)
-    e_cas = e_tot.real - energy_core.real
-    if not isinstance(e_cas, (float, numpy.number)):
-        e_cas = e_cas.mean()
-        e_tot = e_tot.mean()
-    return e_tot.real, e_cas.real, fcivec
+    e_tot = numpy.asarray(e_tot).real
+    e_cas = e_tot - energy_core.real
+    if e_tot.ndim == 0:
+        e_tot = float(e_tot)
+        e_cas = float(e_cas)
+    return e_tot, e_cas, fcivec
 
 
 class CASCI(zcasbase.CASBase):

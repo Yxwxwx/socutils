@@ -11,14 +11,16 @@ def _inject_initial_dmrg():
         return
 
     def _initial_dmrg(self, nroots=1, bond_dims=None, noises=None,
-                      thrds=None, tol=1e-6, scratch=None, n_threads=None):
+                      thrds=None, n_sweeps=None, tol=1e-6, scratch=None,
+                      n_threads=None, **kwargs):
         """Attach a :class:`DMRGCI` solver and return *self*."""
         fcisolv = DMRGCI(self._scf.mol)
         fcisolv.init(
             ncas=self.ncas, nelecas=self.nelecas,
             nroots=nroots,
             bond_dims=bond_dims, noises=noises, thrds=thrds,
-            tol=tol, scratch=scratch, n_threads=n_threads,
+            n_sweeps=n_sweeps, tol=tol, scratch=scratch,
+            n_threads=n_threads, **kwargs,
         )
         self.fcisolver = fcisolv
         return self

@@ -19,4 +19,11 @@ target_include_directories(zquatev PRIVATE csrc capi)
 set_target_properties(zquatev PROPERTIES
   PREFIX "lib" OUTPUT_NAME "zquatev"
   LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND UNIX AND NOT APPLE)
+  # The site Python may already have loaded an older libstdc++ (for example
+  # from Anaconda).  Keep this small bundled C++ library independent of that
+  # process-global runtime to avoid GLIBCXX symbol-version conflicts.
+  set_property(TARGET zquatev APPEND_STRING PROPERTY LINK_FLAGS
+               " -static-libstdc++ -static-libgcc")
+endif()
 target_link_libraries(zquatev PUBLIC ${LAPACK_LIBRARIES} ${BLAS_LIBRARIES})
