@@ -67,6 +67,22 @@ rotation step, repeating until the energy and orbital gradient are converged.
    mc.kernel()
    print(mc.e_tot)
 
+Spinor orbital analysis
+~~~~~~~~~~~~~~~~~~~~~~~
+
+``analyze_casscf_spinors`` prints the dominant spinor-AO coefficients of the
+optimized orbitals.  It analyzes the active space by default, making it useful
+for checking or refining a spinor active-space selection::
+
+   from socutils.tools import analyze_casscf_spinors
+
+   analyze_casscf_spinors(mc, threshold=0.05)
+   analyze_casscf_spinors(mc, threshold=0.05, mo_type='all')
+
+The threshold is applied to the absolute value of the complex AO coefficient;
+the printed real and imaginary parts are coefficients rather than
+overlap-weighted AO populations.
+
 Requirements
 ~~~~~~~~~~~~
 

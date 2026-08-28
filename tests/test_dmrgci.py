@@ -228,6 +228,7 @@ def test_casscf_restart_reuses_only_compatible_internal_mps(tmp_path):
     solver = _solver(tmp_path, 3, 1, bond_dim=8)
     energy0, state0 = solver.kernel(h1, eri, 3, 1, verbose=0)
     solver.make_rdm12(state0, 3, 1)
+    assert solver.convergence_info["block2_sweep_tolerance"] == solver.tol
     driver_id = id(solver.driver)
     scratch = solver._scratch
 
@@ -249,6 +250,8 @@ def test_casscf_restart_reuses_only_compatible_internal_mps(tmp_path):
     )
     assert solver.convergence_info["schedule"]["restart"]
     assert solver.convergence_info["schedule"]["n_sweeps"] == 8
+    assert solver.convergence_info["block2_sweep_tolerance"] == 0.0
+    assert solver.convergence_info["sweeps"] == 8
     assert solver._multi_mps.dot == 1
     solver.close()
 
@@ -303,6 +306,8 @@ def test_multiroot_checkpoint_resume_and_fingerprint_gate(tmp_path):
     assert np.max(abs(energy1 - energy0)) <= ENERGY_TOL
     assert resumed.convergence_info["run_mode"] == "checkpoint-resume"
     assert resumed.convergence_info["schedule"]["restart"]
+    assert resumed.convergence_info["block2_sweep_tolerance"] == 0.0
+    assert resumed.convergence_info["sweeps"] == 8
     assert not resumed.resume
     resumed.close()
 

@@ -1244,9 +1244,16 @@ class DMRGCI(StreamObject):
                 integral_cutoff=self.integral_cutoff,
                 iprint=iprint,
             )
+            # Block2's sweep tolerance is based on its aggregate energy and
+            # can stop a state-averaged MultiMPS restart while an individual
+            # root is still changing by more than ``self.tol``.  A restart
+            # schedule is deliberately short, noiseless, and one-site-only,
+            # so run all configured restart sweeps and let
+            # ``_capture_dmrg_run`` apply the stricter maximum-per-root test.
+            block2_sweep_tol = 0.0 if schedule.restart else self.tol
             dmrg_kwargs = {
                 "n_sweeps": schedule.n_sweeps,
-                "tol": self.tol,
+                "tol": block2_sweep_tol,
                 "bond_dims": list(schedule.bond_dims),
                 "noises": list(schedule.noises),
                 "thrds": list(schedule.thrds),
@@ -1366,6 +1373,7 @@ class DMRGCI(StreamObject):
                     "restart_requested": restart_requested,
                     "schedule_mode": self.schedule_mode,
                     "schedule": schedule.as_dict(),
+                    "block2_sweep_tolerance": block2_sweep_tol,
                     "checkpoint_dir": self.checkpoint_dir,
                     "checkpoint_fingerprint": checkpoint_problem[
                         "hamiltonian_sha256"

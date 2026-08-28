@@ -25,6 +25,8 @@ var/
 
 # Local log files
 *~
+dmrg.out
+slurm-*.out
 
 # Calculation examples
 *.molden
@@ -81,9 +83,11 @@ OneRDM*
 # Memoization and caching
 tmp/
 
-# IDEs
+# IDE and local agent metadata
 .idea/
 .vscode/
+.agents/
+.codex/
 
 #
 local/
@@ -97,4 +101,6 @@ benchmarck/results/**/*.progress.json
 benchmarck/kramers/logs/
 benchmarck/kramers/results/**/*.progress.json
 
-tests/
+# Local DMRG runtime state
+dmrg_scratch/
+dmrg_checkpoint/

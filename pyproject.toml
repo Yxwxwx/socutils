@@ -46,6 +46,7 @@ packages = [
     "socutils.scf",
     "socutils.somf",
     "socutils.tdscf",
+    "socutils.tools",
     "x2camf",
 ]
 include-package-data = true
