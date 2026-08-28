@@ -23,6 +23,7 @@ explicit here to prevent a silent index error.
 
 from dataclasses import dataclass
 from functools import lru_cache
+import warnings
 
 import numpy
 
@@ -411,6 +412,12 @@ class KramersManifoldRDM:
 class KramersResultAdapter:
     """Documented adapter for Kramers-paired full-spinor DMRG results.
 
+    Numerical degeneracy and time-reversal residual checks are diagnostics:
+    exceeding their tolerances emits :class:`RuntimeWarning` and is recorded
+    in ``diagnostics`` without aborting an otherwise usable calculation.
+    Structural input errors and an unsafe requested projection remain hard
+    errors.
+
     Projection is disabled by default.  When requested, the adapter first
     measures the raw pair-ensemble residual and refuses to project if it is
     larger than ``projection_tolerance``.  Thus projection can remove only
@@ -623,9 +630,10 @@ class KramersResultAdapter:
         time-reversed partner for each state and is therefore checked root by
         root.  In a four- or higher-dimensional exact degeneracy, individual
         eigenvectors may be arbitrary unitary mixtures and pairwise diagonal
-        RDM matching is not invariant.  Such a manifold is accepted only when
-        it is complete, has equal state-average weights, and its raw
-        equal-weight 1-/2-RDM is time-reversal symmetric.
+        RDM matching is not invariant.  The adapter assesses whether such a
+        manifold is complete and whether its raw equal-weight 1-/2-RDM is
+        time-reversal symmetric; numerical shortfalls are reported as
+        warnings while the raw result remains available.
         """
         if self.time_reversal is None:
             raise RuntimeError("time-reversal matrix has not been configured")
@@ -635,6 +643,12 @@ class KramersResultAdapter:
         if not (len(energies) == len(dm1s) == len(dm2s)):
             raise ValueError("energies and root RDM lists have inconsistent lengths")
 
+        validation_warnings = []
+
+        def warn_validation(message):
+            validation_warnings.append(message)
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+
         root_manifolds = self._energy_manifolds(energies)
         pair_results = []
         manifold_results = []
@@ -643,7 +657,7 @@ class KramersResultAdapter:
         projection_max = 0.0
         for manifold in root_manifolds:
             if len(manifold) % 2:
-                raise RuntimeError(
+                warn_validation(
                     "odd-electron Kramers energy manifold at %.12g Eh has "
                     "odd dimension %d"
                     % (energies[manifold[0]], len(manifold))
@@ -651,7 +665,7 @@ class KramersResultAdapter:
             manifold_energies = energies[list(manifold)]
             energy_spread = float(numpy.ptp(manifold_energies))
             if energy_spread > self.energy_tolerance:
-                raise RuntimeError(
+                warn_validation(
                     "Kramers manifold energy spread %.3e exceeds %.3e"
                     % (energy_spread, self.energy_tolerance)
                 )
@@ -671,7 +685,7 @@ class KramersResultAdapter:
             raw_manifold_max = max(residual.values())
             raw_max = max(raw_max, raw_manifold_max)
             if raw_manifold_max > self.residual_tolerance:
-                raise RuntimeError(
+                warn_validation(
                     "raw Kramers manifold residual %.3e exceeds %.3e"
                     % (raw_manifold_max, self.residual_tolerance)
                 )
@@ -716,7 +730,7 @@ class KramersResultAdapter:
                     _max_abs(dm2s[i] - tr2_j),
                 )
                 if max(partner_dm1, partner_dm2) > self.residual_tolerance:
-                    raise RuntimeError(
+                    warn_validation(
                         "raw Kramers partner residual is too large "
                         "(dm1 %.3e, dm2 %.3e; tolerance %.3e)"
                         % (
@@ -793,6 +807,8 @@ class KramersResultAdapter:
             "raw_ensemble_residual": raw_max,
             "projection_change": projection_max,
             "projection_applied": self.project,
+            "validation_passed": not validation_warnings,
+            "validation_warnings": tuple(validation_warnings),
             "root_orthogonality_error": orthogonality_error,
             "projected_hamiltonian_error": projected_hamiltonian_error,
             "pairs": [dict(result.diagnostics) for result in pair_results],

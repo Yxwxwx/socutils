@@ -98,6 +98,52 @@ def test_fourfold_degenerate_manifold_is_basis_invariant():
     assert np.max(abs(result.dm2)) == 0.0
 
 
+def test_numerical_kramers_residual_warns_and_is_recorded():
+    time_reversal = np.array(
+        [[0.0, -1.0], [1.0, 0.0]], dtype=complex
+    )
+    dm1s = [
+        np.diag([1.0, 0.0]),
+        np.diag([0.0, 0.9]),
+    ]
+    dm2s = [np.zeros((2,) * 4), np.zeros((2,) * 4)]
+    adapter = KramersResultAdapter(time_reversal)
+
+    with pytest.warns(RuntimeWarning) as caught:
+        pairs = adapter.analyze(np.zeros(2), dm1s, dm2s)
+
+    assert len(pairs) == 1
+    assert not adapter.diagnostics["validation_passed"]
+    emitted = [str(item.message) for item in caught]
+    assert any("raw Kramers manifold residual" in item for item in emitted)
+    assert any("raw Kramers partner residual" in item for item in emitted)
+    messages = adapter.diagnostics["validation_warnings"]
+    assert any("raw Kramers manifold residual" in item for item in messages)
+    assert any("raw Kramers partner residual" in item for item in messages)
+
+
+def test_incomplete_kramers_energy_manifold_warns_and_is_recorded():
+    time_reversal = np.array(
+        [[0.0, -1.0], [1.0, 0.0]], dtype=complex
+    )
+    dm1s = [np.diag([1.0, 0.0]), np.diag([0.0, 1.0])]
+    dm2s = [np.zeros((2,) * 4), np.zeros((2,) * 4)]
+    adapter = KramersResultAdapter(time_reversal, energy_tolerance=1e-8)
+
+    with pytest.warns(RuntimeWarning) as caught:
+        pairs = adapter.analyze(np.array([0.0, 2e-8]), dm1s, dm2s)
+
+    assert pairs == ()
+    assert adapter.root_manifolds == ((0,), (1,))
+    assert not adapter.diagnostics["validation_passed"]
+    emitted = [str(item.message) for item in caught]
+    assert sum("odd dimension" in item for item in emitted) == 2
+    assert any(
+        "odd dimension" in item
+        for item in adapter.diagnostics["validation_warnings"]
+    )
+
+
 def test_one_body_time_reversal_projection_is_idempotent():
     time_reversal = _nonadjacent_time_reversal()
     rng = np.random.default_rng(991)
