@@ -1,9 +1,11 @@
+from functools import reduce
 from pathlib import Path
 
 import numpy as np
 import pytest
 import scipy.linalg
 from pyscf import gto, scf
+from pyscf.fci import cistring
 
 from socutils.dmrg.dmrgci import DMRGCI, energy_from_rdms
 from socutils.mcscf import zmc_ao2mo, zmc_supercipt, zmcscf
@@ -40,6 +42,49 @@ def tilted_hf_supercipt():
     mf_cd = mf.cholesky(tau=1e-10)
     mf_cd.mo_coeff = mf.mo_coeff.copy()
     return mol, mf, mf_cd, mo
+
+
+@pytest.fixture(scope="module")
+def complex_correlated_supercipt():
+    """Complex CAS(2,4) point with nonsymmetric active density matrices."""
+    mol = gto.M(
+        atom="H 0 0 0; F 0.35 0.27 0.8035",
+        basis="6-31g",
+        spin=0,
+        charge=0,
+        verbose=0,
+        max_memory=1000,
+    )
+    mf = spinor_hf.SCF(mol).x2camf(
+        with_gaunt=False, with_breit=False
+    )
+    mf.init_guess = "1e"
+    mf.conv_tol = 1e-11
+    mf.max_cycle = 100
+    mf.kernel()
+    assert mf.converged
+
+    mo = mf.mo_coeff.copy()
+    kappa = np.zeros((mo.shape[1], mo.shape[1]), dtype=complex)
+    kappa[10, 7] = 0.04 + 0.02j
+    kappa[12, 8] = -0.035 + 0.015j
+    kappa[12, 7] = 0.02 - 0.01j
+    kappa -= kappa.T.conj()
+    mo = mo.dot(scipy.linalg.expm(kappa))
+
+    mc = zmcscf.CASSCF(mf, ncas=4, nelecas=2)
+    mc.mo_coeff = mo.copy()
+    mc.natorb = False
+    mc.canonicalize_ = False
+    mc.verbose = 0
+    eris = zmc_ao2mo._ERIS(mc, mo.copy(), level=2)
+    mci = zmcscf._fake_h_for_fast_casci(mc, mo.copy(), eris)
+    _, _, ci = mci.kernel(mo, verbose=0)
+    dm1, dm2 = mc.fcisolver.make_rdm12(ci, mc.ncas, mc.nelecas)
+    quantities = zmc_supercipt.build_orbital_quantities(
+        mc, mo, dm1, dm2, eris
+    )
+    return mc, mo, ci, dm1, dm2, eris, quantities
 
 
 def _casscf(mf, mo, solver=None):
@@ -85,6 +130,30 @@ def _projector(mo, overlap, columns):
     return vectors.dot(vectors.T.conj())
 
 
+def _casci_energy(mc, orbitals):
+    eris = zmc_ao2mo._ERIS(mc, orbitals, level=2)
+    mci = zmcscf._fake_h_for_fast_casci(mc, orbitals, eris)
+    energy, _, _ = mci.kernel(orbitals, verbose=0)
+    return float(np.real(energy))
+
+
+def _fock_space_operators(norb):
+    dimension = 1 << norb
+    annihilation = []
+    for orbital in range(norb):
+        operator = np.zeros((dimension, dimension), dtype=complex)
+        for ket_string in range(dimension):
+            if ket_string & (1 << orbital):
+                bra_string = ket_string ^ (1 << orbital)
+                parity = (
+                    ket_string & ((1 << orbital) - 1)
+                ).bit_count()
+                operator[bra_string, ket_string] = (-1) ** parity
+        annihilation.append(operator)
+    creation = [operator.T.conj() for operator in annihilation]
+    return annihilation, creation
+
+
 def test_supercipt_metric_eigenproblem_truncates_null_space():
     matrix = np.diag([2.0, 1.5, 7.0]).astype(complex)
     metric = np.diag([1.0, 0.5, 1e-9]).astype(complex)
@@ -106,6 +175,205 @@ def test_supercipt_metric_eigenproblem_truncates_null_space():
     indefinite[2, 2] = -1e-3
     with pytest.raises(ValueError, match="not positive semidefinite"):
         zmc_supercipt.solve_metric_eigenproblem(matrix, indefinite)
+
+
+@pytest.mark.integration
+def test_supercipt_complex_gradient_matches_casci_finite_difference(
+    complex_correlated_supercipt,
+):
+    mc, mo, _, _, _, _, quantities = complex_correlated_supercipt
+    epsilon = 2e-4
+
+    # The selected elements are the largest old complex-density errors in
+    # the core-active, active-virtual, and core-virtual blocks, respectively.
+    for row, column in ((8, 4), (12, 8), (17, 4)):
+        derivatives = []
+        for value in (1.0, 1.0j):
+            generator = np.zeros((mo.shape[1], mo.shape[1]), dtype=complex)
+            generator[row, column] = value
+            generator[column, row] = -value.conjugate()
+            plus = _casci_energy(
+                mc, mo.dot(scipy.linalg.expm(epsilon * generator))
+            )
+            minus = _casci_energy(
+                mc, mo.dot(scipy.linalg.expm(-epsilon * generator))
+            )
+            derivatives.append((plus - minus) / (2.0 * epsilon))
+
+        finite_difference = 0.5 * (
+            derivatives[0] + 1.0j * derivatives[1]
+        )
+        assert abs(
+            finite_difference - quantities.gradient[row, column]
+        ) <= 1e-7
+
+
+@pytest.mark.integration
+def test_supercipt_koopmans_sectors_and_pt_resolvents_are_exact(
+    complex_correlated_supercipt,
+):
+    mc, mo, ci, dm1, dm2, eris, quantities = (
+        complex_correlated_supercipt
+    )
+    norb = mc.ncas
+    ncore = mc.ncore
+    nocc = ncore + norb
+    active = slice(ncore, nocc)
+    annihilation, creation = _fock_space_operators(norb)
+    dimension = 1 << norb
+    hamiltonian = np.zeros((dimension, dimension), dtype=complex)
+    h1_active = quantities.fock_core[active, active]
+    for p in range(norb):
+        for q in range(norb):
+            hamiltonian += (
+                h1_active[p, q] * creation[p].dot(annihilation[q])
+            )
+            for r in range(norb):
+                for s in range(norb):
+                    hamiltonian += (
+                        0.5
+                        * eris.aaaa[p, q, r, s]
+                        * creation[p]
+                        .dot(creation[r])
+                        .dot(annihilation[s])
+                        .dot(annihilation[q])
+                    )
+
+    psi = np.zeros(dimension, dtype=complex)
+    for coefficient, occupied in zip(
+        ci, cistring.gen_occslst(range(norb), mc.nelecas)
+    ):
+        address = sum(1 << int(index) for index in occupied)
+        psi[address] = coefficient
+    energy_n = float(np.real(np.vdot(psi, hamiltonian.dot(psi))))
+
+    removal_direct = np.empty((norb, norb), dtype=complex)
+    addition_direct = np.empty_like(removal_direct)
+    for t in range(norb):
+        for u in range(norb):
+            removal_direct[t, u] = np.vdot(
+                psi,
+                creation[u]
+                .dot(
+                    hamiltonian.dot(annihilation[t])
+                    - annihilation[t].dot(hamiltonian)
+                )
+                .dot(psi),
+            )
+            addition_direct[u, t] = np.vdot(
+                psi,
+                annihilation[u]
+                .dot(
+                    hamiltonian.dot(creation[t])
+                    - creation[t].dot(hamiltonian)
+                )
+                .dot(psi),
+            )
+
+    step = zmc_supercipt.supercipt_step(
+        mc,
+        mo,
+        dm1,
+        dm2,
+        eris,
+        metric_tol=1e-8,
+        canonicalize=False,
+    )
+    assert np.max(abs(step.koopmans_removal - removal_direct)) <= 1e-10
+    assert np.max(abs(step.koopmans_addition - addition_direct)) <= 1e-10
+
+    minus_sector = [
+        index
+        for index in range(dimension)
+        if index.bit_count() == mc.nelecas - 1
+    ]
+    plus_sector = [
+        index
+        for index in range(dimension)
+        if index.bit_count() == mc.nelecas + 1
+    ]
+    exact_removal = energy_n - np.linalg.eigvalsh(
+        hamiltonian[np.ix_(minus_sector, minus_sector)]
+    )
+    exact_addition = np.linalg.eigvalsh(
+        hamiltonian[np.ix_(plus_sector, plus_sector)]
+    ) - energy_n
+    assert np.max(
+        abs(np.sort(step.removal_energies) - np.sort(exact_removal))
+    ) <= 1e-10
+    assert np.max(
+        abs(np.sort(step.addition_energies) - np.sort(exact_addition))
+    ) <= 1e-10
+
+    # Check eqs. 24--26 independently as direct generalized resolvents.
+    diagonal = np.diag(quantities.fock_effective).real
+    expected_lower = np.zeros_like(step.kappa_unscaled)
+    expected_lower[nocc:, :ncore] = (
+        quantities.gradient[nocc:, :ncore]
+        / (diagonal[:ncore][None, :] - diagonal[nocc:, None])
+    )
+    removal_metric = dm1.T
+    addition_metric = (np.eye(norb) - dm1).T
+    for core in range(ncore):
+        expected_lower[active, core] = -addition_metric.dot(
+            np.linalg.solve(
+                step.koopmans_addition
+                - diagonal[core] * addition_metric,
+                quantities.gradient[active, core],
+            )
+        )
+    for virtual in range(nocc, mo.shape[1]):
+        expected_lower[virtual, active] = removal_metric.dot(
+            np.linalg.solve(
+                -step.koopmans_removal
+                - diagonal[virtual] * removal_metric,
+                quantities.gradient[virtual, active],
+            )
+        )
+    expected_kappa = expected_lower - expected_lower.T.conj()
+    assert np.max(abs(step.kappa_unscaled - expected_kappa)) <= 1e-10
+
+
+@pytest.mark.integration
+def test_supercipt_always_canonicalizes_pt_denominator_spaces(
+    complex_correlated_supercipt,
+):
+    mc, mo, _, dm1, dm2, eris, _ = complex_correlated_supercipt
+    assert not mc.canonicalize_
+    step = zmc_supercipt.supercipt_step(
+        mc, mo, dm1, dm2, eris, canonicalize=True
+    )
+    assert len(step.canonical_energies["core"]) == mc.ncore
+    assert len(step.canonical_energies["virtual"]) == (
+        mo.shape[1] - mc.ncore - mc.ncas
+    )
+
+    nocc = mc.ncore + mc.ncas
+    dm_core = step.mo_coeff[:, :mc.ncore].dot(
+        step.mo_coeff[:, :mc.ncore].T.conj()
+    )
+    mo_active = step.mo_coeff[:, mc.ncore:nocc]
+    dm_active = reduce(
+        np.dot, (mo_active, dm1.T, mo_active.T.conj())
+    )
+    vj_core, vk_core = mc.get_jk(mc.mol, dm_core)
+    vj_active, vk_active = mc.get_jk(mc.mol, dm_active)
+    fock_ao = (
+        mc.get_hcore()
+        + vj_core
+        - vk_core
+        + vj_active
+        - vk_active
+    )
+    fock_mo = reduce(
+        np.dot,
+        (step.mo_coeff.T.conj(), fock_ao, step.mo_coeff),
+    )
+    for block in (
+        fock_mo[:mc.ncore, :mc.ncore],
+        fock_mo[nocc:, nocc:],
+    ):
+        assert np.linalg.norm(block - np.diag(np.diag(block))) <= 1e-10
 
 
 @pytest.mark.integration
@@ -230,7 +498,6 @@ def test_supercipt_block2_macroiterations_match_exact(
         )
     )
     legacy_exact_energy = -98.63650918755290
-    legacy_exact_gradient = 6.185480215550907e-6
 
     assert exact.converged and dmrg.converged and solver.converged
     assert len(exact.supercipt_history) == len(dmrg.supercipt_history)
@@ -243,9 +510,6 @@ def test_supercipt_block2_macroiterations_match_exact(
     assert exact.final_orbital_gradient_norm <= exact.conv_tol_grad
     assert dmrg.final_orbital_gradient_norm <= dmrg.conv_tol_grad
     assert abs(exact.e_tot - legacy_exact_energy) <= 1e-7
-    assert abs(
-        exact.final_orbital_gradient_norm - legacy_exact_gradient
-    ) <= 1e-7
     assert energy_trajectory_error <= 1e-7
     assert gradient_trajectory_error <= 1e-7
     assert np.max(abs(dmrg_dm1 - exact_dm1)) <= 1e-8

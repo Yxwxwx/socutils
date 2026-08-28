@@ -131,8 +131,8 @@ historical authorship attribution in `mcscf/zmc_supercipt.py`.
 | eqs. 1--4, Hamiltonian/RDMs | `h1e_mo`, `eris.paaa`, `casdm1`, `casdm2` | `h1e[p,q]`, `eri[p,q,r,s]`, `dm1[p,q]=<p+q>`, `dm2[p,q,r,s]=<p+r+sq>` |
 | eqs. 8--13, Dyall Hamiltonian | `fock`, `fock_eff` | `fock_core = h + f_occ`; `fock_effective = fock_core + f_act` |
 | eqs. 15--18, independent blocks | three assignments to `kappa` | core--virtual, core--active, and active--virtual slices selected by `uniq_var_indices` |
-| eq. 19, orbital gradient | `g - g.T.conj()` | `lagrangian - lagrangian.T.conj()` |
-| eqs. 20--23, Koopmans problems | `compute_K1_K2`, `solve_Fc_eSc` | removal matrix in metric `D`; addition matrix in metric `I-D`, solved by canonical orthogonalization |
+| eq. 19, orbital gradient | `g - g.T.conj()` | `lagrangian - lagrangian.T.conj()` with active JK and the one-RDM term built from `D.T` |
+| eqs. 20--23, Koopmans problems | `compute_K1_K2`, `solve_Fc_eSc` | removal matrix in metric `D.T`; addition matrix in metric `(I-D).T`, solved by canonical orthogonalization |
 | eq. 24 | direct inactive--virtual denominator | `G[a,i] / (f[i,i]-f[a,a])` |
 | eq. 25 | `compute_k_it` | hole-metric/addition eigenvectors and `f[i,i]-epsilon_add` |
 | eq. 26 | `compute_k_ta` | density-metric/removal eigenvectors and `epsilon_remove-f[a,a]` |
@@ -146,11 +146,12 @@ Q[p,t] = sum_u,v,w eris.paaa[p,u,v,w] * dm2[t,u,v,w].
 
 The removal Koopmans matrix is the Hermitian part of
 `-fock_active @ dm1.T - Q_active`; the addition matrix adds the active block
-of `fock_effective`.  Density and hole-density metrics are positive
-semidefinite, so eigenvectors below `supercipt_metric_tol` are removed instead
-of being sent to an ill-conditioned generalized eigensolver.  A configurable,
-sign-preserving denominator level shift and an explicit singular-denominator
-guard replace silent division by a near-zero value.
+of `fock_effective`.  In the stored Koopmans orientation, the corresponding
+density and hole-density metrics are `dm1.T` and `(I-dm1).T`.  They are
+positive semidefinite, so eigenvectors below `supercipt_metric_tol` are
+removed instead of being sent to an ill-conditioned generalized eigensolver.
+A configurable, sign-preserving denominator level shift and an explicit
+singular-denominator guard replace silent division by a near-zero value.
 
 State averaging is not a separate orbital algorithm.  PySCF's
 `state_average_(weights)` supplies the weighted scalar energy and weighted
@@ -165,6 +166,37 @@ condition.
 optimizer.  Super-CIPT reuses `_ERIS`/`_CDERIS`, current Cholesky JK and
 two-RDM contractions, the common exact/DMRG solver contract, callbacks,
 logging, convergence snapshots, and core/virtual subspace canonicalization.
+
+## Complex-spinor formula audit
+
+The historical source was useful as a structural reference but is not a
+formula oracle for complex orbitals.  It passes `dm1` directly to the active
+JK build and to the active-column one-RDM contraction.  It also solves the
+Koopmans generalized eigenproblems with `D` and `I-D`.  Those choices are
+invisible for a real symmetric density, but this repository defines
+`D[p,q] = <p+ q>`; the required arrays at those contraction boundaries are
+therefore transposed.
+
+A correlated complex X2C H--F CAS(2e,4 spinors) point was constructed with
+nonsymmetric complex `D`.  Three independent tests establish the corrected
+index mapping:
+
+* central CASCI energy differences for selected core--active,
+  active--virtual, and core--virtual complex rotations agree with every
+  corrected analytic gradient component to `1.4e-9` or better; the old
+  formula gives block errors up to `2.98e-3`;
+* Koopmans matrices evaluated as explicit Fock-space commutators agree to
+  `1.2e-15`, and their generalized eigenvalues reproduce the exact active
+  `(N-1)` and `(N+1)` sector energy differences to `1e-10`; using untransposed
+  metrics produces visibly incorrect roots;
+* direct generalized-resolvent evaluations of paper eqs. 24--26 reproduce
+  the complete unscaled anti-Hermitian orbital step to `1.5e-15`.
+
+The Dyall denominators require canonical inactive and virtual orbital blocks.
+This is now an internal Super-CIPT invariant and is not
+disabled by `mc.canonicalize_ = False` (as used by the production DMRG-SCF
+input).  A regression explicitly verifies both Fock blocks after an update
+even when that public flag is false.
 
 ## Orbital-optimization validation ladder
 
@@ -188,23 +220,18 @@ SHA-256
 | --- | ---: | ---: | ---: | ---: | ---: |
 | old equations + exact CI | -98.63628437827134 | -98.63650918755290 | -1.871857885573590 | 6.1854802e-6 | 17 |
 | old equations + Block2 | -98.63628437827134 | -98.63650918755285 | -1.871857885573618 | 6.1854802e-6 | 17 |
-| current port + exact CI | -98.63628437827134 | -98.63650918755262 | -1.871857885575267 | 6.1857722e-6 | 17 |
-| current port + Block2 | -98.63628437827134 | -98.63650918755262 | -1.871857885575267 | 6.1857722e-6 | 17 |
+| corrected current + exact CI | -98.63628437827134 | -98.63650918755310 | -1.871857889542511 | 4.9717475e-6 | 17 |
+| corrected current + Block2 | -98.63628437827134 | -98.63650918755319 | -1.871857889542497 | 4.9717475e-6 | 17 |
 
 | comparison | result |
 | --- | ---: |
 | old exact/Block2 maximum trajectory energy difference | 9.95e-14 Eh |
 | old exact/Block2 maximum trajectory gradient difference | 1.23e-15 |
 | old exact/Block2 final 1-/2-RDM differences | 2.29e-15 / 2.29e-15 |
-| old/current exact final energy difference | 2.84e-13 Eh |
-| old/current same-orbital full-gradient norm difference | 2.12e-16 |
-| old/current first raw orbital update difference | 9.17e-8 |
-| old/current final gradient difference | 2.92e-10 |
-| old/current natural-occupation difference | 6.66e-16 |
-| old/current core/active/virtual projector errors | 3.61e-10 / 1.27e-10 / 3.61e-10 |
-| current exact/Block2 maximum trajectory energy difference | 7.11e-14 Eh |
-| current exact/Block2 final 1-/2-RDM differences | 7.98e-16 / 7.98e-16 |
-| current exact/Block2 core/active/virtual projector errors | 2.00e-15 / 9.99e-16 / 7.28e-16 |
+| corrected current exact/Block2 maximum trajectory energy difference | 8.53e-14 Eh |
+| corrected current exact/Block2 maximum trajectory gradient difference | 1.37e-15 |
+| corrected current exact/Block2 final 1-/2-RDM differences | 9.43e-16 / 9.43e-16 |
+| corrected current exact/Block2 core/active/virtual projector errors | 6.55e-15 / 1.67e-15 / 1.78e-15 |
 
 The final occupations are `[1.0, 1.0, 0.0]` to displayed precision.  This
 small determinant-valued endpoint is why the separate four-active-spinor
@@ -214,10 +241,9 @@ rotation block and the complete macroiteration trajectory.
 
 The historical diagnostic norm includes redundant active--active entries;
 the current convergence norm screens to the independently optimizable blocks.
-At the shared initial orbitals their displayed norms are therefore
-`0.0142947293160142` and `0.0142808973596876`, respectively, even though the
-full-gradient norms agree within `2.12e-16`.  This deliberate diagnostic
-change does not alter any Super-CIPT block.
+The corrected current initial norm is `0.0142740674390348`.  It must not be
+numerically equated with the historical norm because the old complex 1-RDM
+orientation was wrong, in addition to using a different diagnostic mask.
 
 The six-root F/cc-pVTZ current exact run converges monotonically in eight
 energy/gradient evaluations:
@@ -240,6 +266,74 @@ stationary energy differs from the original Pykylin result by
 `5.75e-8` Eh, within the `1e-7` target.  Unlike the old Pykylin run, the exact
 six-root space has no macro-3 root collapse.
 
+## Cl/dyallv3z CAS-size convergence diagnosis
+
+The production diagnostic supplied with this audit starts from closed-shell
+Cl- X2CAMF/Cholesky orbitals and then optimizes neutral Cl with seven active
+electrons, 16 active spinors, six equally weighted roots, and general
+(non-Kramers-adapted) Block2.  The cold schedule uses `M=1000`, 33 sweeps,
+and Davidson squared residuals down to `1e-16`.  Repeating that entire cold
+schedule at every macroiteration is unnecessary for diagnosis: after the
+first cold solve, eight one-site warm-restart sweeps with Block2 `tol=0`
+reproduced the first four cold-schedule energies and gradients to about
+`1e-12` and `1e-10`, respectively.  The maximum per-root restart energy
+change was at most `3.6e-13` Eh and discarded weights were about `2e-19`.
+
+The corrected Super-CIPT trajectory is:
+
+| macro | energy (Eh) | energy change (Eh) | gradient norm | largest raw rotation | minimum denominator (Eh) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | -460.688470255946 | --- | 1.26124e-1 | 1.27569e-2 | 1.09954 |
+| 1 | -460.692149112103 | -3.67886e-3 | 4.01975e-2 | 2.34394e-3 | 1.09591 |
+| 2 | -460.692426036794 | -2.76925e-4 | 2.32232e-2 | 9.61531e-4 | 1.09552 |
+| 3 | -460.692509037901 | -8.30011e-5 | 2.06177e-2 | 9.42865e-4 | 1.09540 |
+| 5 | -460.692618694523 | -5.24588e-5 | 1.98914e-2 | 8.89802e-4 | 1.09531 |
+| 7 | -460.692720749455 | -5.08484e-5 | 1.97823e-2 | 9.37596e-4 | 1.09525 |
+| 10 | -460.692873045077 | -5.08036e-5 | 1.97559e-2 | 9.95045e-4 | 1.09515 |
+
+Both Koopmans metrics remained full rank (`16/16`), every minimum
+denominator stayed above `1.09` Eh, and no step was capped by
+`max_stepsize=0.2`.  The six roots retained the expected four-plus-two
+degeneracy.  Thus this plateau is not caused by DMRG convergence, root
+collapse, a null metric, an intruder denominator, or trust-radius rejection.
+Increasing `max_stepsize` cannot enlarge these raw PT steps because the option
+is only an upper bound.
+
+For comparison, the already validated full Super-CI calculation from the
+same orbitals continues to `-460.718244584615` Eh in 20 energy evaluations.
+Its orbital-step Frobenius norm is capped at `0.2` through macro 13, whereas
+the CAS(7,16)-spinor Super-CIPT raw steps quickly fall to about `1e-3` per
+matrix element.  The expanded active space therefore requires substantial
+active/external orbital reselection, but the first-order Dyall update moves
+through that region very conservatively.  This is an optimizer/basin issue,
+not evidence for a remaining tensor-formula or DMRG error.
+
+The paper's notation must be read carefully: 2C-CAS(7,4) contains eight
+spinors, not 16.  An exact-CI Cl calculation at that paper-sized active space
+with the same strict `energy AND gradient` stopping rule converged
+monotonically in 28 energy evaluations:
+
+| macro | energy (Eh) | gradient norm | largest raw rotation |
+| ---: | ---: | ---: | ---: |
+| 0 | -460.630368616465 | 3.42170e-1 | 7.91559e-2 |
+| 1 | -460.678627486011 | 1.02938e-1 | 8.50441e-3 |
+| 3 | -460.679998874584 | 7.57568e-3 | 9.25161e-4 |
+| 10 | -460.680018951754 | 1.48836e-3 | 4.66211e-5 |
+| 20 | -460.680019822513 | 2.84718e-4 | 8.89646e-6 |
+| 27 | -460.680019852324 | 8.94578e-5 | --- |
+
+This exact-CI control proves that the long, roughly linear tail is not a DMRG
+artifact.  The historical reference's `energy OR gradient` test would have
+stopped this trajectory at macro 21 when `|dE| = 9.32e-9`, despite a gradient
+of `2.41e-4`; the corrected implementation intentionally waits for both
+tests.
+
+Finally, disabling the mandatory core/virtual semicanonicalization was tested
+as an ablation.  At macro 3 its energy differed from the corrected trajectory
+by only `9.8e-9` Eh and its gradient by `6.3e-6`.  Semicanonicalization is a
+real requirement of the PT denominators and remains fixed, but it is not the
+dominant source of this particular CAS(7,16) plateau.
+
 ## Commands and scope boundary
 
 The durable tests are:
@@ -250,10 +344,12 @@ env CUDA_VISIBLE_DEVICES=1 uv run pytest -q
 make PYTHON=.venv/bin/python test
 ```
 
-`tests/test_supercipt.py` independently covers the metric eigensolver, fixed
-energy/RDM/RDM-energy/gradient/first-step agreement, all-block exact/Block2
-macroiterations, the six-root historical endpoint, projectors, occupations,
-and the explicit Kramers restriction.
+`tests/test_supercipt.py` independently covers the metric eigensolver, complex
+CASCI finite-difference gradients, explicit many-body Koopmans commutators,
+exact `(N-1)/(N+1)` spectra, direct eq. 24--26 resolvents, mandatory PT
+canonicalization, fixed energy/RDM/first-step agreement, all-block
+exact/Block2 macroiterations, the six-root historical endpoint, projectors,
+occupations, and the explicit Kramers restriction.
 
 Kramers-restricted Super-CIPT orbital equations are intentionally not
 implemented: the cited implementation and historical reference provide only

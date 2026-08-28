@@ -995,7 +995,7 @@ class DMRGCI(StreamObject):
             return None
         return manifest
 
-    def _begin_checkpoint(self, problem, run_mode):
+    def _begin_checkpoint(self, problem, run_mode, reorder_idx=None):
         manifest_path, mps_path, sweeps_path = self._checkpoint_paths()
         if manifest_path is None:
             return None, None
@@ -1025,6 +1025,10 @@ class DMRGCI(StreamObject):
             "problem": problem,
             "run_mode": run_mode,
         }
+        if reorder_idx is not None:
+            manifest["orbital_reordering"] = [
+                int(value) for value in reorder_idx
+            ]
         self._write_json_atomic(manifest_path, manifest)
         return mps_path, per_sweep
 
@@ -1044,6 +1048,19 @@ class DMRGCI(StreamObject):
                 "schedule": schedule.as_dict(),
             }
         )
+        self._write_json_atomic(manifest_path, manifest)
+
+    def _record_checkpoint_reordering(self, reorder_idx):
+        """Persist the MPS site mapping before the first reordered sweep."""
+        manifest_path, _, _ = self._checkpoint_paths()
+        if manifest_path is None:
+            return
+        manifest = self._read_json(manifest_path)
+        if manifest is None:
+            return
+        manifest["orbital_reordering"] = [
+            int(value) for value in reorder_idx
+        ]
         self._write_json_atomic(manifest_path, manifest)
 
     @staticmethod
@@ -1137,8 +1154,11 @@ class DMRGCI(StreamObject):
         )
 
         resume_checkpoint = bool(self.resume)
+        resume_manifest = None
         if resume_checkpoint:
-            self._load_checkpoint(checkpoint_problem, required=True)
+            resume_manifest = self._load_checkpoint(
+                checkpoint_problem, required=True
+            )
         restart_requested = bool(self.restart or self._restart)
         in_memory_compatible = bool(
             self.driver is not None
@@ -1150,6 +1170,26 @@ class DMRGCI(StreamObject):
             and in_memory_compatible
             and not resume_checkpoint
         )
+        preserved_reorder_idx = None
+        if use_internal_mps and self.driver.reorder_idx is not None:
+            preserved_reorder_idx = numpy.asarray(
+                self.driver.reorder_idx, dtype=int
+            ).copy()
+        elif resume_checkpoint:
+            stored_reorder_idx = resume_manifest.get("orbital_reordering")
+            if stored_reorder_idx is None:
+                # Checkpoints written before orbital reordering was enabled
+                # contain an MPS in the original active-orbital order.
+                preserved_reorder_idx = numpy.arange(int(norb), dtype=int)
+                logger.warn(
+                    self,
+                    "legacy DMRG checkpoint has no orbital permutation; "
+                    "resuming in the original active-orbital order",
+                )
+            else:
+                preserved_reorder_idx = numpy.asarray(
+                    stored_reorder_idx, dtype=int
+                )
         if resume_checkpoint:
             run_mode = "checkpoint-resume"
         elif use_internal_mps:
@@ -1217,7 +1257,7 @@ class DMRGCI(StreamObject):
         self.dump_flags(verbose=verbose)
         try:
             checkpoint_mps, checkpoint_sweeps = self._begin_checkpoint(
-                checkpoint_problem, run_mode
+                checkpoint_problem, run_mode, preserved_reorder_idx
             )
             driver = DMRGDriver(
                 stack_mem=stack_bytes,
@@ -1233,6 +1273,64 @@ class DMRGCI(StreamObject):
                 n_sites=int(norb),
                 n_elec=nelec,
                 orb_sym=[0] * int(norb),
+            )
+            fiedler_idx = numpy.asarray(
+                driver.orbital_reordering(
+                    numpy.abs(h1_block2), numpy.abs(eri_block2)
+                ),
+                dtype=int,
+            )
+            expected_indices = numpy.arange(int(norb))
+            if (
+                fiedler_idx.shape != (int(norb),)
+                or not numpy.array_equal(
+                    numpy.sort(fiedler_idx), expected_indices
+                )
+            ):
+                raise RuntimeError(
+                    "Block2 returned an invalid orbital-reordering permutation"
+                )
+            reorder_idx = (
+                fiedler_idx
+                if preserved_reorder_idx is None
+                else preserved_reorder_idx
+            )
+            if (
+                reorder_idx.shape != (int(norb),)
+                or not numpy.array_equal(
+                    numpy.sort(reorder_idx), expected_indices
+                )
+            ):
+                raise RuntimeError(
+                    "stored DMRG orbital-reordering permutation is invalid"
+                )
+            if (
+                preserved_reorder_idx is not None
+                and not numpy.array_equal(fiedler_idx, reorder_idx)
+            ):
+                logger.new_logger(self, verbose).note(
+                    "DMRG Fiedler proposal %s replaced by preserved restart "
+                    "ordering %s",
+                    fiedler_idx.tolist(),
+                    reorder_idx.tolist(),
+                )
+            logger.new_logger(self, verbose).note(
+                "DMRG orbital reordering = %s",
+                reorder_idx.tolist(),
+            )
+            self._record_checkpoint_reordering(reorder_idx)
+            h1_block2 = numpy.ascontiguousarray(
+                h1_block2[numpy.ix_(reorder_idx, reorder_idx)]
+            )
+            eri_block2 = numpy.ascontiguousarray(
+                eri_block2[
+                    numpy.ix_(
+                        reorder_idx,
+                        reorder_idx,
+                        reorder_idx,
+                        reorder_idx,
+                    )
+                ]
             )
             if run_mode != "cold-start":
                 ket = driver.load_mps("GS", nroots=nroots)
@@ -1292,6 +1390,11 @@ class DMRGCI(StreamObject):
                 kets = [ket]
                 ci = ket
             self._multi_mps = ket
+            # The MPO was built from manually reordered integrals.  Register
+            # the permutation after DMRG and MultiMPS splitting so Block2 maps
+            # all subsequent normal and transition NPDM indices back to the
+            # original active-orbital order.
+            driver.reorder_idx = numpy.array(reorder_idx, dtype=int, copy=True)
 
             if nroots > 1:
                 identity_mpo = driver.get_identity_mpo()
@@ -1378,6 +1481,7 @@ class DMRGCI(StreamObject):
                     "checkpoint_fingerprint": checkpoint_problem[
                         "hamiltonian_sha256"
                     ],
+                    "orbital_reordering": reorder_idx.tolist(),
                     "restart_scheduler": dict(self.restart_diagnostics),
                 }
             )

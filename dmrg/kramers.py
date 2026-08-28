@@ -339,7 +339,20 @@ def canonicalize_root_space_rdm1(root_space, tolerance=1e-12):
         else:
             separation = float(numpy.min(numpy.diff(eigenvalues)))
         candidate = (separation, label, eigenvalues, eigenvectors)
-        if best is None or candidate[0] > best[0]:
+        # Kramers symmetry can make the real and imaginary quadratures of an
+        # anchor exactly equally resolving.  Do not let roundoff select a
+        # different quadrature after an otherwise harmless orbital
+        # permutation; retain the first deterministically ordered candidate
+        # unless the separation is materially larger.
+        comparison_tolerance = (
+            tolerance
+            if best is None
+            else max(
+                tolerance,
+                1e-10 * max(abs(candidate[0]), abs(best[0])),
+            )
+        )
+        if best is None or candidate[0] > best[0] + comparison_tolerance:
             best = candidate
     if best is None or (nroot > 1 and best[0] <= tolerance):
         raise ValueError("no nondegenerate one-body anchor exists in the root subspace")

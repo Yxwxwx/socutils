@@ -215,7 +215,62 @@ def test_large_ecore_is_excluded_from_sweep_convergence(tmp_path):
     solver.close()
 
 
-def test_casscf_restart_reuses_only_compatible_internal_mps(tmp_path):
+def test_fiedler_reordering_restores_original_rdm_indices(tmp_path, monkeypatch):
+    """A nontrivial Block2 site permutation must be invisible to PySCF."""
+    from pyblock2.driver.core import DMRGDriver
+
+    h1, eri, h1_rot, eri_rot, _ = _complex_hamiltonians()
+    norb, nelec = h1.shape[0], 2
+    reorder_idx = np.array([2, 0, 3, 1])
+    calls = []
+
+    def fixed_reordering(driver, h1e, g2e, method="fiedler", **kwargs):
+        calls.append((np.array(h1e, copy=True), np.array(g2e, copy=True)))
+        assert method == "fiedler"
+        assert np.min(h1e) >= 0.0
+        assert np.min(g2e) >= 0.0
+        return reorder_idx.copy()
+
+    monkeypatch.setattr(
+        DMRGDriver, "orbital_reordering", fixed_reordering
+    )
+    reference = zfci.FCISolver()
+    energy_ref, ci_ref = reference.kernel(
+        h1_rot, eri_rot, norb, nelec
+    )
+    dm1_ref, dm2_ref = reference.make_rdm12(ci_ref, norb, nelec)
+
+    solver = _solver(tmp_path, norb, nelec)
+    energy, state = solver.kernel(
+        h1_rot, eri_rot, norb, nelec, verbose=0
+    )
+    dm1, dm2 = solver.make_rdm12(state, norb, nelec)
+
+    assert len(calls) == 1
+    assert np.array_equal(solver.driver.reorder_idx, reorder_idx)
+    assert solver.convergence_info["orbital_reordering"] == reorder_idx.tolist()
+    assert abs(energy - energy_ref) <= ENERGY_TOL
+    assert np.max(abs(dm1 - dm1_ref)) <= RDM_TOL
+    assert np.max(abs(dm2 - dm2_ref)) <= RDM_TOL
+    assert abs(energy_from_rdms(h1_rot, eri_rot, dm1, dm2) - energy) <= ENERGY_TOL
+    solver.close()
+
+
+def test_casscf_restart_reuses_only_compatible_internal_mps(
+    tmp_path, monkeypatch
+):
+    from pyblock2.driver.core import DMRGDriver
+
+    proposed_reorderings = iter(
+        (np.array([2, 0, 1]), np.array([1, 2, 0]))
+    )
+
+    def changing_reordering(driver, h1e, g2e, method="fiedler", **kwargs):
+        return next(proposed_reorderings).copy()
+
+    monkeypatch.setattr(
+        DMRGDriver, "orbital_reordering", changing_reordering
+    )
     h1 = np.array(
         [
             [-1.1, 0.08j, 0.02],
@@ -229,6 +284,7 @@ def test_casscf_restart_reuses_only_compatible_internal_mps(tmp_path):
     energy0, state0 = solver.kernel(h1, eri, 3, 1, verbose=0)
     solver.make_rdm12(state0, 3, 1)
     assert solver.convergence_info["block2_sweep_tolerance"] == solver.tol
+    reorder0 = np.array(solver.driver.reorder_idx, copy=True)
     driver_id = id(solver.driver)
     scratch = solver._scratch
 
@@ -253,6 +309,9 @@ def test_casscf_restart_reuses_only_compatible_internal_mps(tmp_path):
     assert solver.convergence_info["block2_sweep_tolerance"] == 0.0
     assert solver.convergence_info["sweeps"] == 8
     assert solver._multi_mps.dot == 1
+    assert np.array_equal(reorder0, [2, 0, 1])
+    assert np.array_equal(solver.driver.reorder_idx, reorder0)
+    assert solver.convergence_info["orbital_reordering"] == reorder0.tolist()
     solver.close()
 
 
@@ -279,6 +338,9 @@ def test_multiroot_checkpoint_resume_and_fingerprint_gate(tmp_path):
     manifest_path = checkpoint / "dmrgci-checkpoint.json"
     manifest = json.loads(manifest_path.read_text())
     assert manifest["status"] == "complete"
+    assert manifest["orbital_reordering"] == first.convergence_info[
+        "orbital_reordering"
+    ]
     assert (checkpoint / "mps" / "GS-mps_info.bin").is_file()
     # A killed process leaves status=running; the last completed sweep is
     # nevertheless a valid pyblock2 restart image.
@@ -308,6 +370,9 @@ def test_multiroot_checkpoint_resume_and_fingerprint_gate(tmp_path):
     assert resumed.convergence_info["schedule"]["restart"]
     assert resumed.convergence_info["block2_sweep_tolerance"] == 0.0
     assert resumed.convergence_info["sweeps"] == 8
+    assert np.array_equal(
+        resumed.driver.reorder_idx, manifest["orbital_reordering"]
+    )
     assert not resumed.resume
     resumed.close()
 

@@ -166,6 +166,12 @@ against ``fci.FCISolver`` are recorded in
 For production relativistic calculations, ``DMRGCI`` defaults to
 ``max_bond_dimension=1000``, ``tol=1e-8``, and a staged Davidson
 squared-residual schedule from ``1e-8`` to ``schedule_thrd_max=1e-16``.
+Before constructing the MPO, the solver obtains Block2's Fiedler ordering
+from ``abs(h1e)`` and ``abs(g2e)`` and permutes both integral tensors.  The
+permutation is registered on the driver after the sweep and MultiMPS split,
+so all normal and transition RDMs exposed to PySCF retain the original active-
+spinor indices.  Warm starts and disk resumes preserve the prior MPS site
+ordering even if the newly evaluated Fiedler proposal changes.
 Scratch paths, checkpoint policy, thread count, and stack memory remain
 machine- and job-specific input options.
 
@@ -203,12 +209,19 @@ two-particle contraction is
 
    Q[p,t] = sum_u,v,w eris.paaa[p,u,v,w] * dm2[t,u,v,w]
 
-The removal and addition Koopmans problems use the active density ``D`` and
-hole density ``I-D`` as positive-semidefinite metrics.  Numerically null
-metric directions are removed by canonical orthogonalization.  The three
-paper blocks (core--virtual, core--active, and active--virtual) form one
-anti-Hermitian rotation, whose largest matrix element is capped by
-``max_stepsize`` before applying ``C <- C exp(kappa)``.
+Because this package stores ``D[p,q] = <p+ q>`` while the Koopmans matrices
+carry the reversed projected-Hamiltonian orientation, the removal and
+addition generalized eigenproblems use ``D.T`` and ``(I-D).T``, respectively.
+They are positive-semidefinite metrics; numerically null directions are
+removed by canonical orthogonalization.  The three paper blocks
+(core--virtual, core--active, and active--virtual) form one anti-Hermitian
+rotation, whose largest matrix element is capped by ``max_stepsize`` before
+applying ``C <- C exp(kappa)``.
+
+The Dyall denominators require canonical core and virtual blocks.  Super-CIPT
+therefore performs this internal canonicalization after every orbital step,
+even when ``mc.canonicalize_`` is ``False``; that flag retains its normal
+meaning for the other CASSCF optimizer and finalization paths.
 
 Super-CIPT uses the common CASSCF attributes ``max_cycle_macro``,
 ``max_stepsize``, ``conv_tol``, and ``conv_tol_grad``.  Its additional
@@ -221,12 +234,26 @@ attributes are:
 * ``supercipt_level_shift`` (``0.0``) -- optional sign-preserving shift away
   from zero.
 
+``max_stepsize`` is an upper bound, not an acceleration factor.  If the
+reported ``max(raw)`` is already much smaller than ``max_stepsize``, increasing
+the option cannot make Super-CIPT move faster.  This commonly occurs when a
+large active space must be reselected from mean-field orbitals: the
+first-order Dyall denominators can produce a long linear-convergence region.
+In that case use better selected starting orbitals or pre-optimize them with
+the full Super-CI path; do not loosen the DMRG or denominator tolerances to
+hide the orbital problem.
+
 Convergence requires both the energy and the nonredundant orbital gradient.
 ``supercipt_history`` records energies, root energies, gradients, natural
 occupations, RDM-energy checks, metric ranks, denominators, step scales, and
 integral provenance; ``supercipt_diagnostics`` records the final settings and
 status.  PySCF ``state_average_(weights)`` is supported and supplies the same
 weighted energy and RDMs to every Super-CIPT equation.
+
+At normal logging level each update prints its raw maximum rotation, applied
+scale, rotation norm, minimum absolute denominator, and both metric ranks.
+These distinguish an orbital-optimizer plateau from CI nonconvergence,
+metric truncation, an intruder denominator, or trust-radius clipping.
 
 Kramers-restricted Super-CIPT orbital equations are not implemented.  A KRHF
 reference or Kramers-adapted DMRG solver is rejected with a clear error; use

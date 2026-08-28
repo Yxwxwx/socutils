@@ -40,7 +40,10 @@ def solve_metric_eigenproblem(matrix, metric, metric_tol=1e-6):
     """Solve ``matrix C = metric C e`` in the supported metric range.
 
     The active 1-RDM and hole-density metrics in the Super-CIPT equations are
-    positive semidefinite rather than positive definite.  Canonical
+    positive semidefinite rather than positive definite.  The caller supplies
+    them in the index orientation of the corresponding Koopmans matrix;
+    :func:`supercipt_step` therefore passes ``D.T`` and ``(I-D).T`` for this
+    repository's ``D[p,q] = <p^+ q>`` convention.  Canonical
     orthogonalization removes eigenvectors whose metric eigenvalue is not
     larger than ``metric_tol``.  Returned columns obey ``C^H metric C = I``.
 
@@ -149,7 +152,10 @@ def build_orbital_quantities(mc, mo, casdm1, casdm2, eris):
         dm_core_ao, mo_coeff=mo, mo_occ=core_occ
     )
     vhf_core = reduce(np.dot, (mo.T.conj(), vj_core - vk_core, mo))
-    vj_active, vk_active = eris.get_jk_active_mo(casdm1)
+    # ``casdm1[p,q] = <p^+ q>`` whereas PySCF's JK builders consume the
+    # covariant density with the annihilation index first.  The transpose is
+    # immaterial for real orbitals but essential for complex spinors.
+    vj_active, vk_active = eris.get_jk_active_mo(casdm1.T)
     vhf_active = vj_active - vk_active
 
     fock_core = _hermitize(h1e + vhf_core)
@@ -159,7 +165,7 @@ def build_orbital_quantities(mc, mo, casdm1, casdm2, eris):
     lagrangian = np.zeros((nmo, nmo), dtype=np.complex128)
     lagrangian[:, :ncore] = fock_effective[:, :ncore]
     lagrangian[:, ncore:nocc] = (
-        fock_core[:, ncore:nocc].dot(casdm1) + two_rdm
+        fock_core[:, ncore:nocc].dot(casdm1.T) + two_rdm
     )
     gradient = lagrangian - lagrangian.T.conj()
 
@@ -218,16 +224,19 @@ def _check_denominators(denominator, tolerance, label):
 
 
 def _canonicalize_core_virtual(mc, mo, casdm1):
-    """Canonicalize redundant core/virtual blocks after an orbital step."""
+    """Canonicalize the redundant core/virtual blocks required by PT.
+
+    This is an internal condition of the Dyall denominators, not the optional
+    final-orbital presentation controlled by ``mc.canonicalize_``.
+    """
     ncore, ncas = mc.ncore, mc.ncas
     nocc = ncore + ncas
     nmo = mo.shape[1]
-    if not mc.canonicalize_:
-        return mo, {"core": [], "virtual": []}
-
     dm_core = mo[:, :ncore].dot(mo[:, :ncore].T.conj())
     mo_active = mo[:, ncore:nocc]
-    dm_active = reduce(np.dot, (mo_active, casdm1, mo_active.T.conj()))
+    dm_active = reduce(
+        np.dot, (mo_active, np.asarray(casdm1).T, mo_active.T.conj())
+    )
     vj_core, vk_core = mc.get_jk(mc.mol, dm_core)
     vj_active, vk_active = mc.get_jk(mc.mol, dm_active)
     fock_ao = mc.get_hcore() + vj_core - vk_core + vj_active - vk_active
@@ -265,11 +274,12 @@ def supercipt_step(
 ):
     """Form and apply one perturbative Super-CI orbital step.
 
-    The three blocks correspond directly to paper eqs. 24--26.  The active
-    solves use the particle density ``D`` and hole density ``I-D`` as metrics.
-    Only interspace rotations selected by ``mc.uniq_var_indices`` survive.
-    The historical maximum-element trust bound is retained, followed by the
-    unitary update ``C <- C exp(kappa)``.
+    The three blocks correspond directly to paper eqs. 24--26.  In the stored
+    Koopmans-matrix orientation, the active solves use ``D.T`` and
+    ``(I-D).T`` as the particle and hole metrics.  Only interspace rotations
+    selected by ``mc.uniq_var_indices`` survive.  The historical
+    maximum-element trust bound is retained, followed by the unitary update
+    ``C <- C exp(kappa)``.
     """
     if max_stepsize <= 0:
         raise ValueError("max_stepsize must be positive")
@@ -284,13 +294,20 @@ def supercipt_step(
     active = slice(ncore, nocc)
     virtual = slice(nocc, nmo)
     density = _hermitize(casdm1)
+    # K[t,u] is stored with the reverse orientation of the projected
+    # (N-1)-electron Hamiltonian, while dm1[p,q] = <p^+ q>.  Consequently
+    # the generalized removal problem is -K C = D^T C e.  Using D instead
+    # gives the right scalar equations but incorrect ionization energies and
+    # rotations for complex spinors.
+    removal_metric = density.T
     holes = _hermitize(np.eye(ncas) - density)
+    addition_metric = holes.T
 
     removal_e, removal_c, removal_info = solve_metric_eigenproblem(
-        -removal, density, metric_tol
+        -removal, removal_metric, metric_tol
     )
     addition_e, addition_c, addition_info = solve_metric_eigenproblem(
-        addition, holes, metric_tol
+        addition, addition_metric, metric_tol
     )
 
     lower = np.zeros((nmo, nmo), dtype=np.complex128)
@@ -314,7 +331,7 @@ def supercipt_step(
     if ncore and addition_e.size:
         block = quantities.gradient[active, :ncore]
         transformed = addition_c.T.conj().dot(block)
-        overlap = holes.dot(addition_c)
+        overlap = addition_metric.dot(addition_c)
         denominator = _shift_denominator(
             diagonal[:ncore][None, :] - addition_e[:, None], level_shift
         )
@@ -332,7 +349,7 @@ def supercipt_step(
     if nocc < nmo and removal_e.size:
         block = quantities.gradient[virtual, active]
         transformed = removal_c.T.conj().dot(block.T)
-        overlap = density.dot(removal_c)
+        overlap = removal_metric.dot(removal_c)
         denominator = _shift_denominator(
             removal_e[:, None] - diagonal[nocc:][None, :], level_shift
         )
@@ -476,6 +493,10 @@ def mcscf_supercipt(
         denominator_tol,
         level_shift,
     )
+    log.info(
+        "Super-CIPT core/virtual PT canonicalization is enabled "
+        "independently of canonicalize_"
+    )
 
     for macro in range(max_cycle):
         eris, integral_info = _build_eris(mc, mo, cderi=cderi)
@@ -564,6 +585,17 @@ def mcscf_supercipt(
                 "canonical_energies": last_step.canonical_energies,
             }
         )
+        log.info(
+            "Super-CIPT step  %d  max(raw) = %.6g  scale = %.6g  "
+            "|kappa| = %.6g  min|denom| = %.6g  metric ranks = %d/%d",
+            macro,
+            last_step.maximum_amplitude,
+            last_step.scale,
+            np.linalg.norm(last_step.kappa),
+            last_step.minimum_denominator,
+            last_step.metric_diagnostics["removal"]["rank"],
+            last_step.metric_diagnostics["addition"]["rank"],
+        )
         if callback is not None:
             callback(dict(entry))
         previous_energy = e_tot
@@ -587,6 +619,7 @@ def mcscf_supercipt(
         "denominator_tolerance": float(denominator_tol),
         "level_shift": float(level_shift),
         "maximum_step": float(max_stepsize),
+        "pt_core_virtual_canonicalization": True,
         "integrals": dict(last_integral_info),
         "kramers_restricted": False,
         "last_step_scale": None if last_step is None else last_step.scale,
