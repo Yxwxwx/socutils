@@ -10,6 +10,26 @@ from socutils.mcscf import zmcscf
 from socutils.scf import spinor_hf
 
 
+def test_dmrg_casscf_production_defaults():
+    mol = gto.M(
+        atom='H 0 0 0',
+        basis='sto-3g',
+        spin=1,
+        verbose=0,
+    )
+    mc = zmcscf.CASSCF(mol, ncas=2, nelecas=1)
+
+    assert mc.max_cycle_macro == 50
+    assert mc.max_stepsize == 0.2
+    assert mc.conv_tol == 1e-8
+    assert mc.conv_tol_grad == 1e-4
+    assert not mc.natorb
+    assert not mc.canonicalize_
+    assert mc.superci_davidson_tol == 1e-8
+    assert mc.superci_davidson_max_space == 200
+    assert mc.superci_davidson_strict
+
+
 @pytest.fixture(scope='module')
 def be_x2c_reference():
     mol = gto.M(

@@ -152,7 +152,7 @@ def canonicalize(mc, mo_coeff=None, ci=None, eris=None, sort=False,
 
 class CASSCF(zcasci.CASCI):
 
-    max_cycle_macro = getattr(__config__, 'mcscf_mc1step_CASSCF_max_cycle_macro', 20)
+    max_cycle_macro = getattr(__config__, 'mcscf_mc1step_CASSCF_max_cycle_macro', 50)
     irrep=None
     _keys = zcasci.CASCI._keys.union({
         'max_cycle_macro', 'max_stepsize', 'conv_tol', 'conv_tol_grad',
@@ -173,14 +173,14 @@ class CASSCF(zcasci.CASCI):
         self._cderi = None
         self.max_stepsize = 0.2
         self.conv_tol = 1e-8
-        self.conv_tol_grad = None
+        self.conv_tol_grad = 1e-4
         self.freeze_pair = None
-        self.canonicalize_ = True
-        self.natorb = True
+        self.canonicalize_ = False
+        self.natorb = False
         self.superci_solver = 'davidson'
         self.superci_bfgs = False
-        self.superci_davidson_tol = 5e-6
-        self.superci_davidson_max_space = 10
+        self.superci_davidson_tol = 1e-8
+        self.superci_davidson_max_space = 200
         self.superci_davidson_strict = True
         self.macro_history = []
         self.superci_diagnostics = None

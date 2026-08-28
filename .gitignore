@@ -96,3 +96,5 @@ benchmarck/logs/
 benchmarck/results/**/*.progress.json
 benchmarck/kramers/logs/
 benchmarck/kramers/results/**/*.progress.json
+
+tests/

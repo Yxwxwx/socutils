@@ -270,6 +270,14 @@ have a time-reversal-symmetric RDM.  The adapter therefore:
 4. forms an equal-weight pair average in the full active spinor space; and
 5. reports the raw ensemble time-reversal residual before any projection.
 
+Energy-degeneracy, pair-RDM, and manifold-RDM tolerance failures are soft
+result-quality checks: they emit ``RuntimeWarning`` and are retained in
+``kramers_diagnostics['validation_warnings']`` with
+``validation_passed=False``.  They do not discard a usable raw CASSCF result.
+Malformed orbital/root input, inconsistent split MultiMPS roots, and a
+requested projection whose raw residual exceeds ``projection_tolerance``
+remain hard errors.
+
 Multi-root calculations use one Block2 state-averaged `MultiMPS`, with its
 weights copied from the PySCF state-average wrapper.  Four-spinor diagnostics
 showed that splitting a pure two-site endpoint can produce MPSs inconsistent
@@ -367,16 +375,20 @@ The generated cold schedule retains the PySCF policy:
 5. leave eight possible one-site sweeps after the generated two-site endpoint.
 
 The legacy explicit-array interface remains available with
-`schedule_mode="explicit"`. The generated path also permits a noise scale and
-an upper bound on the local squared-residual threshold. Their defaults leave
-the official schedule unchanged; they are explicit protocol parameters for
-near-degenerate multi-root calculations.
+`schedule_mode="explicit"`. The generated path also permits an independent
+noise scale and a final Davidson squared-residual threshold. The standalone
+`pyscf_dmrg_schedule` generator leaves the official schedule unchanged when
+that threshold is omitted. The relativistic `DMRGCI` sets
+`schedule_thrd_max=1e-16` by default and stages its Davidson thresholds from
+`1e-8` through `1e-16`, one decade at a time. The noise schedule continues to
+follow PySCF independently and remains zero if the tighter Davidson schedule
+requires additional sweeps.
 
 PySCF's restart callback is reproduced by `restart_scheduler_()`. An orbital
 gradient below `1e-3`, or a density change below `1e-2` when supplied, enables
-the next CI warm start. The restart uses maximum M, zero noise, `tol/10`
-(subject to an explicitly tighter threshold cap), one-site DMRG, and at most
-eight sweeps. An arbitrary external `ci0` remains untrusted. Instead, the
+the next CI warm start. The restart uses maximum M, zero noise, the final
+`schedule_thrd_max` Davidson threshold, one-site DMRG, and at most eight
+sweeps. An arbitrary external `ci0` remains untrusted. Instead, the
 solver copies its own structurally compatible saved MPS into a new scratch
 directory, constructs a fresh pyblock2 driver and MPO, and reloads that MPS.
 This matches the lifecycle of `block2main fullrestart` and treats the old

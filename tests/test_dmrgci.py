@@ -94,9 +94,48 @@ def test_pyscf_schedule_is_expanded_for_direct_pyblock2():
         noise_scale=0.5,
         max_davidson_threshold=1e-12,
     )
-    assert max(tuned.thrds) == 1e-12
+    assert np.isclose(max(tuned.thrds), 1e-8)
+    assert np.isclose(min(tuned.thrds), 1e-12)
     assert tuned.anchor_noises[0] == 5e-5
     assert tuned.anchor_noises[-1] == 0.0
+
+
+def test_tight_davidson_threshold_is_staged_independently_of_noise():
+    schedule = pyscf_dmrg_schedule(
+        max_bond_dimension=1000,
+        start_bond_dimension=200,
+        tol=1e-7,
+        max_davidson_threshold=1e-16,
+    )
+
+    assert np.allclose(
+        schedule.anchor_thrds,
+        [1e-8] * 4
+        + [1e-9, 1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15, 1e-16],
+        rtol=1e-14,
+        atol=0.0,
+    )
+    assert schedule.anchor_noises[-1] == 0.0
+    assert schedule.noises[-8:] == (0.0,) * 8
+    assert len(set(schedule.thrds)) > 1
+
+
+def test_relativistic_solver_defaults_to_tight_davidson_schedule():
+    solver = DMRGCI()
+
+    assert solver.schedule_mode == "pyscf"
+    assert solver.max_bond_dimension == 1000
+    assert solver.tol == 1e-8
+    assert solver.schedule_thrd_max == 1e-16
+    assert np.isclose(max(solver.schedule_thrds), 1e-8)
+    assert np.isclose(min(solver.schedule_thrds), 1e-16)
+    assert len(set(solver.thrds)) > 1
+    assert np.allclose(
+        solver._schedule_snapshot(restart=True).thrds,
+        (1e-16,) * 8,
+        rtol=1e-14,
+        atol=0.0,
+    )
 
 
 def test_restart_scheduler_accepts_both_callback_vocabularies():

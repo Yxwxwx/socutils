@@ -84,6 +84,9 @@ def pyscf_dmrg_schedule(
     anchor rows are expanded here without changing their ranges.  A restart
     follows the reference ``fullrestart`` path: maximum bond dimension,
     zero noise, one-site sweeps, and a local threshold of ``tol / 10``.
+    When ``max_davidson_threshold`` is supplied, the Davidson squared-residual
+    schedule is tightened independently of the PySCF noise schedule: it starts
+    at ``1e-8`` and decreases by decades to the requested final threshold.
     """
     max_bond_dimension = int(max_bond_dimension)
     tol = float(tol)
@@ -112,15 +115,15 @@ def pyscf_dmrg_schedule(
             "max_davidson_threshold must be finite and positive"
         )
 
-    def local_threshold(value):
-        if max_davidson_threshold is None:
-            return value
-        return min(value, max_davidson_threshold)
-
     if restart:
         anchor_sweeps = (0,)
         anchor_bond_dims = (max_bond_dimension,)
-        anchor_thrds = (local_threshold(tol / 10.0),)
+        final_thrd = (
+            tol / 10.0
+            if max_davidson_threshold is None
+            else max_davidson_threshold
+        )
+        anchor_thrds = (final_thrd,)
         anchor_noises = (0.0,)
         n_sweeps = restart_sweeps
         twosite_to_onesite = None
@@ -138,25 +141,56 @@ def pyscf_dmrg_schedule(
         sweep = 0
         bond_dimension = start_bond_dimension
         local_thrd = 1e-4
+        davidson_stages = None
+        if max_davidson_threshold is None:
+            initial_davidson_thrd = local_thrd
+        else:
+            davidson_stages = []
+            exponent = -8
+            candidate = 10.0**exponent
+            while candidate > max_davidson_threshold:
+                davidson_stages.append(candidate)
+                exponent -= 1
+                candidate = 10.0**exponent
+            davidson_stages.append(max_davidson_threshold)
+            initial_davidson_thrd = davidson_stages[0]
         while bond_dimension < max_bond_dimension:
             sweeps.append(sweep)
             bond_dims.append(bond_dimension)
-            thrds.append(local_threshold(local_thrd))
+            thrds.append(initial_davidson_thrd)
             noises.append(noise_scale * local_thrd)
             sweep += 4
             bond_dimension *= 2
-        while local_thrd > tol:
+
+        if max_davidson_threshold is None:
+            while local_thrd > tol:
+                sweeps.append(sweep)
+                bond_dims.append(max_bond_dimension)
+                thrds.append(local_thrd)
+                noises.append(noise_scale * local_thrd)
+                sweep += 2
+                local_thrd /= 10.0
             sweeps.append(sweep)
             bond_dims.append(max_bond_dimension)
-            thrds.append(local_threshold(local_thrd))
-            noises.append(noise_scale * local_thrd)
+            thrds.append(tol / 10.0)
+            noises.append(0.0)
             sweep += 2
-            local_thrd /= 10.0
-        sweeps.append(sweep)
-        bond_dims.append(max_bond_dimension)
-        thrds.append(local_threshold(tol / 10.0))
-        noises.append(0.0)
-        sweep += 2
+        else:
+            noise_stages = []
+            while local_thrd > tol:
+                noise_stages.append(noise_scale * local_thrd)
+                local_thrd /= 10.0
+            noise_stages.append(0.0)
+
+            n_stages = max(len(noise_stages), len(davidson_stages))
+            for stage in range(n_stages):
+                sweeps.append(sweep)
+                bond_dims.append(max_bond_dimension)
+                thrds.append(
+                    davidson_stages[min(stage, len(davidson_stages) - 1)]
+                )
+                noises.append(noise_stages[min(stage, len(noise_stages) - 1)])
+                sweep += 2
 
         anchor_sweeps = tuple(sweeps)
         anchor_bond_dims = tuple(bond_dims)
@@ -344,8 +378,10 @@ class DMRGCI(StreamObject):
         self.start_bond_dimension = None
         self.restart_sweeps = 8
         self.schedule_noise_scale = 1.0
-        self.schedule_thrd_max = None
-        self.tol = 1e-7
+        # Relativistic Davidson squared residuals progress from 1e-8 to this
+        # final threshold instead of using the looser PySCF thresholds.
+        self.schedule_thrd_max = 1e-16
+        self.tol = 1e-8
         self.schedule_sweeps = []
         self.schedule_bond_dims = []
         self.schedule_thrds = []
@@ -582,8 +618,14 @@ class DMRGCI(StreamObject):
             )
         if self.schedule_noise_scale < 0.0:
             raise ValueError("schedule_noise_scale must be nonnegative")
-        if self.schedule_thrd_max is not None and self.schedule_thrd_max <= 0.0:
-            raise ValueError("schedule_thrd_max must be positive")
+        if (
+            self.schedule_thrd_max is not None
+            and (
+                self.schedule_thrd_max <= 0.0
+                or not numpy.isfinite(self.schedule_thrd_max)
+            )
+        ):
+            raise ValueError("schedule_thrd_max must be finite and positive")
         if self.resume and self.checkpoint_dir is None:
             raise ValueError("resume=True requires checkpoint_dir")
         if self.n_threads <= 0 or self.stack_memory <= 0:

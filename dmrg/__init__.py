@@ -30,7 +30,7 @@ def _inject_initial_dmrg():
         return
 
     def _initial_dmrg(self, nroots=1, bond_dims=None, noises=None,
-                      thrds=None, n_sweeps=None, tol=1e-7, scratch=None,
+                      thrds=None, n_sweeps=None, tol=1e-8, scratch=None,
                       n_threads=None, **kwargs):
         """Attach a :class:`DMRGCI` solver and return *self*."""
         fcisolv = DMRGCI(self._scf.mol)

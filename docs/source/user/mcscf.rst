@@ -107,6 +107,8 @@ roots and give the pair equal state-average weights:
    mc = zmcscf.CASSCF(mf, ncas=2, nelecas=1)
    mc.fcisolver = dmrg
    mc.state_average_([0.5, 0.5])
+   dmrg = mc.fcisolver
+   mc.callback = dmrg.restart_scheduler_()
    mc.kernel()
 
    # state_average_ installs a PySCF solver view, so read final diagnostics
@@ -126,8 +128,13 @@ active spinor space.
 
 ``mc.fcisolver.kramers_diagnostics`` reports root pairs, raw partner and
 ensemble time-reversal residuals, root orthogonality, the projected
-Hamiltonian residual, and any projection change.  Projection is disabled by
-default.  ``.kramers_restricted(project=True)`` permits only a final
+Hamiltonian residual, any projection change, and ``validation_passed`` /
+``validation_warnings``.  A numerical energy-degeneracy or RDM
+time-reversal residual above its tolerance emits a warning and leaves the raw
+result available instead of aborting the CASSCF.  Structural input errors,
+inconsistent split MPS roots, and unsafe requested projections remain hard
+errors.  Projection is disabled by default.
+``.kramers_restricted(project=True)`` permits only a final
 roundoff-level ``(D + Theta(D))/2`` projection after the raw residual has
 passed ``projection_tolerance``; it is never a substitute for converging the
 DMRG or fixing an index error.  The pair RDM and phase/mixing-canonicalized
@@ -139,6 +146,12 @@ The general complex-spinor route is unchanged when
 ``kramers_restricted()`` is omitted.  Exact settings and numerical validation
 against ``fci.FCISolver`` are recorded in
 ``docs/x2c_dmrg_validation.md``.
+
+For production relativistic calculations, ``DMRGCI`` defaults to
+``max_bond_dimension=1000``, ``tol=1e-8``, and a staged Davidson
+squared-residual schedule from ``1e-8`` to ``schedule_thrd_max=1e-16``.
+Scratch paths, checkpoint policy, thread count, and stack memory remain
+machine- and job-specific input options.
 
 Perturbative Super-CI (Super-CIPT)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -211,16 +224,15 @@ Options
 The optimization is controlled by attributes set on the ``CASSCF`` object
 (defaults in parentheses):
 
-* ``max_cycle_macro`` (``20``) -- maximum number of macro-iterations;
+* ``max_cycle_macro`` (``50``) -- maximum number of macro-iterations;
 * ``max_stepsize`` (``0.2``) -- trust radius capping each orbital-rotation step;
 * ``conv_tol`` (``1e-8``) -- energy convergence threshold;
-* ``conv_tol_grad`` (``None`` → ``sqrt(conv_tol)`` ``= 1e-4``) -- orbital-gradient
-  convergence threshold;
-* ``natorb`` (``True``) -- at each macro-iteration rotate the active orbitals to
-  natural orbitals (eigenvectors of the active 1-RDM, ordered by descending
-  occupation);
-* ``canonicalize_`` (``True``) -- diagonalize the core and virtual blocks of the
-  effective Fock matrix so the inactive/virtual orbitals come out canonical;
+* ``conv_tol_grad`` (``1e-4``) -- orbital-gradient convergence threshold;
+* ``natorb`` (``False``) -- if enabled, rotate the active orbitals at each
+  macro-iteration to natural orbitals (eigenvectors of the active 1-RDM,
+  ordered by descending occupation);
+* ``canonicalize_`` (``False``) -- if enabled, diagonalize the core and virtual
+  blocks of the effective Fock matrix at the end;
 * ``frozen`` (``None``) -- orbitals excluded from rotation; an ``int`` freezes the
   lowest ``frozen`` orbitals, a list/array freezes the listed indices;
 * ``freeze_pair`` (``None``) -- a pair of index sets ``(set_i, set_j)`` whose
@@ -230,9 +242,9 @@ The optimization is controlled by attributes set on the ``CASSCF`` object
 * ``superci_solver`` (``'davidson'``) -- linear solver for the Super-CI orbital
   equation; this is independent of any local Davidson solver used by a DMRG CI
   solver;
-* ``superci_davidson_tol`` (``5e-6``) -- norm tolerance for the full generalized
+* ``superci_davidson_tol`` (``1e-8``) -- norm tolerance for the full generalized
   augmented-Hessian residual;
-* ``superci_davidson_max_space`` (``10``) -- maximum Super-CI Davidson subspace;
+* ``superci_davidson_max_space`` (``200``) -- maximum Super-CI Davidson subspace;
 * ``superci_davidson_strict`` (``True``) -- raise instead of applying an orbital
   step when the configured Super-CI residual was not reached.
 
@@ -248,8 +260,7 @@ stops at ``max_cycle_macro``.  ``kernel()`` returns
 * ``mc.e_tot`` -- total CASSCF energy;
 * ``mc.e_cas`` -- active-space (CI) energy;
 * ``mc.ci`` -- the active-space CI vector;
-* ``mc.mo_coeff`` / ``mc.mo_energy`` -- optimized (canonical) orbitals and their
-  energies;
+* ``mc.mo_coeff`` / ``mc.mo_energy`` -- optimized orbitals and their energies;
 * ``mc.converged`` -- whether both convergence criteria were met.
 * ``mc.final_orbital_gradient_norm`` -- norm tested at the final macroiteration;
 * ``mc.macro_history`` -- energy, CAS energy, gradient, applied step, natural
@@ -260,13 +271,9 @@ stops at ``max_cycle_macro``.  ``kernel()`` returns
 * ``mc.superci_diagnostics`` -- final convergence thresholds and linear-solver
   residual.
 
-.. note::
-
-   For tightly-bound cases the default ``max_cycle_macro = 20`` can stop a step
-   or two before ``abs(dE) < 1e-8`` even though the gradient is already below
-   ``conv_tol_grad`` (so ``mc.converged`` is ``False`` while the energy is
-   essentially converged).  Raise ``mc.max_cycle_macro`` (e.g. to ``40``) to
-   reach full convergence.
+The production defaults above match the validated F CAS(7e,16 spinor)
+protocol.  They remain ordinary attributes and can be overridden for smaller
+validation jobs or deliberately different convergence studies.
 
 Full CI and selected CI
 -----------------------
