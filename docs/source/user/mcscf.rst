@@ -315,12 +315,12 @@ scale, rotation norm, minimum absolute denominator, and both metric ranks.
 These distinguish an orbital-optimizer plateau from CI nonconvergence,
 metric truncation, an intruder denominator, or trust-radius clipping.
 
-The contributed compatibility entry point remains available as
-``socutils.mcscf.zmc_supercipt_new.mcscf_superci_pt``.  It delegates to the
-same validated optimizer and returns ``(converged, energy, final_mo)``; it
-does not replace the current CASCI/CASSCF or CI-solver implementations.  The
-paper/source equation map, immutable historical output, and exact/Pykylin/
-Block2 numerical ladder are recorded in ``docs/supercipt_validation.md``.
+``CASSCF.supercipt(...)`` is the single supported public driver and delegates
+to the implementation in ``socutils.mcscf.zmc_supercipt``.  The obsolete
+contributed ``zmc_supercipt_new.mcscf_superci_pt`` compatibility wrapper is
+not retained.  The paper/source equation map, immutable historical output,
+and exact/Pykylin/Block2 numerical ladder are recorded in
+``docs/supercipt_validation.md``.
 
 Orbital localization
 ~~~~~~~~~~~~~~~~~~~~

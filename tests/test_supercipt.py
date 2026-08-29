@@ -12,7 +12,6 @@ from socutils.dmrg.kramers import identify_kramers_orbitals
 from socutils.mcscf import (
     zmc_ao2mo,
     zmc_supercipt,
-    zmc_supercipt_new,
     zmcscf,
 )
 from socutils.scf import spinor_hf
@@ -642,22 +641,19 @@ def test_supercipt_kramers_diis_requires_explicit_symmetry():
 
 
 @pytest.mark.integration
-def test_contributed_supercipt_interface_generates_cderi(
+def test_supercipt_public_interface_generates_cderi(
     tilted_hf_supercipt,
 ):
     _, mf, _, mo = tilted_hf_supercipt
     mc = _casscf(mf, mo)
-    converged, energy, final_mo = zmc_supercipt_new.mcscf_superci_pt(
-        mc,
-        mf,
-        max_cycle=1,
+    mc.max_cycle_macro = 1
+    mc.supercipt(
         use_cderi=True,
         use_diis=True,
     )
 
-    assert not converged
-    assert energy == pytest.approx(mc.e_tot)
-    assert np.max(abs(final_mo - mc.mo_coeff)) == 0.0
+    assert not mc.converged
+    assert np.isfinite(mc.e_tot)
     assert mc.supercipt_diagnostics["integrals"]["factorized"]
     assert mc.supercipt_diagnostics["integrals"]["source"] == "legacy-cderi"
     assert mc.supercipt_diagnostics["diis"]
@@ -769,17 +765,12 @@ def test_supercipt_kramers_diis_preserves_time_reversal():
     mc.conv_tol_grad = 1e-7
     mc.max_stepsize = 0.1
     mc.verbose = 0
-    converged, energy, final_mo = zmc_supercipt_new.mcscf_superci_pt(
-        mc,
-        mf,
+    mc.supercipt(
         symm="kramers",
-        max_cycle=mc.max_cycle_macro,
-        conv_etol=mc.conv_tol,
-        conv_gtol=mc.conv_tol_grad,
-        max_step=mc.max_stepsize,
         use_diis=True,
         use_cderi=True,
     )
+    converged, energy, final_mo = mc.converged, mc.e_tot, mc.mo_coeff
 
     mapping = identify_kramers_orbitals(
         mol,
@@ -846,17 +837,14 @@ def test_cl_kramers_supercipt_incremental_diis_accelerates_convergence():
     )
 
     accelerated = make_casscf()
-    converged, energy, final_mo = zmc_supercipt_new.mcscf_superci_pt(
-        accelerated,
-        mf,
+    accelerated.supercipt(
         symm="kramers",
-        max_cycle=15,
-        conv_etol=accelerated.conv_tol,
-        conv_gtol=accelerated.conv_tol_grad,
-        max_step=accelerated.max_stepsize,
         use_cderi=True,
         use_diis=True,
     )
+    converged = accelerated.converged
+    energy = accelerated.e_tot
+    final_mo = accelerated.mo_coeff
     mapping = identify_kramers_orbitals(
         mol,
         final_mo,
