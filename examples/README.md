@@ -18,6 +18,8 @@ They use the canonical `.x2camf()` / `.x2cmp()` driver API.
 | `10-casscf.py` | Cholesky CASSCF orbital optimization (needs zquatev) |
 | `11-kramers_dmrg_scf.py` | Kramers-pair X2C-DMRG-SCF (needs Block2 + zquatev) |
 | `14-supercipt.py` | Block2 X2C-DMRG-SCF with the separate Super-CIPT optimizer |
+| `15-boys-localization.py` | complex and Kramers-preserving Boys localization |
+| `16-nd_h2o8_supercipt_diis.py` | Nd3+(H2O)8 CAS(3,14), 52-root Kramers Super-CIPT/DIIS input |
 
 The `fci/` subfolder has examples for the spinor CI module (`socutils.fci`):
 

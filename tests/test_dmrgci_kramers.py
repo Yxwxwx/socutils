@@ -15,7 +15,7 @@ from socutils.dmrg.kramers import (
     time_reverse_one_body,
 )
 from socutils.fci import zfci
-from socutils.mcscf import zmcscf
+from socutils.mcscf import zmc_superci, zmcscf
 from socutils.scf import spinor_hf
 
 
@@ -49,6 +49,22 @@ def _kramers_hamiltonian():
     one_body = (one_body + one_body_tr) * 0.5
     two_body = (two_body + two_body_tr) * 0.5
     return time_reversal, one_body, two_body
+
+
+def test_sparse_time_reversal_one_body_matches_dense_definition():
+    time_reversal = _nonadjacent_time_reversal()
+    rng = np.random.default_rng(661)
+    matrix = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    expected = np.einsum(
+        "ap,bq,pq->ab",
+        time_reversal,
+        time_reversal.conj(),
+        matrix.conj(),
+        optimize=True,
+    )
+    assert np.max(
+        abs(time_reverse_one_body(time_reversal, matrix) - expected)
+    ) <= 1e-14
 
 
 def _exact_root_space(solver, states, dm1s, norb, nelec):
@@ -223,6 +239,50 @@ def test_repository_kramers_orbital_order_and_phase():
     assert mapping.diagnostics["partner_orbital_error"] <= 1e-12
     assert mapping.diagnostics["partner_phase_error"] <= 1e-12
     assert mapping.diagnostics["time_reversal_square_error"] <= 1e-12
+
+
+def test_kramers_subspace_eigh_accepts_nonadjacent_pairs():
+    mol = gto.M(
+        atom="H 0 0 0; H 0 0 0.74",
+        basis="sto-3g",
+        spin=0,
+        verbose=0,
+    )
+    mf = spinor_hf.KRHF(mol)
+    mf.conv_tol = 1e-12
+    mf.kernel()
+    assert mf.converged
+    orbitals = mf.mo_coeff[:, [0, 2, 1, 3]]
+    mapping = identify_kramers_orbitals(
+        mol,
+        orbitals,
+        mf.get_ovlp(),
+    )
+    rng = np.random.default_rng(478)
+    raw = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+    matrix = 0.5 * (raw + raw.T.conj())
+    matrix = 0.5 * (
+        matrix + time_reverse_one_body(mapping.time_reversal, matrix)
+    )
+    matrix = 0.5 * (matrix + matrix.T.conj())
+    mc = zmcscf.CASSCF(mf, ncas=2, nelecas=2, ncore=0)
+
+    eigenvalues, eigenvectors = zmc_superci._kramers_subspace_eigh(
+        mc,
+        matrix,
+        orbitals,
+    )
+    diagonal = eigenvectors.T.conj().dot(matrix).dot(eigenvectors)
+    final_mapping = identify_kramers_orbitals(
+        mol,
+        orbitals.dot(eigenvectors),
+        mf.get_ovlp(),
+        tolerance=1e-8,
+    )
+
+    assert np.linalg.norm(diagonal - np.diag(eigenvalues)) <= 1e-10
+    assert np.max(abs(eigenvalues[::2] - eigenvalues[1::2])) <= 1e-12
+    assert final_mapping.diagnostics["partner_orbital_error"] <= 1e-8
 
 
 @pytest.mark.integration
@@ -474,6 +534,61 @@ def _kramers_casscf(mf, initial_mo, fcisolver=None):
     mc.superci_davidson_strict = True
     mc.verbose = 0
     return mc
+
+
+@pytest.mark.integration
+def test_kramers_superci_orbital_diis_preserves_pairs():
+    mol, mf, initial_mo = _tilted_h_kramers_reference()
+    mc = _kramers_casscf(mf, initial_mo)
+    mc.natorb = False
+    mc.superci(symm="kramers", use_diis=True)
+
+    mapping = identify_kramers_orbitals(
+        mol,
+        mc.mo_coeff,
+        mf.get_ovlp(),
+        tolerance=1e-7,
+    )
+    assert mc.converged
+    assert mc.superci_diagnostics["kramers_restricted"]
+    assert mc.superci_diagnostics["diis"]
+    assert mapping.diagnostics["subspace_closure_error"] <= 1e-7
+    assert mapping.diagnostics["partner_orbital_error"] <= 1e-7
+    assert any(
+        row.get("diis", {}).get("extrapolated", False)
+        for row in mc.macro_history
+    )
+
+
+@pytest.mark.integration
+def test_kramers_supercipt_diis_dmrg_matches_exact(tmp_path):
+    mol, mf, initial_mo = _tilted_h_kramers_reference()
+    exact = _kramers_casscf(mf, initial_mo)
+    exact.natorb = False
+    exact.supercipt(symm="kramers", use_diis=True, use_cderi=True)
+
+    base_solver = _dmrg_solver(tmp_path, 2, 1, 2, mol=mol)
+    base_solver.kramers_restricted()
+    dmrg = _kramers_casscf(mf, initial_mo, base_solver)
+    dmrg.natorb = False
+    dmrg.callback = dmrg.fcisolver.restart_scheduler_()
+    dmrg.supercipt(symm="kramers", use_diis=True, use_cderi=True)
+
+    assert exact.converged and dmrg.converged and dmrg.fcisolver.converged
+    assert abs(dmrg.e_tot - exact.e_tot) <= 1e-7
+    assert abs(dmrg.e_cas - exact.e_cas) <= 1e-7
+    assert abs(
+        dmrg.final_orbital_gradient_norm
+        - exact.final_orbital_gradient_norm
+    ) <= 1e-7
+    assert all(
+        row["kramers_rotation"]["output_generator_residual"] <= 1e-12
+        for row in dmrg.supercipt_history[:-1]
+    )
+    assert dmrg.fcisolver.kramers_diagnostics[
+        "raw_ensemble_residual"
+    ] <= 1e-8
+    dmrg.fcisolver.close()
 
 
 @pytest.mark.integration

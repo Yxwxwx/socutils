@@ -67,6 +67,24 @@ rotation step, repeating until the energy and orbital gradient are converged.
    mc.kernel()
    print(mc.e_tot)
 
+Orbital DIIS can be enabled explicitly for the full Super-CI optimizer::
+
+   mc.superci(use_diis=True)
+
+For a Kramers-restricted reference or solver, DIIS must be told to retain the
+time-reversal tangent space::
+
+   mc.superci(use_diis=True, symm='kramers')
+
+DIIS extrapolates unitary orbital transformations in one fixed reference
+frame.  Every extrapolated step is screened through the normal frozen/irrep
+mask and, in Kramers mode, through the actual AO time-reversal map.  Partner
+orbitals therefore need not be adjacent.  For ``kernel()``-style input, set
+``mc.superci_diis = True`` and, when needed,
+``mc.orbital_symmetry = 'kramers'``.  Shared controls are
+``orbital_diis_space=15``, ``orbital_diis_start_cycle=3`` and
+``orbital_diis_start_gradient=0.02``.
+
 Spinor orbital analysis
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -198,7 +216,7 @@ orbital optimizer.  It is an explicit alternative API: ``kernel()`` and
    )
    mc = zmcscf.CASSCF(mf, ncas=4, nelecas=2)
    mc.fcisolver = solver
-   mc.supercipt()
+   mc.supercipt(use_diis=True, use_cderi=True)
 
 The method uses the same exact-CI/Block2 solver contract and full or Cholesky
 integral containers as Super-CI.  In the repository RDM convention,
@@ -232,7 +250,28 @@ attributes are:
 * ``supercipt_denominator_tol`` (``1e-10``) -- reject a singular Dyall
   denominator rather than divide silently;
 * ``supercipt_level_shift`` (``0.0``) -- optional sign-preserving shift away
-  from zero.
+  from zero;
+* ``supercipt_diis`` (``False``) -- enable orbital DIIS;
+* ``supercipt_use_cderi`` (``None``) -- automatically use factors attached to
+  the SCF object.  ``True`` forces the factorized route and generates AO
+  Cholesky vectors once if necessary; ``False`` forces full integral
+  transformation.
+
+The same options can be passed directly to ``supercipt``.  For example, a
+Kramers-restricted calculation with both new accelerators is::
+
+   mc.supercipt(
+       symm='kramers',
+       use_diis=True,
+       use_cderi=True,
+   )
+
+The explicit ``symm='kramers'`` is mandatory when DIIS is enabled on a KRHF
+reference or Kramers-adapted active-space solver.  Without DIIS, Kramers mode
+is detected automatically.  The implementation identifies partner indices
+and phases from ``C.H @ S @ Theta(C)``, projects every orbital generator, and
+uses a quaternion eigensolve for the required core/virtual
+semicanonicalization.
 
 ``max_stepsize`` is an upper bound, not an acceleration factor.  If the
 reported ``max(raw)`` is already much smaller than ``max_stepsize``, increasing
@@ -255,11 +294,44 @@ scale, rotation norm, minimum absolute denominator, and both metric ranks.
 These distinguish an orbital-optimizer plateau from CI nonconvergence,
 metric truncation, an intruder denominator, or trust-radius clipping.
 
-Kramers-restricted Super-CIPT orbital equations are not implemented.  A KRHF
-reference or Kramers-adapted DMRG solver is rejected with a clear error; use
-the validated full Super-CI path for Kramers-restricted optimization.  The
+The contributed compatibility entry point remains available as
+``socutils.mcscf.zmc_supercipt_new.mcscf_superci_pt``.  It delegates to the
+same validated optimizer and returns ``(converged, energy, final_mo)``; it
+does not replace the current CASCI/CASSCF or CI-solver implementations.  The
 paper/source equation map, immutable historical output, and exact/Pykylin/
 Block2 numerical ladder are recorded in ``docs/supercipt_validation.md``.
+
+Orbital localization
+~~~~~~~~~~~~~~~~~~~~
+
+General real or complex orbitals can be Boys-localized over a selected column
+interval without changing that orbital subspace::
+
+   from socutils.lo import localize_boys
+
+   mo_local = localize_boys(
+       mol, mc.mo_coeff,
+       start=mc.ncore,
+       stop=mc.ncore + mc.ncas,
+   )
+
+For a Kramers-complete interval, use the time-reversal-constrained driver::
+
+   from socutils.lo import localize_boys_kramers
+
+   mo_local, info = localize_boys_kramers(
+       mol, mc.mo_coeff,
+       start=mc.ncore,
+       stop=mc.ncore + mc.ncas,
+       return_info=True,
+   )
+
+``localize_boys_kramers`` derives the actual partner map in the AO overlap
+metric and projects all localization rotations onto the quaternionic unitary
+space.  It does not assume ``(2*i, 2*i+1)`` ordering.  ``info`` records the
+initial/final Boys objective, gradient, cycle history, unitary rotation and
+the final time-reversal residual.  Compatibility wrappers ``boys_driver`` and
+``boys_driver_kramers`` retain the old in-place calling style.
 
 Options
 ~~~~~~~

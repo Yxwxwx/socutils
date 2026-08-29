@@ -48,7 +48,7 @@ with TemporaryDirectory(prefix="socutils-supercipt-") as scratch:
     mc.conv_tol_grad = 1e-5
     mc.max_cycle_macro = 24
     mc.max_stepsize = 0.2
-    mc.supercipt()
+    mc.supercipt(use_diis=True, use_cderi=True)
 
     print("E(Super-CIPT DMRG-SCF) = %.12f" % mc.e_tot)
     print("final orbital gradient = %.6e" % mc.final_orbital_gradient_norm)

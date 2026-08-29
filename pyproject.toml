@@ -41,6 +41,7 @@ packages = [
     "socutils.lib",
     "socutils.lib.ao2mo",
     "socutils.lib.zquatev",
+    "socutils.lo",
     "socutils.mcscf",
     "socutils.mp",
     "socutils.scf",

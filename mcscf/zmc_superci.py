@@ -14,6 +14,7 @@ from scipy.sparse.linalg import LinearOperator
 import scipy
 from numpy.linalg import norm
 from socutils.mcscf.hf_superci import precondition_grad, postprocess_x
+from socutils.mcscf.orbital_diis import OrbitalDIIS
 
 
 def expmat(x):
@@ -388,28 +389,118 @@ def _subspace_eigh(casscf, matrix, mo_subspace):
     return scipy.linalg.eigh(matrix)
 
 
+def _kramers_subspace_eigh(casscf, matrix, mo_subspace):
+    """Diagonalize a Kramers-invariant MO subspace without pair-order assumptions.
+
+    ``zquatev`` expects a canonical Kramers basis.  The actual partners and
+    their phases are therefore identified in the AO metric first, and the
+    returned eigenvectors are transformed back to the caller's MO ordering.
+    """
+    from socutils.dmrg.kramers import (
+        identify_kramers_orbitals,
+        time_reverse_one_body,
+    )
+    from socutils.lib import zquatev
+
+    matrix = np.asarray(matrix, dtype=np.complex128)
+    mo_subspace = np.asarray(mo_subspace, dtype=np.complex128)
+    nmo = matrix.shape[0]
+    if matrix.shape != (nmo, nmo) or mo_subspace.shape[1] != nmo:
+        raise ValueError("Kramers subspace matrix and orbitals disagree")
+    if nmo == 0:
+        return np.empty(0), np.empty((0, 0), dtype=np.complex128)
+    if nmo % 2:
+        raise ValueError("a Kramers orbital subspace must have even dimension")
+
+    mapping = identify_kramers_orbitals(
+        casscf.mol,
+        mo_subspace,
+        casscf._scf.get_ovlp(),
+        tolerance=1e-8,
+    )
+    pair_basis = np.zeros((nmo, nmo), dtype=np.complex128)
+    for pair_index, ((first, second), phase) in enumerate(
+        zip(mapping.pairs, mapping.phases)
+    ):
+        phase = phase / abs(phase)
+        pair_basis[first, 2 * pair_index] = 1.0
+        pair_basis[second, 2 * pair_index + 1] = phase
+
+    paired_matrix = reduce(
+        np.dot,
+        (pair_basis.T.conj(), matrix, pair_basis),
+    )
+    canonical_time_reversal = np.zeros_like(paired_matrix)
+    canonical_time_reversal[1::2, 0::2] = np.eye(nmo // 2)
+    canonical_time_reversal[0::2, 1::2] = -np.eye(nmo // 2)
+    paired_matrix = 0.5 * (
+        paired_matrix
+        + time_reverse_one_body(canonical_time_reversal, paired_matrix)
+    )
+    paired_matrix = 0.5 * (paired_matrix + paired_matrix.T.conj())
+
+    block_order = np.r_[np.arange(0, nmo, 2), np.arange(1, nmo, 2)]
+    block_matrix = paired_matrix[np.ix_(block_order, block_order)]
+    eigenvalues, block_vectors = zquatev.eigh(block_matrix, iop=1)
+    paired_vectors = np.zeros_like(block_vectors)
+    paired_vectors[block_order] = block_vectors
+    return eigenvalues, pair_basis.dot(paired_vectors)
+
+
 def _active_natural_orbitals(casscf, casdm1, mo_active):
     """Diagonalize the active 1-RDM using the reference's symmetry when needed."""
     return _subspace_eigh(casscf, -casdm1, mo_active)
 
 
-def _project_kramers_rotation(casscf, mo, generator):
-    """Project an orbital generator onto the time-reversal invariant space."""
-    from socutils.dmrg.kramers import (
-        identify_kramers_orbitals,
-        time_reverse_one_body,
-    )
+def _resolve_kramers_mode(casscf, symm=None, *, use_diis=False):
+    """Resolve explicit/automatic Kramers mode and guard DIIS usage."""
     from socutils.scf import spinor_hf
 
-    if not isinstance(casscf._scf, spinor_hf.KRHF):
-        return generator, None
+    if symm is not None:
+        symm = str(symm).lower()
+        if symm != "kramers":
+            raise ValueError("symm must be None or 'kramers'")
+    native = isinstance(casscf._scf, spinor_hf.KRHF) or getattr(
+        casscf.fcisolver, "kramers_adapter", None
+    ) is not None
+    if use_diis and native and symm != "kramers":
+        raise ValueError(
+            "symm='kramers' is required when DIIS is used with a "
+            "Kramers-restricted reference or active-space solver"
+        )
+    return bool(native or symm == "kramers")
 
-    mapping = identify_kramers_orbitals(
+
+def _identify_kramers_mapping(casscf, mo):
+    from socutils.dmrg.kramers import (
+        identify_kramers_orbitals,
+    )
+
+    return identify_kramers_orbitals(
         casscf.mol,
         mo,
         casscf._scf.get_ovlp(),
         tolerance=1e-8,
     )
+
+
+def _project_kramers_rotation(
+    casscf,
+    mo,
+    generator,
+    *,
+    force=False,
+    mapping=None,
+):
+    """Project an orbital generator onto the time-reversal invariant space."""
+    from socutils.dmrg.kramers import time_reverse_one_body
+    from socutils.scf import spinor_hf
+
+    if not force and not isinstance(casscf._scf, spinor_hf.KRHF):
+        return generator, None
+
+    if mapping is None:
+        mapping = _identify_kramers_mapping(casscf, mo)
     # Use the phase-resolved, exactly sparse representation rather than the
     # measured matrix's roundoff-level off-pair entries.  This makes the
     # symmetry projection idempotent and prevents a sequence of orbital steps
@@ -789,6 +880,11 @@ def mcscf_superci(
     davidson_maxiter=10,
     davidson_tol=5e-6,
     davidson_strict=True,
+    use_diis=False,
+    symm=None,
+    diis_space=15,
+    diis_start_cycle=3,
+    diis_start_gradient=0.02,
     callback=None,
 ):
     # cderi is retained for compatibility with callers that supply vectors
@@ -801,7 +897,7 @@ def mcscf_superci(
     mol = mc.mol
     # if mc.irrep is None:
     #    mo = form_kramers(mo_coeff)
-    mo = mo_coeff
+    mo = np.array(mo_coeff, dtype=np.complex128, copy=True)
     nmo = mo_coeff.shape[1]
     ncore = mc.ncore
     ncas = mc.ncas
@@ -809,7 +905,24 @@ def mcscf_superci(
 
     if solver not in ("davidson", "gmres"):
         raise ValueError("Super-CI solver must be 'davidson' or 'gmres'")
+    if use_diis and bfgs:
+        raise ValueError("Super-CI DIIS and BFGS acceleration are mutually exclusive")
+    kramers = _resolve_kramers_mode(mc, symm, use_diis=use_diis)
+    orbital_diis = None
+    if use_diis:
+        orbital_diis = OrbitalDIIS(
+            mo,
+            mc._scf.get_ovlp(),
+            space=diis_space,
+            start_cycle=diis_start_cycle,
+            start_gradient=diis_start_gradient,
+        )
     log.info("Super-CI orbital solver = %s", solver)
+    log.info(
+        "Super-CI Kramers = %s, orbital DIIS = %s",
+        kramers,
+        bool(use_diis),
+    )
     if solver == "davidson":
         log.info(
             "Super-CI Davidson tolerance = %.3g, maximum space = %d, strict = %s",
@@ -889,7 +1002,14 @@ def mcscf_superci(
         # do it in gen_g_hop
         if mc.natorb is True:
             moa = mo[:, ncore:nocc]
-            natocc, c = _active_natural_orbitals(mc, casdm1, moa)
+            if kramers:
+                natocc, c = _kramers_subspace_eigh(
+                    mc,
+                    -casdm1,
+                    moa,
+                )
+            else:
+                natocc, c = _active_natural_orbitals(mc, casdm1, moa)
             moa_new = np.dot(moa, c)
             mo[:, ncore:nocc] = moa_new
 
@@ -1092,6 +1212,16 @@ def mcscf_superci(
         t2m = log.timer("Solving Super-CI equation", *t_gmres)
 
         dr = mc.unpack_uniq_var(x)
+        kramers_mapping = (
+            _identify_kramers_mapping(mc, mo) if kramers else None
+        )
+        dr, kramers_rotation = _project_kramers_rotation(
+            mc,
+            mo,
+            dr,
+            force=kramers,
+            mapping=kramers_mapping,
+        )
         step_control = max_stepsize
         proposed_step_norm = float(norm(dr))
         history_entry["proposed_orbital_step_norm"] = proposed_step_norm
@@ -1108,7 +1238,6 @@ def mcscf_superci(
         step_rescaled = proposed_step_norm > step_control
         if step_rescaled:
             dr = dr * (step_control / proposed_step_norm)
-        dr, kramers_rotation = _project_kramers_rotation(mc, mo, dr)
         if kramers_rotation is not None:
             history_entry["kramers_rotation"] = kramers_rotation
             log.info(
@@ -1118,15 +1247,43 @@ def mcscf_superci(
                 kramers_rotation["output_generator_residual"],
                 kramers_rotation["projection_change_norm"],
             )
+        rotation = expmat(dr)
+        mo_new = np.dot(mo, rotation)
+        if use_diis:
+            def project_generator(current_mo, generator):
+                screened = mc.unpack_uniq_var(mc.pack_uniq_var(generator))
+                if kramers:
+                    return _project_kramers_rotation(
+                        mc,
+                        current_mo,
+                        screened,
+                        force=True,
+                        mapping=kramers_mapping,
+                    )
+                return screened, None
+
+            diis_result = orbital_diis.update(
+                mo,
+                mo_new,
+                g_unpack,
+                cycle=imacro,
+                gradient_norm=norm_gorb,
+                max_stepsize=max_stepsize,
+                step_metric="frobenius",
+                projector=project_generator,
+            )
+            dr = diis_result.generator
+            mo_new = diis_result.mo_coeff
+            rotation = expmat(dr)
+            step_rescaled = bool(
+                step_rescaled or diis_result.diagnostics["step_scale"] < 1.0
+            )
+            history_entry["diis"] = diis_result.diagnostics
         history_entry["applied_orbital_step_norm"] = float(norm(dr))
         history_entry["step_rescaled"] = bool(step_rescaled)
         applied_x = mc.pack_uniq_var(dr)
-        rotation = expmat(dr)
 
         norm_rot = np.linalg.norm(rotation - np.eye(nmo, dtype=complex))
-        g_unpack = mc.unpack_uniq_var(g)
-
-        mo_new = np.dot(mo, rotation)
         # e_tot, e_cas, fcivec, _, _ = mci.kernel(mo)
         # eris = zmc_ao2mo._ERIS(mc, mo_new, level=2)
         eris = zmc_ao2mo._CDERIS(mc, mo_new, cderi=cderi, level=2)
@@ -1278,6 +1435,9 @@ def mcscf_superci(
         "linear_solver": last_linear_info,
         "metric": dict(mc.superci_metric_diagnostics),
         "cholesky": cholesky_info,
+        "kramers_restricted": bool(kramers),
+        "diis": bool(use_diis),
+        "diis_space": int(diis_space) if use_diis else None,
         "macro_iterations": int(imacro),
     }
     return conv, e_tot, e_cas, fcivec, mo, None

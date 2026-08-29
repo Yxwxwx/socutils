@@ -8,7 +8,12 @@ from pyscf import gto, scf
 from pyscf.fci import cistring
 
 from socutils.dmrg.dmrgci import DMRGCI, energy_from_rdms
-from socutils.mcscf import zmc_ao2mo, zmc_supercipt, zmcscf
+from socutils.mcscf import (
+    zmc_ao2mo,
+    zmc_supercipt,
+    zmc_supercipt_new,
+    zmcscf,
+)
 from socutils.scf import spinor_hf
 
 
@@ -175,6 +180,29 @@ def test_supercipt_metric_eigenproblem_truncates_null_space():
     indefinite[2, 2] = -1e-3
     with pytest.raises(ValueError, match="not positive semidefinite"):
         zmc_supercipt.solve_metric_eigenproblem(matrix, indefinite)
+
+
+def test_supercipt_use_cderi_explicitly_selects_integral_route(
+    tilted_hf_supercipt,
+):
+    _, _, mf_cd, mo = tilted_hf_supercipt
+    mc = _casscf(mf_cd, mo)
+    full, full_info = zmc_supercipt._build_eris(
+        mc,
+        mo,
+        use_cderi=False,
+    )
+    factorized, factorized_info = zmc_supercipt._build_eris(
+        mc,
+        mo,
+        use_cderi=True,
+    )
+
+    assert isinstance(full, zmc_ao2mo._ERIS)
+    assert isinstance(factorized, zmc_ao2mo._CDERIS)
+    assert not full_info["factorized"]
+    assert factorized_info["factorized"]
+    assert np.max(abs(full.aaaa - factorized.aaaa)) <= 1e-9
 
 
 @pytest.mark.integration
@@ -594,7 +622,7 @@ def test_supercipt_state_average_reaches_legacy_stationary_energy():
     )
 
 
-def test_supercipt_rejects_kramers_restricted_orbital_equations():
+def test_supercipt_kramers_diis_requires_explicit_symmetry():
     mol = gto.M(
         atom="H 0 0 0; H 0 0 0.74",
         basis="sto-3g",
@@ -604,10 +632,95 @@ def test_supercipt_rejects_kramers_restricted_orbital_equations():
     )
     mf = spinor_hf.KRHF(mol)
     mc = zmcscf.CASSCF(mf, ncas=2, nelecas=2, ncore=0)
-    with pytest.raises(
-        NotImplementedError,
-        match="Kramers-restricted Super-CIPT orbital equations",
-    ):
+    with pytest.raises(ValueError, match="symm='kramers' is required"):
         zmc_supercipt.mcscf_supercipt(
-            mc, np.eye(2 * mol.nao_nr(), dtype=complex)
+            mc,
+            np.eye(2 * mol.nao_nr(), dtype=complex),
+            use_diis=True,
         )
+
+
+@pytest.mark.integration
+def test_contributed_supercipt_interface_generates_cderi(
+    tilted_hf_supercipt,
+):
+    _, mf, _, mo = tilted_hf_supercipt
+    mc = _casscf(mf, mo)
+    converged, energy, final_mo = zmc_supercipt_new.mcscf_superci_pt(
+        mc,
+        mf,
+        max_cycle=1,
+        use_cderi=True,
+        use_diis=True,
+    )
+
+    assert not converged
+    assert energy == pytest.approx(mc.e_tot)
+    assert np.max(abs(final_mo - mc.mo_coeff)) == 0.0
+    assert mc.supercipt_diagnostics["integrals"]["factorized"]
+    assert mc.supercipt_diagnostics["integrals"]["source"] == "legacy-cderi"
+    assert mc.supercipt_diagnostics["diis"]
+
+
+@pytest.mark.integration
+def test_supercipt_kramers_diis_preserves_time_reversal():
+    from socutils.dmrg.kramers import identify_kramers_orbitals
+
+    mol = gto.M(
+        atom="H 0 0 0",
+        basis="6-31g",
+        spin=1,
+        charge=0,
+        verbose=0,
+        max_memory=1000,
+    )
+    mf = spinor_hf.KRHF(mol).x2camf(
+        with_gaunt=False,
+        with_breit=False,
+    ).cholesky(tau=1e-10)
+    mf.init_guess = "1e"
+    mf.conv_tol = 1e-12
+    mf.kernel()
+    assert mf.converged
+
+    rotation = np.eye(4, dtype=complex)
+    cosine, sine = np.cos(0.18), np.sin(0.18)
+    for occupied, virtual in ((0, 2), (1, 3)):
+        rotation[occupied, occupied] = cosine
+        rotation[virtual, virtual] = cosine
+        rotation[occupied, virtual] = sine
+        rotation[virtual, occupied] = -sine
+    initial_mo = mf.mo_coeff.dot(rotation)
+
+    mc = zmcscf.CASSCF(mf, ncas=2, nelecas=1)
+    mc.mo_coeff = initial_mo
+    mc.state_average_([0.5, 0.5])
+    mc.natorb = False
+    mc.canonicalize_ = False
+    mc.max_cycle_macro = 20
+    mc.conv_tol = 1e-10
+    mc.conv_tol_grad = 1e-7
+    mc.max_stepsize = 0.1
+    mc.verbose = 0
+    mc.supercipt(
+        symm="kramers",
+        use_diis=True,
+        use_cderi=True,
+    )
+
+    mapping = identify_kramers_orbitals(
+        mol,
+        mc.mo_coeff,
+        mf.get_ovlp(),
+        tolerance=1e-7,
+    )
+    assert mc.converged
+    assert mc.supercipt_diagnostics["kramers_restricted"]
+    assert mc.supercipt_diagnostics["diis"]
+    assert mc.supercipt_diagnostics["integrals"]["factorized"]
+    assert mapping.diagnostics["subspace_closure_error"] <= 1e-7
+    assert mapping.diagnostics["partner_orbital_error"] <= 1e-7
+    assert any(
+        row.get("diis", {}).get("extrapolated", False)
+        for row in mc.supercipt_history
+    )

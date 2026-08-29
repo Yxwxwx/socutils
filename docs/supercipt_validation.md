@@ -349,11 +349,17 @@ CASCI finite-difference gradients, explicit many-body Koopmans commutators,
 exact `(N-1)/(N+1)` spectra, direct eq. 24--26 resolvents, mandatory PT
 canonicalization, fixed energy/RDM/first-step agreement, all-block
 exact/Block2 macroiterations, the six-root historical endpoint, projectors,
-occupations, and the explicit Kramers restriction.
+occupations, Kramers projection, orbital DIIS, and factorized-integral
+selection.
 
-Kramers-restricted Super-CIPT orbital equations are intentionally not
-implemented: the cited implementation and historical reference provide only
-general complex-spinor Super-CIPT.  Kramers-restricted exact/DMRG CASSCF
-remains available through the validated full Super-CI path.
+The later ``note/to_Dutta`` contribution added Kramers and orbital-DIIS ideas.
+They were merged into the validated equations rather than replacing the
+current CASCI/CASSCF stack.  Kramers partners are now inferred from the AO
+time-reversal map instead of adjacent indices; every raw and DIIS-extrapolated
+generator is projected, and the PT core/virtual blocks are diagonalized in a
+phase-resolved quaternion basis.  Small exact and Block2 state-averaged tests
+reach the same Kramers-restricted Super-CIPT endpoint and retain time-reversal
+closure.  The same fixed-frame unitary DIIS implementation is also exercised
+by the full Super-CI optimizer.
 
 Milestone commit message: `mcscf: port validated Super-CIPT optimizer to block2`.

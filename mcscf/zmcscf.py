@@ -158,11 +158,14 @@ class CASSCF(zcasci.CASCI):
         'max_cycle_macro', 'max_stepsize', 'conv_tol', 'conv_tol_grad',
         'freeze_pair', 'canonicalize_', 'superci_solver', 'superci_bfgs',
         'superci_davidson_tol', 'superci_davidson_max_space',
-        'superci_davidson_strict', 'macro_history',
+        'superci_davidson_strict', 'superci_diis', 'macro_history',
         'superci_diagnostics', 'superci_metric_diagnostics',
         'cholesky_diagnostics',
         'final_orbital_gradient_norm', 'supercipt_level_shift',
         'supercipt_metric_tol', 'supercipt_denominator_tol',
+        'supercipt_use_cderi', 'supercipt_diis',
+        'orbital_symmetry', 'orbital_diis_space',
+        'orbital_diis_start_cycle', 'orbital_diis_start_gradient',
         'supercipt_history', 'supercipt_diagnostics',
     })
 
@@ -182,6 +185,7 @@ class CASSCF(zcasci.CASCI):
         self.superci_davidson_tol = 1e-8
         self.superci_davidson_max_space = 200
         self.superci_davidson_strict = True
+        self.superci_diis = False
         self.macro_history = []
         self.superci_diagnostics = None
         self.superci_metric_diagnostics = None
@@ -190,6 +194,12 @@ class CASSCF(zcasci.CASCI):
         self.supercipt_level_shift = 0.0
         self.supercipt_metric_tol = 1e-6
         self.supercipt_denominator_tol = 1e-10
+        self.supercipt_use_cderi = None
+        self.supercipt_diis = False
+        self.orbital_symmetry = None
+        self.orbital_diis_space = 15
+        self.orbital_diis_start_cycle = 3
+        self.orbital_diis_start_gradient = 0.02
         self.supercipt_history = []
         self.supercipt_diagnostics = None
 
@@ -292,7 +302,19 @@ class CASSCF(zcasci.CASCI):
         '''
         return self.superci(mo_coeff, ci0=ci0, callback=callback)
 
-    def superci(self, mo_coeff=None, ci0=None, callback=None, _kern=None):
+    def superci(
+        self,
+        mo_coeff=None,
+        ci0=None,
+        callback=None,
+        _kern=None,
+        *,
+        use_diis=None,
+        symm=None,
+        diis_space=None,
+        diis_start_cycle=None,
+        diis_start_gradient=None,
+    ):
         '''Super-CI CASSCF orbital optimization.
 
         Returns:
@@ -315,6 +337,16 @@ class CASSCF(zcasci.CASCI):
             self.mo_coeff = mo_coeff
         if callback is None:
             callback = self.callback
+        if use_diis is None:
+            use_diis = self.superci_diis
+        if symm is None:
+            symm = self.orbital_symmetry
+        if diis_space is None:
+            diis_space = self.orbital_diis_space
+        if diis_start_cycle is None:
+            diis_start_cycle = self.orbital_diis_start_cycle
+        if diis_start_gradient is None:
+            diis_start_gradient = self.orbital_diis_start_gradient
 
         self.check_sanity()
         self.dump_flags()
@@ -328,21 +360,39 @@ class CASSCF(zcasci.CASCI):
                       davidson_maxiter=self.superci_davidson_max_space,
                       davidson_tol=self.superci_davidson_tol,
                       davidson_strict=self.superci_davidson_strict,
+                      use_diis=use_diis, symm=symm,
+                      diis_space=diis_space,
+                      diis_start_cycle=diis_start_cycle,
+                      diis_start_gradient=diis_start_gradient,
                       callback=callback)
         logger.note(self, 'CASSCF energy = %#.15g', self.e_tot)
         self._finalize()
         return self.e_tot, self.e_cas, self.ci, self.mo_coeff, self.mo_energy
 
-    def supercipt(self, mo_coeff=None, ci0=None, callback=None, _kern=None):
+    def supercipt(
+        self,
+        mo_coeff=None,
+        ci0=None,
+        callback=None,
+        _kern=None,
+        *,
+        use_cderi=None,
+        use_diis=None,
+        symm=None,
+        diis_space=None,
+        diis_start_cycle=None,
+        diis_start_gradient=None,
+    ):
         '''Perturbative Super-CI CASSCF orbital optimization.
 
         This is the Guo--Dutta two-component Super-CIPT optimizer.  It is an
         explicit alternative to :meth:`superci`; calling :meth:`kernel` keeps
         using the validated full Super-CI/Davidson optimizer.
 
-        Kramers-restricted orbital equations are intentionally not provided by
-        this path.  General complex spinors, exact CI, state averages and the
-        common Block2 :class:`socutils.dmrg.DMRGCI` solver are supported.
+        General and Kramers-restricted complex spinors, exact CI, state
+        averages and the common Block2 :class:`socutils.dmrg.DMRGCI` solver are
+        supported.  When DIIS is combined with a Kramers calculation, pass
+        ``symm='kramers'`` explicitly.
         '''
         del ci0  # Orbital changes invalidate untransformed CI/MPS guesses.
         from socutils.mcscf.zmc_supercipt import mcscf_supercipt
@@ -354,6 +404,18 @@ class CASSCF(zcasci.CASCI):
             self.mo_coeff = mo_coeff
         if callback is None:
             callback = self.callback
+        if use_cderi is None:
+            use_cderi = self.supercipt_use_cderi
+        if use_diis is None:
+            use_diis = self.supercipt_diis
+        if symm is None:
+            symm = self.orbital_symmetry
+        if diis_space is None:
+            diis_space = self.orbital_diis_space
+        if diis_start_cycle is None:
+            diis_start_cycle = self.orbital_diis_start_cycle
+        if diis_start_gradient is None:
+            diis_start_gradient = self.orbital_diis_start_gradient
 
         self.check_sanity()
         self.dump_flags()
@@ -369,6 +431,12 @@ class CASSCF(zcasci.CASCI):
                     denominator_tol=self.supercipt_denominator_tol,
                     verbose=self.verbose,
                     cderi=self._cderi,
+                    use_cderi=use_cderi,
+                    use_diis=use_diis,
+                    symm=symm,
+                    diis_space=diis_space,
+                    diis_start_cycle=diis_start_cycle,
+                    diis_start_gradient=diis_start_gradient,
                     callback=callback,
                 )
         logger.note(self, 'Super-CIPT CASSCF energy = %#.15g', self.e_tot)

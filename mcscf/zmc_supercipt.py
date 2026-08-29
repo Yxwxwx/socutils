@@ -24,9 +24,14 @@ from pyscf import lib
 from pyscf.lib import logger
 
 from socutils.mcscf import zmc_ao2mo
+from socutils.mcscf.orbital_diis import OrbitalDIIS
 from socutils.mcscf.zmc_superci import (
     _ci_convergence_snapshot,
     _contract_dm2_gradient,
+    _identify_kramers_mapping,
+    _kramers_subspace_eigh,
+    _project_kramers_rotation,
+    _resolve_kramers_mode,
     _subspace_eigh,
 )
 
@@ -123,6 +128,7 @@ class SuperCIPTStep:
     minimum_denominator: float
     metric_diagnostics: dict
     canonical_energies: dict
+    kramers_diagnostics: dict | None
 
 
 def build_orbital_quantities(mc, mo, casdm1, casdm2, eris):
@@ -223,7 +229,7 @@ def _check_denominators(denominator, tolerance, label):
     return minimum
 
 
-def _canonicalize_core_virtual(mc, mo, casdm1):
+def _canonicalize_core_virtual(mc, mo, casdm1, *, kramers=False):
     """Canonicalize the redundant core/virtual blocks required by PT.
 
     This is an internal condition of the Dyall denominators, not the optional
@@ -245,13 +251,15 @@ def _canonicalize_core_virtual(mc, mo, casdm1):
     result = np.array(mo, copy=True)
     energies = {"core": [], "virtual": []}
     if ncore:
-        values, vectors = _subspace_eigh(
+        diagonalizer = _kramers_subspace_eigh if kramers else _subspace_eigh
+        values, vectors = diagonalizer(
             mc, fock_mo[:ncore, :ncore], mo[:, :ncore]
         )
         result[:, :ncore] = mo[:, :ncore].dot(vectors)
         energies["core"] = np.asarray(values).real.tolist()
     if nocc < nmo:
-        values, vectors = _subspace_eigh(
+        diagonalizer = _kramers_subspace_eigh if kramers else _subspace_eigh
+        values, vectors = diagonalizer(
             mc, fock_mo[nocc:, nocc:], mo[:, nocc:]
         )
         result[:, nocc:] = mo[:, nocc:].dot(vectors)
@@ -271,6 +279,8 @@ def supercipt_step(
     metric_tol=1e-6,
     denominator_tol=1e-10,
     canonicalize=True,
+    kramers=False,
+    kramers_mapping=None,
 ):
     """Form and apply one perturbative Super-CI orbital step.
 
@@ -368,6 +378,15 @@ def supercipt_step(
     allowed = mc.uniq_var_indices(nmo, ncore, ncas, mc.frozen)
     lower[~allowed] = 0.0
     kappa_unscaled = lower - lower.T.conj()
+    kramers_diagnostics = None
+    if kramers:
+        kappa_unscaled, kramers_diagnostics = _project_kramers_rotation(
+            mc,
+            mo,
+            kappa_unscaled,
+            force=True,
+            mapping=kramers_mapping,
+        )
     maximum = float(np.max(abs(kappa_unscaled))) if kappa_unscaled.size else 0.0
     scale = min(1.0, float(max_stepsize) / maximum) if maximum else 1.0
     kappa = scale * kappa_unscaled
@@ -376,7 +395,7 @@ def supercipt_step(
     canonical_energies = {"core": [], "virtual": []}
     if canonicalize:
         mo_new, canonical_energies = _canonicalize_core_virtual(
-            mc, mo_new, casdm1
+            mc, mo_new, casdm1, kramers=kramers
         )
 
     return SuperCIPTStep(
@@ -394,12 +413,23 @@ def supercipt_step(
         minimum_denominator=float(minimum_denominator),
         metric_diagnostics={"removal": removal_info, "addition": addition_info},
         canonical_energies=canonical_energies,
+        kramers_diagnostics=kramers_diagnostics,
     )
 
 
-def _build_eris(mc, mo, cderi=None):
+def _build_eris(mc, mo, cderi=None, *, use_cderi=None):
+    if use_cderi not in (None, True, False):
+        raise ValueError("use_cderi must be True, False, or None")
     with_df = getattr(mc._scf, "with_df", None)
-    if with_df is not None or cderi is not None:
+    factorized = use_cderi is True or (
+        use_cderi is None and (with_df is not None or cderi is not None)
+    )
+    if factorized:
+        if with_df is None and cderi is None:
+            raise ValueError(
+                "use_cderi=True requires attached density-fitting/Cholesky "
+                "vectors or an explicit cderi array"
+            )
         eris = zmc_ao2mo._CDERIS(mc, mo, cderi=cderi, level=2)
         return eris, {
             "factorized": True,
@@ -437,18 +467,6 @@ def _root_energies(solver):
     return np.asarray(values).real.tolist()
 
 
-def _reject_kramers_restricted(mc):
-    from socutils.scf import spinor_hf
-
-    if isinstance(mc._scf, spinor_hf.KRHF) or getattr(
-        mc.fcisolver, "kramers_adapter", None
-    ) is not None:
-        raise NotImplementedError(
-            "Kramers-restricted Super-CIPT orbital equations are not implemented; "
-            "use the general complex solver/reference or the validated Super-CI path"
-        )
-
-
 def mcscf_supercipt(
     mc,
     mo_coeff,
@@ -462,10 +480,16 @@ def mcscf_supercipt(
     denominator_tol=1e-10,
     verbose=None,
     cderi=None,
+    use_cderi=None,
+    use_diis=False,
+    symm=None,
+    diis_space=15,
+    diis_start_cycle=3,
+    diis_start_gradient=0.02,
     callback=None,
 ):
     """Drive state-specific or state-averaged 2C-CASSCF with Super-CIPT."""
-    _reject_kramers_restricted(mc)
+    kramers = _resolve_kramers_mode(mc, symm, use_diis=use_diis)
     log = logger.new_logger(mc, verbose)
     if conv_tol is None:
         conv_tol = mc.conv_tol
@@ -477,6 +501,20 @@ def mcscf_supercipt(
         raise ValueError("max_cycle must be positive")
 
     mo = np.array(mo_coeff, dtype=np.complex128, copy=True)
+    generated_cderi = cderi
+    with_df = getattr(mc._scf, "with_df", None)
+    if use_cderi is True and generated_cderi is None and with_df is None:
+        log.info("Generating AO Cholesky vectors for Super-CIPT")
+        generated_cderi = zmc_ao2mo.chunked_cholesky(mc.mol)
+    orbital_diis = None
+    if use_diis:
+        orbital_diis = OrbitalDIIS(
+            mo,
+            mc._scf.get_ovlp(),
+            space=diis_space,
+            start_cycle=diis_start_cycle,
+            start_gradient=diis_start_gradient,
+        )
     previous_energy = None
     history = []
     mc.macro_history = history
@@ -497,9 +535,22 @@ def mcscf_supercipt(
         "Super-CIPT core/virtual PT canonicalization is enabled "
         "independently of canonicalize_"
     )
+    log.info(
+        "Super-CIPT Kramers = %s, DIIS = %s, integral selection = %s",
+        kramers,
+        bool(use_diis),
+        "automatic" if use_cderi is None else (
+            "factorized" if use_cderi else "full"
+        ),
+    )
 
     for macro in range(max_cycle):
-        eris, integral_info = _build_eris(mc, mo, cderi=cderi)
+        eris, integral_info = _build_eris(
+            mc,
+            mo,
+            cderi=generated_cderi,
+            use_cderi=use_cderi,
+        )
         last_integral_info = integral_info
         from socutils.mcscf.zmcscf import _fake_h_for_fast_casci
 
@@ -561,6 +612,9 @@ def mcscf_supercipt(
                 callback(dict(entry))
             break
 
+        kramers_mapping = (
+            _identify_kramers_mapping(mc, mo) if kramers else None
+        )
         last_step = supercipt_step(
             mc,
             mo,
@@ -571,8 +625,45 @@ def mcscf_supercipt(
             level_shift=level_shift,
             metric_tol=metric_tol,
             denominator_tol=denominator_tol,
-            canonicalize=True,
+            canonicalize=not use_diis,
+            kramers=kramers,
+            kramers_mapping=kramers_mapping,
         )
+        if use_diis:
+            def project_generator(current_mo, generator):
+                screened = mc.unpack_uniq_var(mc.pack_uniq_var(generator))
+                if kramers:
+                    return _project_kramers_rotation(
+                        mc,
+                        current_mo,
+                        screened,
+                        force=True,
+                        mapping=kramers_mapping,
+                    )
+                return screened, None
+
+            diis_result = orbital_diis.update(
+                mo,
+                last_step.mo_coeff,
+                quantities.screened_gradient,
+                cycle=macro,
+                gradient_norm=quantities.gradient_norm,
+                max_stepsize=max_stepsize,
+                step_metric="maximum",
+                projector=project_generator,
+            )
+            mo_diis, canonical_energies = _canonicalize_core_virtual(
+                mc,
+                diis_result.mo_coeff,
+                casdm1,
+                kramers=kramers,
+            )
+            last_step.mo_coeff = mo_diis
+            last_step.kappa = diis_result.generator
+            last_step.rotation = scipy.linalg.expm(diis_result.generator)
+            last_step.scale = diis_result.diagnostics["step_scale"]
+            last_step.canonical_energies = canonical_energies
+            entry["diis"] = diis_result.diagnostics
         entry.update(
             {
                 "proposed_maximum_amplitude": last_step.maximum_amplitude,
@@ -583,6 +674,7 @@ def mcscf_supercipt(
                 "removal_energies": last_step.removal_energies.tolist(),
                 "addition_energies": last_step.addition_energies.tolist(),
                 "canonical_energies": last_step.canonical_energies,
+                "kramers_rotation": last_step.kramers_diagnostics,
             }
         )
         log.info(
@@ -621,7 +713,10 @@ def mcscf_supercipt(
         "maximum_step": float(max_stepsize),
         "pt_core_virtual_canonicalization": True,
         "integrals": dict(last_integral_info),
-        "kramers_restricted": False,
+        "kramers_restricted": bool(kramers),
+        "diis": bool(use_diis),
+        "diis_space": int(diis_space) if use_diis else None,
+        "use_cderi": use_cderi,
         "last_step_scale": None if last_step is None else last_step.scale,
     }
     return converged, e_tot, e_cas, ci, mo, mc.mo_energy

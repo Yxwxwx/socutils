@@ -226,6 +226,25 @@ def time_reverse_one_body(time_reversal, matrix):
     r"""Time reverse one-body operator coefficients in a spinor MO basis."""
     time_reversal = numpy.asarray(time_reversal)
     matrix = numpy.asarray(matrix)
+    # Phase-resolved Kramers maps are signed permutation matrices.  Orbital
+    # optimization deliberately constructs this exact sparse form, for which
+    # dense O(n^3) contractions are wasteful (notably for 800+ spinors).
+    nonzero = time_reversal != 0
+    if (
+        time_reversal.ndim == 2
+        and time_reversal.shape[0] == time_reversal.shape[1]
+        and matrix.shape == time_reversal.shape
+        and numpy.all(numpy.count_nonzero(nonzero, axis=0) == 1)
+        and numpy.all(numpy.count_nonzero(nonzero, axis=1) == 1)
+    ):
+        rows = numpy.arange(time_reversal.shape[0])
+        columns = numpy.argmax(nonzero, axis=1)
+        phases = time_reversal[rows, columns]
+        return (
+            phases[:, None]
+            * phases[None, :].conj()
+            * matrix.conj()[numpy.ix_(columns, columns)]
+        )
     return numpy.einsum(
         "ap,bq,pq->ab",
         time_reversal,

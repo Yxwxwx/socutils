@@ -104,3 +104,5 @@ benchmarck/kramers/results/**/*.progress.json
 # Local DMRG runtime state
 dmrg_scratch/
 dmrg_checkpoint/
+
+.pytest_cache/
