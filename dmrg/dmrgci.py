@@ -215,6 +215,28 @@ def pyscf_dmrg_schedule(
     )
 
 
+def _convert_twosite_restart_schedule(schedule, conversion_sweeps=2):
+    """Prepend two-site conversion sweeps to a one-site restart schedule."""
+    if not schedule.restart or schedule.twosite_to_onesite is not None:
+        raise ValueError("site conversion requires a one-site restart schedule")
+    conversion_sweeps = int(conversion_sweeps)
+    if conversion_sweeps <= 0:
+        raise ValueError("conversion_sweeps must be positive")
+    return DMRGSweepSchedule(
+        anchor_sweeps=schedule.anchor_sweeps,
+        anchor_bond_dims=schedule.anchor_bond_dims,
+        anchor_thrds=schedule.anchor_thrds,
+        anchor_noises=schedule.anchor_noises,
+        bond_dims=(schedule.bond_dims[0],) * conversion_sweeps
+        + schedule.bond_dims,
+        thrds=(schedule.thrds[0],) * conversion_sweeps + schedule.thrds,
+        noises=(0.0,) * conversion_sweeps + schedule.noises,
+        n_sweeps=schedule.n_sweeps + conversion_sweeps,
+        twosite_to_onesite=conversion_sweeps,
+        restart=True,
+    )
+
+
 def block2_integrals(h1e, eri, norb):
     r"""Copy spinor-FCI integrals into the Block2 QC-MPO convention.
 
@@ -1063,6 +1085,24 @@ class DMRGCI(StreamObject):
         ]
         self._write_json_atomic(manifest_path, manifest)
 
+    def _save_final_checkpoint_mps(self, ket):
+        """Replace the sweep checkpoint with the final canonical MPS image.
+
+        Block2's ``restart_dir`` is updated during sweeps, but after an
+        internal two-site-to-one-site transition it can retain the last
+        two-site MPS metadata.  Loading that mixed image as a one-site
+        MultiMPS destroys root orthogonality.  Explicitly save and copy the
+        final in-scratch image before marking the checkpoint complete.
+        """
+        _, checkpoint_mps, _ = self._checkpoint_paths()
+        if checkpoint_mps is None:
+            return
+        if self._scratch is None:
+            raise RuntimeError("cannot checkpoint an MPS without run scratch")
+        ket.save_data()
+        ket.info.save_data(os.path.join(self._scratch, "GS-mps_info.bin"))
+        self._copy_internal_mps(self._scratch, checkpoint_mps)
+
     @staticmethod
     def _copy_checkpoint_mps(source, destination):
         if not os.path.isdir(source):
@@ -1170,6 +1210,20 @@ class DMRGCI(StreamObject):
             and in_memory_compatible
             and not resume_checkpoint
         )
+        minimal_multiroot_restart_fallback = bool(
+            use_internal_mps and nroots > 1 and int(norb) <= 2
+        )
+        if minimal_multiroot_restart_fallback:
+            # A one-site MultiMPS on a two-site lattice has no interior
+            # tensor.  The locked Block2 build segfaults on the third
+            # direction change even when energy convergence is enabled, so
+            # this exact tiny space is safer and cheaper to solve cold.
+            use_internal_mps = False
+            logger.warn(
+                self,
+                "two-site multi-root active space cannot be warm-restarted "
+                "safely by Block2; using a fresh cold solve",
+            )
         preserved_reorder_idx = None
         if use_internal_mps and self.driver.reorder_idx is not None:
             preserved_reorder_idx = numpy.asarray(
@@ -1196,7 +1250,11 @@ class DMRGCI(StreamObject):
             run_mode = "casscf-warm-start"
         else:
             run_mode = "cold-start"
-        if restart_requested and run_mode == "cold-start":
+        if (
+            restart_requested
+            and run_mode == "cold-start"
+            and not minimal_multiroot_restart_fallback
+        ):
             logger.warn(
                 self,
                 "DMRG restart was requested but no compatible internal MPS "
@@ -1213,6 +1271,7 @@ class DMRGCI(StreamObject):
             restart=run_mode != "cold-start"
         )
         effective_twosite_to_onesite = schedule.twosite_to_onesite
+        restart_site_conversion_sweeps = 0
         if (
             run_mode == "cold-start"
             and nroots > 1
@@ -1334,6 +1393,27 @@ class DMRGCI(StreamObject):
             )
             if run_mode != "cold-start":
                 ket = driver.load_mps("GS", nroots=nroots)
+                if int(ket.dot) != 1:
+                    if int(ket.dot) != 2:
+                        raise RuntimeError(
+                            "checkpoint MPS has unsupported site type %s"
+                            % ket.dot
+                        )
+                    restart_site_conversion_sweeps = 2
+                    schedule = _convert_twosite_restart_schedule(
+                        schedule,
+                        conversion_sweeps=restart_site_conversion_sweeps,
+                    )
+                    effective_twosite_to_onesite = (
+                        restart_site_conversion_sweeps
+                    )
+                    logger.warn(
+                        self,
+                        "loaded a two-site MPS; running %d conversion sweeps "
+                        "before the configured %d one-site restart sweeps",
+                        restart_site_conversion_sweeps,
+                        self.restart_sweeps,
+                    )
             mpo = driver.get_qc_mpo(
                 h1e=h1_block2,
                 g2e=eri_block2,
@@ -1374,7 +1454,8 @@ class DMRGCI(StreamObject):
                     nroots=nroots,
                 )
             elif run_mode != "cold-start":
-                ket, forward = driver.adjust_mps(ket, dot=1)
+                target_dot = 2 if restart_site_conversion_sweeps else 1
+                ket, forward = driver.adjust_mps(ket, dot=target_dot)
                 dmrg_kwargs["forward"] = forward
             if nroots > 1:
                 ket.weights = driver.bw.VectorFP(weights.tolist())
@@ -1452,6 +1533,8 @@ class DMRGCI(StreamObject):
                         )
                     )
 
+            self._save_final_checkpoint_mps(ket)
+
             self.driver = driver
             self._active_mpo = mpo
             self.kets = kets
@@ -1474,6 +1557,9 @@ class DMRGCI(StreamObject):
                         else "fresh-driver-mps-reload"
                     ),
                     "restart_requested": restart_requested,
+                    "minimal_multiroot_restart_fallback": (
+                        minimal_multiroot_restart_fallback
+                    ),
                     "schedule_mode": self.schedule_mode,
                     "schedule": schedule.as_dict(),
                     "block2_sweep_tolerance": block2_sweep_tol,
@@ -1483,6 +1569,9 @@ class DMRGCI(StreamObject):
                     ],
                     "orbital_reordering": reorder_idx.tolist(),
                     "restart_scheduler": dict(self.restart_diagnostics),
+                    "restart_site_conversion_sweeps": (
+                        restart_site_conversion_sweeps
+                    ),
                 }
             )
             if nroots > 1:

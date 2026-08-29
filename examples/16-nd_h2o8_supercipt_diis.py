@@ -46,7 +46,13 @@ H         0.234709   -1.917003   -2.459045
 """
 
 
-def main(*, dry_run=False):
+def main(
+    *,
+    dry_run=False,
+    max_cycle=40,
+    init_guess="atom",
+    max_memory=200000,
+):
     basis = {
         "Nd": gto.load("dyallv2z", "Nd"),
         "O": gto.load("def2-svp", "O"),
@@ -59,7 +65,7 @@ def main(*, dry_run=False):
         spin=0,
         verbose=5,
         nucmod="G",
-        max_memory=200000,
+        max_memory=int(max_memory),
     )
     mf = spinor_hf.KRHF(mol).x2camf(
         with_gaunt=True,
@@ -82,7 +88,7 @@ def main(*, dry_run=False):
         )
         return
     mf.max_cycle = 1
-    mf.init_guess = "atom"
+    mf.init_guess = init_guess
     mf.kernel()
 
     initial_mo = np.array(mf.mo_coeff, copy=True)
@@ -104,7 +110,7 @@ def main(*, dry_run=False):
     mc.mo_coeff = initial_mo
     mc.natorb = False
     mc.canonicalize_ = False
-    mc.max_cycle_macro = 40
+    mc.max_cycle_macro = int(max_cycle)
     mc.max_stepsize = 0.2
     mc.conv_tol = 1e-8
     mc.conv_tol_grad = 1e-3
@@ -126,4 +132,31 @@ if __name__ == "__main__":
         action="store_true",
         help="build the real Nd geometry/bases and validate CAS dimensions only",
     )
-    main(dry_run=parser.parse_args().dry_run)
+    parser.add_argument(
+        "--max-cycle",
+        type=int,
+        default=40,
+        help="maximum Super-CIPT macroiterations (default: 40)",
+    )
+    parser.add_argument(
+        "--init-guess",
+        default="atom",
+        help="reference-SCF initial guess (default: atom; use 1e for a low-memory smoke test)",
+    )
+    parser.add_argument(
+        "--max-memory",
+        type=int,
+        default=200000,
+        help="PySCF memory limit in MB (default: 200000)",
+    )
+    args = parser.parse_args()
+    if args.max_cycle <= 0:
+        parser.error("--max-cycle must be positive")
+    if args.max_memory <= 0:
+        parser.error("--max-memory must be positive")
+    main(
+        dry_run=args.dry_run,
+        max_cycle=args.max_cycle,
+        init_guess=args.init_guess,
+        max_memory=args.max_memory,
+    )

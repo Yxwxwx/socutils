@@ -394,6 +394,13 @@ directory, constructs a fresh pyblock2 driver and MPO, and reloads that MPS.
 This matches the lifecycle of `block2main fullrestart` and treats the old
 coefficients only as a guess for the new-orbital Hamiltonian.
 
+The restart call uses `tol=0` to complete all configured sweeps; convergence
+is decided afterward from the maximum per-root energy change.  A two-site,
+multi-root lattice is the only exception.  It has no interior one-site tensor,
+and the locked Block2 build segfaults on repeated one-site direction changes
+even with normal energy stopping, so this exact, negligible-cost CAS(1,2)
+edge case is solved cold rather than loading a warm-start MultiMPS.
+
 For process-level continuation, `checkpoint_dir` asks pyblock2 to copy a
 loadable MPS after every completed sweep. A JSON manifest records orbital and
 electron counts, root count and weights, MPO cutoffs, core shift, and a
@@ -402,6 +409,18 @@ with `resume=True` loads either a completed or interrupted checkpoint only
 when that exact fingerprint matches. The checkpoint is not deleted by
 `close()`. Optional per-sweep archives are available but disabled by default
 because of their storage cost.
+
+The final checkpoint now receives an explicit copy of the canonical one-site
+MultiMPS after root-space validation.  This matters because
+Block2's sweep-time `restart_dir` can otherwise retain two-site metadata from
+an intermediate image even though the in-memory calculation finished with
+one-site sweeps.  Directly changing that old image's `dot` flag to one-site
+was found to corrupt a six-root Cl CAS(7,16) restart (`max|S-I| = 0.1845` and
+`max|H-SE| = 2.006` Eh).  Legacy two-site checkpoints are therefore resumed
+with two actual conversion sweeps followed by the configured eight one-site
+sweeps.  The converted Cl restart recovered the reference energy and passed
+the root-overlap/projected-eigenproblem validation; new checkpoints load
+directly with `dot=1`.
 
 The protocol-7 Kramers halogen matrix uses CAS(7,8), six equal roots,
 `M=16 -> 32`, `tol=1e-10`, the official noise decay, a `1e-12` local-threshold

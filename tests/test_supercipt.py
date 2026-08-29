@@ -8,6 +8,7 @@ from pyscf import gto, scf
 from pyscf.fci import cistring
 
 from socutils.dmrg.dmrgci import DMRGCI, energy_from_rdms
+from socutils.dmrg.kramers import identify_kramers_orbitals
 from socutils.mcscf import (
     zmc_ao2mo,
     zmc_supercipt,
@@ -663,9 +664,75 @@ def test_contributed_supercipt_interface_generates_cderi(
 
 
 @pytest.mark.integration
-def test_supercipt_kramers_diis_preserves_time_reversal():
-    from socutils.dmrg.kramers import identify_kramers_orbitals
+def test_supercipt_diis_rejects_an_uphill_extrapolation(
+    tilted_hf_supercipt,
+    monkeypatch,
+):
+    """An extrapolated step may not move the variational energy uphill."""
+    _, mf, _, mo = tilted_hf_supercipt
+    mc = _casscf(mf, mo)
+    mc.max_cycle_macro = 6
+    injected = {"done": False}
+    original_update = zmc_supercipt.IncrementalOrbitalDIIS.update
 
+    def uphill_update(self, current_mo, proposed_mo, gradient, **kwargs):
+        result = original_update(
+            self,
+            current_mo,
+            proposed_mo,
+            gradient,
+            **kwargs,
+        )
+        if (
+            result.diagnostics["extrapolated"]
+            and kwargs["cycle"] == mc.max_cycle_macro - 2
+            and not injected["done"]
+        ):
+            injected["done"] = True
+            generator = np.zeros(
+                (current_mo.shape[1],) * 2,
+                dtype=np.complex128,
+            )
+            generator[-1, 0] = 0.2
+            generator[0, -1] = -0.2
+            diagnostics = dict(result.diagnostics)
+            diagnostics["test_uphill_injection"] = True
+            return result.__class__(
+                current_mo.dot(scipy.linalg.expm(generator)),
+                generator,
+                diagnostics,
+            )
+        return result
+
+    monkeypatch.setattr(
+        zmc_supercipt.IncrementalOrbitalDIIS,
+        "update",
+        uphill_update,
+    )
+    mc.supercipt(
+        use_diis=True,
+        diis_start_cycle=0,
+    )
+
+    rejected = [row for row in mc.supercipt_history if not row["accepted"]]
+    assert injected["done"]
+    assert len(rejected) == 1
+    assert rejected[0]["diis_rejection"]["reason"] == "energy-increase"
+    assert mc.supercipt_diagnostics["diis_energy_safeguard"]
+    assert mc.supercipt_diagnostics["diis_rejected_steps"] == 1
+    assert mc.supercipt_diagnostics["last_step_scale"] is None
+    rejected_index = mc.supercipt_history.index(rejected[0])
+    assert rejected_index == len(mc.supercipt_history) - 2
+    assert len(mc.supercipt_history) == mc.max_cycle_macro + 1
+    assert mc.supercipt_history[rejected_index + 1]["accepted"]
+    assert (
+        mc.supercipt_history[rejected_index + 1]["total_energy"]
+        < rejected[0]["total_energy"]
+    )
+
+
+@pytest.mark.integration
+def test_supercipt_kramers_diis_preserves_time_reversal():
     mol = gto.M(
         atom="H 0 0 0",
         basis="6-31g",
@@ -697,13 +764,19 @@ def test_supercipt_kramers_diis_preserves_time_reversal():
     mc.state_average_([0.5, 0.5])
     mc.natorb = False
     mc.canonicalize_ = False
-    mc.max_cycle_macro = 20
+    mc.max_cycle_macro = 30
     mc.conv_tol = 1e-10
     mc.conv_tol_grad = 1e-7
     mc.max_stepsize = 0.1
     mc.verbose = 0
-    mc.supercipt(
+    converged, energy, final_mo = zmc_supercipt_new.mcscf_superci_pt(
+        mc,
+        mf,
         symm="kramers",
+        max_cycle=mc.max_cycle_macro,
+        conv_etol=mc.conv_tol,
+        conv_gtol=mc.conv_tol_grad,
+        max_step=mc.max_stepsize,
         use_diis=True,
         use_cderi=True,
     )
@@ -714,7 +787,9 @@ def test_supercipt_kramers_diis_preserves_time_reversal():
         mf.get_ovlp(),
         tolerance=1e-7,
     )
-    assert mc.converged
+    assert converged and mc.converged
+    assert energy == pytest.approx(mc.e_tot)
+    assert np.max(abs(final_mo - mc.mo_coeff)) == 0.0
     assert mc.supercipt_diagnostics["kramers_restricted"]
     assert mc.supercipt_diagnostics["diis"]
     assert mc.supercipt_diagnostics["integrals"]["factorized"]
@@ -724,3 +799,92 @@ def test_supercipt_kramers_diis_preserves_time_reversal():
         row.get("diis", {}).get("extrapolated", False)
         for row in mc.supercipt_history
     )
+
+
+@pytest.mark.integration
+def test_cl_kramers_supercipt_incremental_diis_accelerates_convergence():
+    """Cl exposes gauge contamination in fixed-reference Super-CIPT DIIS."""
+    mol = gto.M(
+        atom="Cl 0 0 0",
+        basis="dyallv2z",
+        charge=-1,
+        spin=0,
+        verbose=0,
+        max_memory=4000,
+    )
+    mf = spinor_hf.KRHF(mol).x2camf(
+        with_gaunt=False,
+        with_breit=False,
+    ).cholesky(tau=1e-10)
+    mf.init_guess = "1e"
+    mf.conv_tol = 1e-12
+    mf.kernel()
+    assert mf.converged
+
+    initial_mo = mf.mo_coeff.copy()
+    mol.charge = 0
+    mol.spin = 1
+
+    def make_casscf():
+        mc = zmcscf.CASSCF(mf, ncas=6, nelecas=5)
+        mc.mo_coeff = initial_mo.copy()
+        mc.state_average_(np.ones(6) / 6)
+        mc.natorb = False
+        mc.canonicalize_ = False
+        mc.max_cycle_macro = 15
+        mc.max_stepsize = 0.1
+        mc.conv_tol = 1e-9
+        mc.conv_tol_grad = 1e-6
+        mc.verbose = 0
+        return mc
+
+    plain = make_casscf()
+    plain.supercipt(
+        symm="kramers",
+        use_cderi=True,
+        use_diis=False,
+    )
+
+    accelerated = make_casscf()
+    converged, energy, final_mo = zmc_supercipt_new.mcscf_superci_pt(
+        accelerated,
+        mf,
+        symm="kramers",
+        max_cycle=15,
+        conv_etol=accelerated.conv_tol,
+        conv_gtol=accelerated.conv_tol_grad,
+        max_step=accelerated.max_stepsize,
+        use_cderi=True,
+        use_diis=True,
+    )
+    mapping = identify_kramers_orbitals(
+        mol,
+        final_mo,
+        mf.get_ovlp(),
+        tolerance=1e-7,
+    )
+
+    full_superci = make_casscf()
+    full_superci.superci(symm="kramers", use_diis=True)
+
+    assert not plain.converged
+    assert converged and accelerated.converged
+    assert full_superci.converged
+    assert accelerated.final_orbital_gradient_norm <= accelerated.conv_tol_grad
+    assert accelerated.final_orbital_gradient_norm < plain.final_orbital_gradient_norm
+    assert abs(energy - (-460.8793608192712)) <= 1e-8
+    assert abs(energy - full_superci.e_tot) <= 1e-8
+    assert accelerated.supercipt_diagnostics[
+        "pt_core_virtual_canonicalization"
+    ] is False
+    assert any(
+        row.get("diis", {}).get("coordinate_system")
+        == "accumulated-incremental"
+        and row["diis"]["extrapolated"]
+        for row in accelerated.supercipt_history
+    )
+    assert any(
+        row.get("diis", {}).get("extrapolated", False)
+        for row in full_superci.macro_history
+    )
+    assert mapping.diagnostics["partner_orbital_error"] <= 1e-7

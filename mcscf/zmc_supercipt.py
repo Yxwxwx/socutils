@@ -24,7 +24,7 @@ from pyscf import lib
 from pyscf.lib import logger
 
 from socutils.mcscf import zmc_ao2mo
-from socutils.mcscf.orbital_diis import OrbitalDIIS
+from socutils.mcscf.orbital_diis import IncrementalOrbitalDIIS
 from socutils.mcscf.zmc_superci import (
     _ci_convergence_snapshot,
     _contract_dm2_gradient,
@@ -508,7 +508,7 @@ def mcscf_supercipt(
         generated_cderi = zmc_ao2mo.chunked_cholesky(mc.mol)
     orbital_diis = None
     if use_diis:
-        orbital_diis = OrbitalDIIS(
+        orbital_diis = IncrementalOrbitalDIIS(
             mo,
             mc._scf.get_ovlp(),
             space=diis_space,
@@ -522,6 +522,9 @@ def mcscf_supercipt(
     converged = False
     last_step = None
     last_integral_info = None
+    pending_diis_fallback = None
+    rejected_diis_steps = 0
+    terminal_fallback = False
     e_tot = e_cas = ci = casdm1 = casdm2 = quantities = None
 
     log.info("Super-CIPT optimizer (Guo-Dutta 2026), max cycles = %d", max_cycle)
@@ -532,8 +535,8 @@ def mcscf_supercipt(
         level_shift,
     )
     log.info(
-        "Super-CIPT core/virtual PT canonicalization is enabled "
-        "independently of canonicalize_"
+        "Super-CIPT core/virtual PT canonicalization = %s",
+        "disabled during incremental DIIS" if use_diis else "enabled",
     )
     log.info(
         "Super-CIPT Kramers = %s, DIIS = %s, integral selection = %s",
@@ -544,7 +547,13 @@ def mcscf_supercipt(
         ),
     )
 
-    for macro in range(max_cycle):
+    # Reserve one extra energy evaluation only when the final scheduled point
+    # is a rejected DIIS extrapolation.  This keeps the returned energy, RDMs,
+    # and orbitals on the accepted plain-PT fallback without granting another
+    # optimization step beyond ``max_cycle``.
+    for macro in range(max_cycle + 1):
+        if macro == max_cycle and not terminal_fallback:
+            break
         eris, integral_info = _build_eris(
             mc,
             mo,
@@ -586,6 +595,7 @@ def mcscf_supercipt(
             "ci_solver_converged": ci_converged,
             "ci_solver_diagnostics": _ci_convergence_snapshot(mc.fcisolver),
             "integrals": dict(integral_info),
+            "accepted": True,
             "converged": False,
         }
         history.append(entry)
@@ -597,6 +607,39 @@ def mcscf_supercipt(
             quantities.gradient_norm,
         )
 
+        energy_increase_tolerance = max(float(conv_tol), 1e-10)
+        if (
+            pending_diis_fallback is not None
+            and energy_change is not None
+            and energy_change > energy_increase_tolerance
+        ):
+            entry["accepted"] = False
+            entry["diis_rejection"] = {
+                "reason": "energy-increase",
+                "source_macro_iteration": pending_diis_fallback[
+                    "source_macro_iteration"
+                ],
+                "energy_increase": energy_change,
+                "tolerance": energy_increase_tolerance,
+            }
+            rejected_diis_steps += 1
+            log.warn(
+                "Rejecting extrapolated Super-CIPT DIIS step from macro %d: "
+                "energy increased by %.6g Eh; retrying its plain PT step",
+                pending_diis_fallback["source_macro_iteration"],
+                energy_change,
+            )
+            if callback is not None:
+                callback(dict(entry))
+            mo = pending_diis_fallback["plain_pt_mo"]
+            pending_diis_fallback = None
+            orbital_diis.reset()
+            last_step = None
+            terminal_fallback = macro + 1 == max_cycle
+            continue
+        pending_diis_fallback = None
+        terminal_fallback = False
+
         if (
             energy_change is not None
             and abs(energy_change) < conv_tol
@@ -607,7 +650,7 @@ def mcscf_supercipt(
             if callback is not None:
                 callback(dict(entry))
             break
-        if macro + 1 == max_cycle:
+        if macro + 1 >= max_cycle:
             if callback is not None:
                 callback(dict(entry))
             break
@@ -630,6 +673,8 @@ def mcscf_supercipt(
             kramers_mapping=kramers_mapping,
         )
         if use_diis:
+            plain_pt_mo = np.array(last_step.mo_coeff, copy=True)
+
             def project_generator(current_mo, generator):
                 screened = mc.unpack_uniq_var(mc.pack_uniq_var(generator))
                 if kramers:
@@ -652,18 +697,16 @@ def mcscf_supercipt(
                 step_metric="maximum",
                 projector=project_generator,
             )
-            mo_diis, canonical_energies = _canonicalize_core_virtual(
-                mc,
-                diis_result.mo_coeff,
-                casdm1,
-                kramers=kramers,
-            )
-            last_step.mo_coeff = mo_diis
+            last_step.mo_coeff = diis_result.mo_coeff
             last_step.kappa = diis_result.generator
             last_step.rotation = scipy.linalg.expm(diis_result.generator)
             last_step.scale = diis_result.diagnostics["step_scale"]
-            last_step.canonical_energies = canonical_energies
             entry["diis"] = diis_result.diagnostics
+            if diis_result.diagnostics["extrapolated"]:
+                pending_diis_fallback = {
+                    "source_macro_iteration": int(macro),
+                    "plain_pt_mo": plain_pt_mo,
+                }
         entry.update(
             {
                 "proposed_maximum_amplitude": last_step.maximum_amplitude,
@@ -711,11 +754,14 @@ def mcscf_supercipt(
         "denominator_tolerance": float(denominator_tol),
         "level_shift": float(level_shift),
         "maximum_step": float(max_stepsize),
-        "pt_core_virtual_canonicalization": True,
+        "pt_core_virtual_canonicalization": not use_diis,
         "integrals": dict(last_integral_info),
         "kramers_restricted": bool(kramers),
         "diis": bool(use_diis),
         "diis_space": int(diis_space) if use_diis else None,
+        "diis_energy_safeguard": bool(use_diis),
+        "diis_energy_increase_tolerance": max(float(conv_tol), 1e-10),
+        "diis_rejected_steps": int(rejected_diis_steps),
         "use_cderi": use_cderi,
         "last_step_scale": None if last_step is None else last_step.scale,
     }

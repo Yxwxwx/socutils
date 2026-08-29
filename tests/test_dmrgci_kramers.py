@@ -525,7 +525,7 @@ def _kramers_casscf(mf, initial_mo, fcisolver=None):
     # zero-core one-electron gate and is disabled independently.
     mc.natorb = True
     mc.canonicalize_ = False
-    mc.max_cycle_macro = 20
+    mc.max_cycle_macro = 30
     mc.conv_tol = 1e-10
     mc.conv_tol_grad = 1e-7
     mc.max_stepsize = 0.1
@@ -588,6 +588,13 @@ def test_kramers_supercipt_diis_dmrg_matches_exact(tmp_path):
     assert dmrg.fcisolver.kramers_diagnostics[
         "raw_ensemble_residual"
     ] <= 1e-8
+    assert (
+        dmrg.fcisolver.convergence_info["block2_sweep_tolerance"]
+        == dmrg.fcisolver.tol
+    )
+    assert dmrg.fcisolver.convergence_info[
+        "minimal_multiroot_restart_fallback"
+    ]
     dmrg.fcisolver.close()
 
 

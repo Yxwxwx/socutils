@@ -305,9 +305,10 @@ def test_casscf_restart_reuses_only_compatible_internal_mps(
         "fresh-driver-mps-reload"
     )
     assert solver.convergence_info["schedule"]["restart"]
-    assert solver.convergence_info["schedule"]["n_sweeps"] == 8
+    assert solver.convergence_info["schedule"]["n_sweeps"] == 10
+    assert solver.convergence_info["restart_site_conversion_sweeps"] == 2
     assert solver.convergence_info["block2_sweep_tolerance"] == 0.0
-    assert solver.convergence_info["sweeps"] == 8
+    assert solver.convergence_info["sweeps"] == 10
     assert solver._multi_mps.dot == 1
     assert np.array_equal(reorder0, [2, 0, 1])
     assert np.array_equal(solver.driver.reorder_idx, reorder0)
@@ -342,11 +343,30 @@ def test_multiroot_checkpoint_resume_and_fingerprint_gate(tmp_path):
         "orbital_reordering"
     ]
     assert (checkpoint / "mps" / "GS-mps_info.bin").is_file()
+    assert first._multi_mps.dot == 1
     # A killed process leaves status=running; the last completed sweep is
     # nevertheless a valid pyblock2 restart image.
     manifest["status"] = "running"
     manifest_path.write_text(json.dumps(manifest))
     first.close()
+
+    from pyblock2.driver.core import DMRGDriver, SymmetryTypes
+
+    checkpoint_driver = DMRGDriver(
+        stack_mem=256_000_000,
+        scratch=str(checkpoint / "mps"),
+        clean_scratch=False,
+        symm_type=SymmetryTypes.SGFCPX,
+        n_threads=1,
+    )
+    checkpoint_driver.initialize_system(
+        n_sites=3,
+        n_elec=1,
+        orb_sym=[0] * 3,
+    )
+    checkpoint_state = checkpoint_driver.load_mps("GS", nroots=2)
+    assert checkpoint_state.dot == 1
+    del checkpoint_state, checkpoint_driver
 
     resumed = DMRGCI().init(
         ncas=3,
@@ -396,6 +416,71 @@ def test_multiroot_checkpoint_resume_and_fingerprint_gate(tmp_path):
     with np.testing.assert_raises_regex(ValueError, "fingerprint"):
         mismatched.kernel(h1_mismatch, eri, 3, 1, verbose=0)
     mismatched.close()
+
+
+def test_legacy_twosite_checkpoint_is_converted_before_restart(
+    tmp_path,
+    monkeypatch,
+):
+    """Old sweep checkpoints need a real 2-site to 1-site transition."""
+    h1 = np.diag([-1.3, -0.4, 0.8]).astype(complex)
+    eri = np.zeros((3,) * 4, dtype=complex)
+    checkpoint = tmp_path / "checkpoint"
+
+    original_save = DMRGCI._save_final_checkpoint_mps
+    monkeypatch.setattr(
+        DMRGCI,
+        "_save_final_checkpoint_mps",
+        lambda self, ket: None,
+    )
+    first = DMRGCI().init(
+        ncas=3,
+        nelecas=1,
+        nroots=2,
+        bond_dims=[8] * 8,
+        noises=[0.0] * 8,
+        thrds=[1e-14] * 8,
+        n_sweeps=8,
+        tol=1e-12,
+        scratch=tmp_path / "scratch-first",
+        checkpoint_dir=checkpoint,
+        n_threads=1,
+        stack_memory=256,
+        random_seed=2468,
+    )
+    energy0, _ = first.kernel(h1, eri, 3, 1, verbose=0)
+    first.close()
+    monkeypatch.setattr(
+        DMRGCI,
+        "_save_final_checkpoint_mps",
+        original_save,
+    )
+
+    resumed = DMRGCI().init(
+        ncas=3,
+        nelecas=1,
+        nroots=2,
+        bond_dims=[8] * 8,
+        noises=[0.0] * 8,
+        thrds=[1e-14] * 8,
+        n_sweeps=8,
+        tol=1e-12,
+        scratch=tmp_path / "scratch-resumed",
+        checkpoint_dir=checkpoint,
+        resume=True,
+        n_threads=1,
+        stack_memory=256,
+        random_seed=2468,
+    )
+    energy1, _ = resumed.kernel(h1, eri, 3, 1, verbose=0)
+
+    assert np.max(abs(energy1 - energy0)) <= ENERGY_TOL
+    assert resumed.convergence_info["restart_site_conversion_sweeps"] == 2
+    assert resumed.convergence_info["schedule"]["n_sweeps"] == 10
+    assert resumed.convergence_info["schedule"]["twosite_to_onesite"] == 2
+    assert resumed.convergence_info["root_orthogonality_error"] <= 1e-7
+    assert resumed._multi_mps.dot == 1
+    resumed.close()
 
 
 def _complex_hamiltonians():

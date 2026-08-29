@@ -76,11 +76,11 @@ time-reversal tangent space::
 
    mc.superci(use_diis=True, symm='kramers')
 
-DIIS extrapolates unitary orbital transformations in one fixed reference
-frame.  Every extrapolated step is screened through the normal frozen/irrep
-mask and, in Kramers mode, through the actual AO time-reversal map.  Partner
-orbitals therefore need not be adjacent.  For ``kernel()``-style input, set
-``mc.superci_diis = True`` and, when needed,
+Full Super-CI DIIS extrapolates unitary orbital transformations in one fixed
+reference frame.  Every extrapolated step is screened through the normal
+frozen/irrep mask and, in Kramers mode, through the actual AO time-reversal
+map.  Partner orbitals therefore need not be adjacent.  For ``kernel()``-style
+input, set ``mc.superci_diis = True`` and, when needed,
 ``mc.orbital_symmetry = 'kramers'``.  Shared controls are
 ``orbital_diis_space=15``, ``orbital_diis_start_cycle=3`` and
 ``orbital_diis_start_gradient=0.02``.
@@ -190,6 +190,16 @@ permutation is registered on the driver after the sweep and MultiMPS split,
 so all normal and transition RDMs exposed to PySCF retain the original active-
 spinor indices.  Warm starts and disk resumes preserve the prior MPS site
 ordering even if the newly evaluated Fiedler proposal changes.
+The completed checkpoint is explicitly overwritten with the final canonical
+one-site MultiMPS.  When resuming an older checkpoint whose saved metadata is
+still two-site, the solver first performs two genuine two-site conversion
+sweeps and only then runs the configured one-site restart sweeps; it never
+relabels a two-site tensor image as one-site.
+Restart sweeps use ``tol=0`` so the configured count is completed.  The sole
+exception is a multi-root active space with at most two sites: Block2 has no
+interior one-site tensor there and cannot safely perform repeated direction
+changes, so that exact, negligible-cost edge case is solved cold instead of
+loading a one-site warm start.
 Scratch paths, checkpoint policy, thread count, and stack memory remain
 machine- and job-specific input options.
 
@@ -236,10 +246,14 @@ removed by canonical orthogonalization.  The three paper blocks
 rotation, whose largest matrix element is capped by ``max_stepsize`` before
 applying ``C <- C exp(kappa)``.
 
-The Dyall denominators require canonical core and virtual blocks.  Super-CIPT
-therefore performs this internal canonicalization after every orbital step,
-even when ``mc.canonicalize_`` is ``False``; that flag retains its normal
-meaning for the other CASSCF optimizer and finalization paths.
+Without DIIS, Super-CIPT semicanonicalizes the redundant core and virtual
+blocks after every orbital step, independently of ``mc.canonicalize_``.  With
+DIIS, it follows the contributed algorithm instead: local perturbative steps
+are accumulated and Pulay-extrapolated in one incremental coordinate system,
+and no intervening core/virtual re-gauging is applied.  Mixing those redundant
+gauge rotations into a fixed-reference DIIS history is unstable for atomic Cl.
+The usual HF or previously semicanonicalized starting orbitals are therefore
+recommended for the DIIS path.
 
 Super-CIPT uses the common CASSCF attributes ``max_cycle_macro``,
 ``max_stepsize``, ``conv_tol``, and ``conv_tol_grad``.  Its additional
@@ -270,8 +284,15 @@ The explicit ``symm='kramers'`` is mandatory when DIIS is enabled on a KRHF
 reference or Kramers-adapted active-space solver.  Without DIIS, Kramers mode
 is detected automatically.  The implementation identifies partner indices
 and phases from ``C.H @ S @ Theta(C)``, projects every orbital generator, and
-uses a quaternion eigensolve for the required core/virtual
-semicanonicalization.
+uses a quaternion eigensolve whenever core/virtual semicanonicalization is
+requested.  Super-CIPT DIIS uses the perturbative correction itself as the
+Pulay residual; full Super-CI retains its fixed-reference gradient DIIS.
+Each extrapolated Super-CIPT step is accepted only after the next CASCI energy
+evaluation.  An uphill extrapolation is recorded as rejected, the Pulay
+history is reset, and the optimizer evaluates the ordinary perturbative step
+from the same source orbitals instead.  If this happens at the cycle limit,
+one terminal energy evaluation is reserved for that fallback so the returned
+energy, RDMs, and orbitals describe the same accepted point.
 
 ``max_stepsize`` is an upper bound, not an acceleration factor.  If the
 reported ``max(raw)`` is already much smaller than ``max_stepsize``, increasing
