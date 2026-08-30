@@ -136,7 +136,7 @@ historical authorship attribution in `mcscf/zmc_supercipt.py`.
 | eq. 24 | direct inactive--virtual denominator | `G[a,i] / (f[i,i]-f[a,a])` |
 | eq. 25 | `compute_k_it` | hole-metric/addition eigenvectors and `f[i,i]-epsilon_add` |
 | eq. 26 | `compute_k_ta` | density-metric/removal eigenvectors and `epsilon_remove-f[a,a]` |
-| eq. 27 | `expm(kappa)` | anti-Hermitian `kappa`, maximum-element cap, then `C @ scipy.linalg.expm(kappa)` |
+| eq. 27 | `expm(kappa)` | anti-Hermitian `kappa`, Frobenius-norm hard cap, then `C @ scipy.linalg.expm(kappa)` |
 
 The two-RDM contribution is explicitly
 
@@ -165,7 +165,11 @@ condition.
 `CASSCF.superci()` still invoke the pre-existing full Super-CI/Davidson
 optimizer.  Super-CIPT reuses `_ERIS`/`_CDERIS`, current Cholesky JK and
 two-RDM contractions, the common exact/DMRG solver contract, callbacks,
-logging, convergence snapshots, and core/virtual subspace canonicalization.
+logging, convergence snapshots, and a temporary core/virtual semicanonical
+frame for the perturbative solve.
+The public driver leaves orbital DIIS disabled unless explicitly requested and
+infers both Kramers mode and the full/factorized integral route from the
+SCF/solver objects, so the conservative input is simply `mc.supercipt()`.
 
 ## Complex-spinor formula audit
 
@@ -193,10 +197,13 @@ index mapping:
   the complete unscaled anti-Hermitian orbital step to `1.5e-15`.
 
 The Dyall denominators require canonical inactive and virtual orbital blocks.
-This is now an internal Super-CIPT invariant and is not
-disabled by `mc.canonicalize_ = False` (as used by the production DMRG-SCF
-input).  A regression explicitly verifies both Fock blocks after an update
-even when that public flag is false.
+At every PT solve, Super-CIPT therefore constructs a temporary
+semicanonical frame, solves the response there, and transforms only the
+physical interspace generator back to the input gauge.  It does not apply the
+redundant core/core or virtual/virtual gauge rotation to the actual MOs.  This
+internal operation is not disabled by `mc.canonicalize_ = False` (as used by
+the production DMRG-SCF input), and regressions verify both the temporary
+Fock-block diagonalization and gauge covariance.
 
 ## Orbital-optimization validation ladder
 
@@ -282,23 +289,32 @@ change was at most `3.6e-13` Eh and discarded weights were about `2e-19`.
 Before changing the orbitals, the supplied `dyallv3z` CAS(7,16) input was also
 repeated with exact CI, ordinary Block2, and Kramers-restricted Block2:
 
-| active-space solver | state-average energy (Eh) | orbital-gradient norm |
+| active-space solver | state-average energy (Eh) | expanded anti-Hermitian `||g||_F` |
 | --- | ---: | ---: |
 | exact CI | -460.68847025593357 | 1.261241809277e-1 |
 | general Block2, `M=1000` | -460.68847025593357 | 1.261241809467e-1 |
 | Kramers Block2, `M=1000` | -460.68847025593540 | 1.261241809343e-1 |
 
-All three calculations retain four degenerate lower roots and two degenerate
-upper roots.  The ordinary and Kramers DMRG paths therefore agree with exact
+These values predate the packed-gradient logging convention.  For this
+screened, purely off-diagonal anti-Hermitian gradient, the packed
+independent-variable norm is `||g||_F/sqrt(2)`.  At the current formal
+exact-CI starting point, the packed and corresponding expanded Frobenius
+norms are `0.0891832303193` and `0.126124133854`, respectively; the older
+points tabulated above differ slightly.  All three calculations retain
+four degenerate lower roots and two degenerate upper roots.  The ordinary and
+Kramers DMRG paths therefore agree with exact
 CI to roughly `2e-12` Eh, while their gradients agree to better than
 `2e-11`.  The Kramers calculation uses `spinor_hf.KRHF`; orbitals from the
 general `spinor_hf.SCF` have the correct Kramers-complete subspace but can be
 arbitrary mixtures inside degenerate manifolds, so merely appending
 `kramers_restricted()` does not provide phase-resolved partner columns.
 
-The corrected Super-CIPT trajectory is:
+The following corrected-equation trajectory is an earlier diagnostic, before
+the current packed-gradient logging and temporary-frame gauge refactor.  It is
+retained to document the plateau, not presented as the current formal
+trajectory:
 
-| macro | energy (Eh) | energy change (Eh) | gradient norm | largest raw rotation | minimum denominator (Eh) |
+| macro | energy (Eh) | energy change (Eh) | expanded `||g||_F` | largest raw rotation | minimum denominator (Eh) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0 | -460.688470255946 | --- | 1.26124e-1 | 1.27569e-2 | 1.09954 |
 | 1 | -460.692149112103 | -3.67886e-3 | 4.01975e-2 | 2.34394e-3 | 1.09591 |
@@ -311,26 +327,28 @@ The corrected Super-CIPT trajectory is:
 Both Koopmans metrics remained full rank (`16/16`), every minimum
 denominator stayed above `1.09` Eh, and no step was capped by
 `max_stepsize=0.2`.  The six roots retained the expected four-plus-two
-degeneracy.  Thus this plateau is not caused by DMRG convergence, root
-collapse, a null metric, an intruder denominator, or trust-radius rejection.
+degeneracy.  Thus the evidence is inconsistent with DMRG nonconvergence, root
+collapse, a null metric, an intruder denominator, or trust-radius rejection
+being the primary cause of this plateau.
 Increasing `max_stepsize` cannot enlarge these raw PT steps because the option
 is only an upper bound.
 
 For comparison, the already validated full Super-CI calculation from the
 same orbitals continues to `-460.718244584615` Eh in 20 energy evaluations.
-Its orbital-step Frobenius norm is capped at `0.2` through macro 13, whereas
+Its orbital-step Frobenius norm is capped at `0.2` for updates 0--12, whereas
 the CAS(7,16)-spinor Super-CIPT raw steps quickly fall to about `1e-3` per
-matrix element.  The expanded active space therefore requires substantial
-active/external orbital reselection, but the first-order Dyall update moves
-through that region very conservatively.  This is an optimizer/basin issue,
-not evidence for a remaining tensor-formula or DMRG error.
+matrix element.  Full Super-CI therefore takes large active/external orbital
+steps over the same early region while the first-order Dyall update remains
+conservative.  The available evidence is
+consistent with an optimizer/basin limitation; it is not an absolute proof
+that every possible formula or DMRG error has been excluded.
 
 The paper's notation must be read carefully: 2C-CAS(7,4) contains eight
 spinors, not 16.  An exact-CI Cl calculation at that paper-sized active space
 with the same strict `energy AND gradient` stopping rule converged
 monotonically in 28 energy evaluations:
 
-| macro | energy (Eh) | gradient norm | largest raw rotation |
+| macro | energy (Eh) | expanded `||g||_F` | largest raw rotation |
 | ---: | ---: | ---: | ---: |
 | 0 | -460.630368616465 | 3.42170e-1 | 7.91559e-2 |
 | 1 | -460.678627486011 | 1.02938e-1 | 8.50441e-3 |
@@ -339,27 +357,27 @@ monotonically in 28 energy evaluations:
 | 20 | -460.680019822513 | 2.84718e-4 | 8.89646e-6 |
 | 27 | -460.680019852324 | 8.94578e-5 | --- |
 
-This exact-CI control proves that the long, roughly linear tail is not a DMRG
-artifact.  The historical reference's `energy OR gradient` test would have
+This smaller CAS(7e,8-spinor) exact-CI control shows that such a long, roughly
+linear tail can occur without DMRG; it does not by itself prove the cause of
+the CAS(7,16) trajectory.  The historical reference's `energy OR gradient`
+test would have
 stopped this trajectory at macro 21 when `|dE| = 9.32e-9`, despite a gradient
 of `2.41e-4`; the corrected implementation intentionally waits for both
 tests.
 
-Finally, disabling core/virtual semicanonicalization in the non-DIIS path was
-tested as an ablation.  At macro 3 its energy differed from the corrected
-trajectory by only `9.8e-9` Eh and its gradient by `6.3e-6`.
-Semicanonicalization remains enabled for the ordinary PT trajectory.  The
-incremental-DIIS path is the deliberate exception: re-gauging the redundant
-blocks between Pulay vectors is less stable than retaining the accumulated
-perturbative coordinates.
+An earlier implementation also disabled actual core/virtual
+semicanonicalization as an ablation.  At macro 3 its energy differed by only
+`9.8e-9 Eh` and its expanded gradient norm by `6.3e-6`.  The current
+implementation supersedes both choices: it always uses a temporary PT frame
+and maps the interspace generator back without re-gauging the actual MOs.
 
-A production-size Kramers/Block2 check then enabled incremental DIIS,
-factorized integrals, `M=1000`, a `1e-16` final Davidson squared residual, and
-eight forced one-site restart sweeps on the same Cl CAS(7,16) problem.  It
-demonstrated why extrapolation must be accepted only after evaluating its
-energy:
+A historical production-size Kramers/Block2 check from the contributed
+incremental-DIIS implementation used factorized integrals, `M=1000`, a
+`1e-16` final Davidson squared residual, and eight forced one-site restart
+sweeps on the same Cl CAS(7,16) problem.  It demonstrated why extrapolation
+must be accepted only after evaluating its energy:
 
-| macro | event | energy (Eh) | change from last accepted point (Eh) | gradient norm |
+| macro | event | energy (Eh) | change from last accepted point (Eh) | expanded `||g||_F` |
 | ---: | --- | ---: | ---: | ---: |
 | 6 | accepted DIIS source | -460.692664647244 | -4.62008e-5 | 1.98184e-2 |
 | 7 | rejected extrapolation | -460.692526779154 | +1.37868e-4 | 1.98830e-2 |
@@ -369,16 +387,33 @@ energy:
 | 11 | rejected extrapolation candidate | -460.692066953996 | +7.49996e-4 | 2.01300e-2 |
 
 After the first rejection, the ordinary fallback returned immediately to the
-monotone PT trajectory and DIIS rebuilt its history from that accepted point.
-The second candidate exposed the cycle-limit edge case: the current loop
-reserves one extra energy-only evaluation for the plain fallback when the
-last scheduled point is rejected.  The macro-11 value was captured by the
-diagnostic that exposed that edge and is classified in the table by the
-current acceptance rule.  A dedicated terminal-cycle regression injects the
-same situation and checks that the returned orbitals, energy, and RDMs all
-belong to the accepted fallback.  This short production diagnostic
-does not claim CAS(7,16) convergence; it establishes that acceleration cannot
-silently replace the variational trajectory with the higher-energy basin.
+monotone PT trajectory.  That run motivated the current transactional rule:
+an extrapolation is accepted only after its CI energy is evaluated, and a
+terminal rejection must restore mutually consistent orbitals, energy, CI and
+RDMs.  Dedicated unit regressions cover that bookkeeping.  The table is not a
+validation of the current fixed-reference Anderson algorithm and does not
+claim CAS(7,16) convergence.
+
+### Formal 20-evaluation comparison
+
+The completed formal comparison is intentionally small because the exact-CI
+gate failed before a production DMRG acceleration run was justified:
+
+| route | CI solver | evaluations | final energy (Eh) | packed `|g|` | result |
+| --- | --- | ---: | ---: | ---: | --- |
+| full Super-CI | Block2, `M=1000` | 20 | -460.718244584615036 | 2.159e-5 | converged |
+| boundary spectral-CG Super-CIPT | exact CI | 20 | -460.700017470244916 | 1.4623198e-2 | not converged |
+
+The spectral-CG energy remains `18.227114 mEh` above the reference and its
+gradient is about 146 times the `1e-4` threshold.  Its 19 successive energy
+changes were negative, documenting a monotone trajectory and consistent
+bookkeeping; rejected-step rollback is covered by unit tests rather than this
+formal run.  Anderson, forced-boundary, PT-trust and PT-seeded L-BFGS jobs
+were cancelled during diagnosis.  Their partial logs, some of which predate
+later fixes, are not current-code convergence validation.  No accelerated
+Block2 trajectory was completed.  Full details and the limitations of the
+retained logs are recorded in
+`tests/supercipt_debug/README.md`.
 
 ## Commands and scope boundary
 
@@ -392,26 +427,25 @@ make PYTHON=.venv/bin/python test
 
 `tests/test_supercipt.py` independently covers the metric eigensolver, complex
 CASCI finite-difference gradients, explicit many-body Koopmans commutators,
-exact `(N-1)/(N+1)` spectra, direct eq. 24--26 resolvents, non-DIIS PT
-canonicalization, fixed energy/RDM/first-step agreement, all-block
+exact `(N-1)/(N+1)` spectra, direct eq. 24--26 resolvents, the temporary PT
+semicanonical frame and redundant-gauge covariance, fixed
+energy/RDM/first-step agreement, all-block
 exact/Block2 macroiterations, the six-root historical endpoint, projectors,
 occupations, Kramers projection, orbital DIIS, and factorized-integral
 selection.
 
-The later ``note/to_Dutta`` contribution added Kramers and orbital-DIIS ideas.
-They were merged into the validated equations rather than replacing the
-current CASCI/CASSCF stack.  Kramers partners are now inferred from the AO
-time-reversal map instead of adjacent indices; every raw and DIIS-extrapolated
-generator is projected, and non-DIIS PT core/virtual blocks are diagonalized
-in a phase-resolved quaternion basis.  Super-CIPT follows the contribution's
-accumulated-incremental Pulay coordinates and perturbative-step residual;
-full Super-CI uses fixed-reference unitary/gradient DIIS.  This distinction is
-required by the Cl regression: fixed-reference Super-CIPT DIIS moved the
-gradient from about ``0.004`` back above ``0.1``, whereas incremental DIIS
-converges the Kramers Cl/dyallv2z CAS(5,6) regression in 10 macroiterations
-and preserves time-reversal closure.  Small exact and Block2 state-averaged
-tests reach the same Kramers-restricted endpoint; the separate dyallv3z
-CAS(7,16) diagnostic above exercises the extrapolation safeguard at production
-DMRG settings.
+The later ``note/to_Dutta`` contribution supplied useful Kramers and orbital
+DIIS ideas.  Kramers partners are now inferred from the AO time-reversal map
+instead of adjacent indices; every raw and DIIS-extrapolated generator is
+projected, and the temporary PT core/virtual blocks use a phase-resolved
+quaternion diagonalization.  The current optional DIIS is not the historical
+incremental implementation: it uses fixed-reference unitary-log coordinates,
+a fixed-point residual `theta_PT_trial - theta_current` in that reference
+frame, coefficient/conditioning safeguards, a gradient descent test, and an
+evaluated-energy rollback.  `IncrementalOrbitalDIIS` remains only as a
+compatibility alias.  The contributed Kramers Cl/dyallv2z CAS(5,6)
+10-macroiteration result is therefore historical evidence, not a convergence
+claim for the current Anderson path.  Small exact and Block2 state-averaged
+tests continue to check the common Kramers-restricted endpoint.
 
 Milestone commit message: `mcscf: port validated Super-CIPT optimizer to block2`.

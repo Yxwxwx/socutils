@@ -541,7 +541,7 @@ def test_kramers_superci_orbital_diis_preserves_pairs():
     mol, mf, initial_mo = _tilted_h_kramers_reference()
     mc = _kramers_casscf(mf, initial_mo)
     mc.natorb = False
-    mc.superci(symm="kramers", use_diis=True)
+    mc.superci(use_diis=True)
 
     mapping = identify_kramers_orbitals(
         mol,
@@ -569,14 +569,14 @@ def test_kramers_supercipt_diis_dmrg_matches_exact(tmp_path):
     mol, mf, initial_mo = _tilted_h_kramers_reference()
     exact = _kramers_casscf(mf, initial_mo)
     exact.natorb = False
-    exact.supercipt(symm="kramers", use_diis=True, use_cderi=True)
+    exact.supercipt(use_diis=True)
 
     base_solver = _dmrg_solver(tmp_path, 2, 1, 2, mol=mol)
     base_solver.kramers_restricted()
     dmrg = _kramers_casscf(mf, initial_mo, base_solver)
     dmrg.natorb = False
     dmrg.callback = dmrg.fcisolver.restart_scheduler_()
-    dmrg.supercipt(symm="kramers", use_diis=True, use_cderi=True)
+    dmrg.supercipt(use_diis=True)
 
     assert exact.converged and dmrg.converged and dmrg.fcisolver.converged
     assert abs(dmrg.e_tot - exact.e_tot) <= 1e-7

@@ -503,8 +503,8 @@ def _active_natural_orbitals(casscf, casdm1, mo_active):
     return _subspace_eigh(casscf, -casdm1, mo_active)
 
 
-def _resolve_kramers_mode(casscf, symm=None, *, use_diis=False):
-    """Resolve explicit/automatic Kramers mode and guard DIIS usage."""
+def _resolve_kramers_mode(casscf, symm=None):
+    """Infer Kramers mode from the reference or active-space solver."""
     from socutils.scf import spinor_hf
 
     if symm is not None:
@@ -514,11 +514,6 @@ def _resolve_kramers_mode(casscf, symm=None, *, use_diis=False):
     native = isinstance(casscf._scf, spinor_hf.KRHF) or getattr(
         casscf.fcisolver, "kramers_adapter", None
     ) is not None
-    if use_diis and native and symm != "kramers":
-        raise ValueError(
-            "symm='kramers' is required when DIIS is used with a "
-            "Kramers-restricted reference or active-space solver"
-        )
     return bool(native or symm == "kramers")
 
 
@@ -543,7 +538,15 @@ def _project_kramers_rotation(
     force=False,
     mapping=None,
 ):
-    """Project an orbital generator onto the time-reversal invariant space."""
+    """Project a generator onto the allowed Kramers-invariant tangent space.
+
+    The ordinary CASSCF mask can contain constraints beyond the
+    core/active/virtual partition (``frozen``, ``freeze_pair`` and ``irrep``).
+    Such a mask need not itself be closed under time reversal.  The admissible
+    KR tangent is therefore the intersection of the full anti-Hermitian support
+    with its time-reversed image.  This freezes the partner direction as well
+    when only one member of a Kramers-related rotation was excluded.
+    """
     from socutils.dmrg.kramers import time_reverse_one_body
     from socutils.scf import spinor_hf
 
@@ -576,24 +579,63 @@ def _project_kramers_rotation(
         time_reversal[second, first] = phase
         time_reversal[first, second] = -phase
 
+    nonzero = abs(time_reversal) > 0.0
+    if not (
+        np.all(np.count_nonzero(nonzero, axis=0) == 1)
+        and np.all(np.count_nonzero(nonzero, axis=1) == 1)
+    ):
+        raise RuntimeError(
+            "the Kramers orbital mapping is not a signed permutation"
+        )
+    partners = np.argmax(nonzero, axis=1)
+
+    # Build the complete support explicitly instead of calling pack_uniq_var:
+    # the latter invokes screen_irrep(), which mutates its matrix argument.
+    # ``uniq_var_indices`` is the authoritative lower-triangle mask and already
+    # includes frozen, freeze_pair and irrep restrictions.
+    nmo = generator.shape[0]
+    lower_allowed = np.asarray(
+        casscf.uniq_var_indices(nmo, ncore, casscf.ncas, casscf.frozen),
+        dtype=bool,
+    )
+    if lower_allowed.shape != generator.shape:
+        raise ValueError("orbital generator and allowed-variable mask disagree")
+    allowed_support = lower_allowed | lower_allowed.T
+    time_reversed_support = allowed_support[np.ix_(partners, partners)]
+    intersection_support = allowed_support & time_reversed_support
+
     input_residual = float(
         np.max(abs(generator - time_reverse_one_body(time_reversal, generator)))
     )
-    projected = (generator + time_reverse_one_body(time_reversal, generator)) * 0.5
+    # The intersection support is symmetric and invariant under time reversal,
+    # so support screening, anti-Hermitization and KR symmetrization commute.
+    # A final explicit screen removes only roundoff and cannot break KR.
+    screened = np.zeros_like(generator, dtype=np.complex128)
+    screened[intersection_support] = generator[intersection_support]
+    screened = (screened - screened.T.conj()) * 0.5
+    projected = (
+        screened + time_reverse_one_body(time_reversal, screened)
+    ) * 0.5
     projected = (projected - projected.T.conj()) * 0.5
-    # Remove any redundant within-space elements after projection.  Because
-    # every Kramers pair lies wholly inside one orbital space, this mask
-    # commutes with time reversal.
-    projected = casscf.unpack_uniq_var(casscf.pack_uniq_var(projected))
-    projected = (projected + time_reverse_one_body(time_reversal, projected)) * 0.5
-    projected = (projected - projected.T.conj()) * 0.5
+    projected[~intersection_support] = 0.0
     output_residual = float(
         np.max(abs(projected - time_reverse_one_body(time_reversal, projected)))
+    )
+    forbidden_residual = float(
+        np.max(abs(projected[~intersection_support]), initial=0.0)
     )
     return projected, {
         "input_generator_residual": input_residual,
         "output_generator_residual": output_residual,
         "projection_change_norm": float(norm(projected - generator)),
+        "allowed_support_size": int(np.count_nonzero(allowed_support)),
+        "intersection_support_size": int(
+            np.count_nonzero(intersection_support)
+        ),
+        "support_directions_removed_by_kramers": int(
+            np.count_nonzero(allowed_support & ~intersection_support)
+        ),
+        "forbidden_support_residual": forbidden_residual,
         "orbital_closure_before_step": mapping.diagnostics["subspace_closure_error"],
         "orbital_partner_error_before_step": mapping.diagnostics[
             "partner_orbital_error"
@@ -957,9 +999,15 @@ def mcscf_superci(
 
     if solver not in ("davidson", "gmres"):
         raise ValueError("Super-CI solver must be 'davidson' or 'gmres'")
+    if use_diis and mc.natorb:
+        log.warn(
+            "Super-CI orbital DIIS is disabled because natorb=True changes "
+            "the active-orbital gauge at every macroiteration"
+        )
+        use_diis = False
     if use_diis and bfgs:
         raise ValueError("Super-CI DIIS and BFGS acceleration are mutually exclusive")
-    kramers = _resolve_kramers_mode(mc, symm, use_diis=use_diis)
+    kramers = _resolve_kramers_mode(mc, symm)
     orbital_diis = None
     if use_diis:
         orbital_diis = OrbitalDIIS(

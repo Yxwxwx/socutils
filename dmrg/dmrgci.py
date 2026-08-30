@@ -59,10 +59,7 @@ def _expand_schedule(anchor_sweeps, values, n_sweeps):
     expanded = []
     anchor = 0
     for sweep in range(n_sweeps):
-        while (
-            anchor + 1 < len(anchor_sweeps)
-            and anchor_sweeps[anchor + 1] <= sweep
-        ):
+        while anchor + 1 < len(anchor_sweeps) and anchor_sweeps[anchor + 1] <= sweep:
             anchor += 1
         expanded.append(values[anchor])
     return tuple(expanded)
@@ -104,24 +101,16 @@ def pyscf_dmrg_schedule(
         raise ValueError("restart_sweeps must be at least two")
     if noise_scale < 0.0 or not numpy.isfinite(noise_scale):
         raise ValueError("noise_scale must be finite and nonnegative")
-    if (
-        max_davidson_threshold is not None
-        and (
-            max_davidson_threshold <= 0.0
-            or not numpy.isfinite(max_davidson_threshold)
-        )
+    if max_davidson_threshold is not None and (
+        max_davidson_threshold <= 0.0 or not numpy.isfinite(max_davidson_threshold)
     ):
-        raise ValueError(
-            "max_davidson_threshold must be finite and positive"
-        )
+        raise ValueError("max_davidson_threshold must be finite and positive")
 
     if restart:
         anchor_sweeps = (0,)
         anchor_bond_dims = (max_bond_dimension,)
         final_thrd = (
-            tol / 10.0
-            if max_davidson_threshold is None
-            else max_davidson_threshold
+            tol / 10.0 if max_davidson_threshold is None else max_davidson_threshold
         )
         anchor_thrds = (final_thrd,)
         anchor_noises = (0.0,)
@@ -186,9 +175,7 @@ def pyscf_dmrg_schedule(
             for stage in range(n_stages):
                 sweeps.append(sweep)
                 bond_dims.append(max_bond_dimension)
-                thrds.append(
-                    davidson_stages[min(stage, len(davidson_stages) - 1)]
-                )
+                thrds.append(davidson_stages[min(stage, len(davidson_stages) - 1)])
                 noises.append(noise_stages[min(stage, len(noise_stages) - 1)])
                 sweep += 2
 
@@ -204,9 +191,7 @@ def pyscf_dmrg_schedule(
         anchor_bond_dims=anchor_bond_dims,
         anchor_thrds=anchor_thrds,
         anchor_noises=anchor_noises,
-        bond_dims=_expand_schedule(
-            anchor_sweeps, anchor_bond_dims, n_sweeps
-        ),
+        bond_dims=_expand_schedule(anchor_sweeps, anchor_bond_dims, n_sweeps),
         thrds=_expand_schedule(anchor_sweeps, anchor_thrds, n_sweeps),
         noises=_expand_schedule(anchor_sweeps, anchor_noises, n_sweeps),
         n_sweeps=n_sweeps,
@@ -227,8 +212,7 @@ def _convert_twosite_restart_schedule(schedule, conversion_sweeps=2):
         anchor_bond_dims=schedule.anchor_bond_dims,
         anchor_thrds=schedule.anchor_thrds,
         anchor_noises=schedule.anchor_noises,
-        bond_dims=(schedule.bond_dims[0],) * conversion_sweeps
-        + schedule.bond_dims,
+        bond_dims=(schedule.bond_dims[0],) * conversion_sweeps + schedule.bond_dims,
         thrds=(schedule.thrds[0],) * conversion_sweeps + schedule.thrds,
         noises=(0.0,) * conversion_sweeps + schedule.noises,
         n_sweeps=schedule.n_sweeps + conversion_sweeps,
@@ -445,6 +429,7 @@ class DMRGCI(StreamObject):
         self.kets = None
         self._multi_mps = None
         self._scratch = None
+        self._rdm1_cache = {}
         self._rdm_cache = {}
         self._mps_signature = None
         self.e_tot = None
@@ -517,16 +502,12 @@ class DMRGCI(StreamObject):
         if tol is not None:
             self.tol = float(tol)
         if maxM is not None:
-            if (
-                max_bond_dimension is not None
-                and int(max_bond_dimension) != int(maxM)
-            ):
+            if max_bond_dimension is not None and int(max_bond_dimension) != int(maxM):
                 raise ValueError("maxM and max_bond_dimension disagree")
             max_bond_dimension = maxM
         if startM is not None:
-            if (
-                start_bond_dimension is not None
-                and int(start_bond_dimension) != int(startM)
+            if start_bond_dimension is not None and int(start_bond_dimension) != int(
+                startM
             ):
                 raise ValueError("startM and start_bond_dimension disagree")
             start_bond_dimension = startM
@@ -542,8 +523,7 @@ class DMRGCI(StreamObject):
             self.schedule_thrd_max = float(schedule_thrd_max)
 
         explicit_controls = any(
-            value is not None
-            for value in (bond_dims, noises, thrds, n_sweeps)
+            value is not None for value in (bond_dims, noises, thrds, n_sweeps)
         )
         if schedule_mode is None:
             mode = "explicit" if explicit_controls else self.schedule_mode
@@ -584,11 +564,7 @@ class DMRGCI(StreamObject):
 
         if not self.bond_dims or not self.noises or not self.thrds:
             raise ValueError("bond_dims, noises, and thrds must be nonempty")
-        if (
-            min(self.bond_dims) <= 0
-            or min(self.noises) < 0
-            or min(self.thrds) <= 0
-        ):
+        if min(self.bond_dims) <= 0 or min(self.noises) < 0 or min(self.thrds) <= 0:
             raise ValueError("invalid DMRG sweep schedule")
 
         if restart is not None:
@@ -635,17 +611,11 @@ class DMRGCI(StreamObject):
         if self.n_sweeps <= 0 or self.tol <= 0:
             raise ValueError("n_sweeps and tol must be positive")
         if self.dmrg_switch_tol <= 0 or self.restart_sweeps <= 1:
-            raise ValueError(
-                "dmrg_switch_tol must be positive and restart_sweeps >= 2"
-            )
+            raise ValueError("dmrg_switch_tol must be positive and restart_sweeps >= 2")
         if self.schedule_noise_scale < 0.0:
             raise ValueError("schedule_noise_scale must be nonnegative")
-        if (
-            self.schedule_thrd_max is not None
-            and (
-                self.schedule_thrd_max <= 0.0
-                or not numpy.isfinite(self.schedule_thrd_max)
-            )
+        if self.schedule_thrd_max is not None and (
+            self.schedule_thrd_max <= 0.0 or not numpy.isfinite(self.schedule_thrd_max)
         ):
             raise ValueError("schedule_thrd_max must be finite and positive")
         if self.resume and self.checkpoint_dir is None:
@@ -725,29 +695,60 @@ class DMRGCI(StreamObject):
         return self.schedule_noises
 
     def restart_scheduler_step(self, environment):
-        """Update the next-kernel warm-start flag from one macroiteration."""
+        """Update the next-kernel warm-start flag from one macroiteration.
+
+        Traditional PySCF callbacks expose only a gradient and/or density
+        change, for which the historical gate is preserved.  Structured
+        socutils optimizer rows additionally describe whether the current
+        point was accepted and the outgoing orbital step.  A rejected point,
+        a failed CI solve, a terminal row, or a large/nonfinite outgoing step
+        must not seed the next Hamiltonian with a stale MPS.
+        """
         gradient = environment.get(
             "norm_gorb", environment.get("orbital_gradient_norm")
         )
         density_change = environment.get("norm_ddm")
+        orbital_step = environment.get("applied_orbital_step_norm")
         reasons = []
+        blockers = []
         if gradient is not None and numpy.isfinite(gradient):
             if float(gradient) < self.dmrg_switch_tol:
                 reasons.append("orbital_gradient")
         if density_change is not None and numpy.isfinite(density_change):
             if float(density_change) < 10.0 * self.dmrg_switch_tol:
                 reasons.append("density_change")
-        self._restart = bool(reasons)
+
+        structured = "accepted" in environment
+        step_tolerance = 10.0 * self.dmrg_switch_tol
+        if structured:
+            if not bool(environment.get("accepted")):
+                blockers.append("rejected_point")
+            if not bool(environment.get("ci_solver_converged", True)):
+                blockers.append("ci_not_converged")
+            if orbital_step is None:
+                blockers.append("no_outgoing_orbital_step")
+            elif not numpy.isfinite(orbital_step):
+                blockers.append("nonfinite_orbital_step")
+            elif float(orbital_step) >= step_tolerance:
+                blockers.append("orbital_step_too_large")
+            else:
+                reasons.append("orbital_step")
+
+        self._restart = bool(reasons) and not blockers
         self.restart_diagnostics = {
             "enabled_for_next_kernel": self._restart,
-            "orbital_gradient_norm": (
-                None if gradient is None else float(gradient)
-            ),
+            "orbital_gradient_norm": (None if gradient is None else float(gradient)),
             "density_change_norm": (
                 None if density_change is None else float(density_change)
             ),
+            "orbital_step_norm": (
+                None if orbital_step is None else float(orbital_step)
+            ),
             "switch_tolerance": self.dmrg_switch_tol,
+            "orbital_step_tolerance": step_tolerance,
+            "structured_callback": structured,
             "reasons": reasons,
+            "blockers": blockers,
         }
         if self._restart:
             logger.debug(
@@ -795,6 +796,7 @@ class DMRGCI(StreamObject):
         return self.kramers_adapter.set_orbitals(mol, mo_coeff, overlap)
 
     def _clear_results(self):
+        self._rdm1_cache.clear()
         self._rdm_cache.clear()
         self.rdm_diagnostics.clear()
         self.kramers_diagnostics.clear()
@@ -905,9 +907,7 @@ class DMRGCI(StreamObject):
             dtype=float,
         )
         if weights.shape != (nroots,) or not numpy.all(numpy.isfinite(weights)):
-            raise ValueError(
-                "state-average weights must be one finite value per root"
-            )
+            raise ValueError("state-average weights must be one finite value per root")
         if numpy.any(weights <= 0.0) or weights.sum() <= 0.0:
             raise ValueError("state-average weights must be positive")
         return weights / weights.sum()
@@ -922,9 +922,7 @@ class DMRGCI(StreamObject):
             tuple(float(value) for value in weights),
         )
 
-    def _checkpoint_problem(
-        self, h1e, eri, norb, nelec, nroots, weights, ecore
-    ):
+    def _checkpoint_problem(self, h1e, eri, norb, nelec, nroots, weights, ecore):
         structural = {
             "symmetry": "SGFCPX",
             "norb": int(norb),
@@ -1004,9 +1002,7 @@ class DMRGCI(StreamObject):
             raise ValueError("unsupported DMRG checkpoint format")
         stored = manifest.get("problem", {})
         if stored.get("hamiltonian_sha256") != problem["hamiltonian_sha256"]:
-            raise ValueError(
-                "DMRG checkpoint Hamiltonian fingerprint does not match"
-            )
+            raise ValueError("DMRG checkpoint Hamiltonian fingerprint does not match")
         info_paths = (
             os.path.join(mps_path, "GS-mps_info.bin"),
             os.path.join(mps_path, "mps_info.bin"),
@@ -1023,9 +1019,7 @@ class DMRGCI(StreamObject):
             return None, None
         previous = self._read_json(manifest_path)
         previous_structure = (
-            None
-            if previous is None
-            else previous.get("problem", {}).get("structural")
+            None if previous is None else previous.get("problem", {}).get("structural")
         )
         if previous_structure not in (None, problem["structural"]):
             if os.path.isdir(mps_path):
@@ -1035,9 +1029,7 @@ class DMRGCI(StreamObject):
         os.makedirs(mps_path, exist_ok=True)
         per_sweep = None
         if self.checkpoint_per_sweep:
-            per_sweep = os.path.join(
-                sweeps_path, problem["hamiltonian_sha256"]
-            )
+            per_sweep = os.path.join(sweeps_path, problem["hamiltonian_sha256"])
             os.makedirs(per_sweep, exist_ok=True)
         manifest = {
             "format": "socutils.dmrgci.checkpoint",
@@ -1048,9 +1040,7 @@ class DMRGCI(StreamObject):
             "run_mode": run_mode,
         }
         if reorder_idx is not None:
-            manifest["orbital_reordering"] = [
-                int(value) for value in reorder_idx
-            ]
+            manifest["orbital_reordering"] = [int(value) for value in reorder_idx]
         self._write_json_atomic(manifest_path, manifest)
         return mps_path, per_sweep
 
@@ -1080,9 +1070,7 @@ class DMRGCI(StreamObject):
         manifest = self._read_json(manifest_path)
         if manifest is None:
             return
-        manifest["orbital_reordering"] = [
-            int(value) for value in reorder_idx
-        ]
+        manifest["orbital_reordering"] = [int(value) for value in reorder_idx]
         self._write_json_atomic(manifest_path, manifest)
 
     def _save_final_checkpoint_mps(self, ket):
@@ -1174,9 +1162,7 @@ class DMRGCI(StreamObject):
         nroots = int(nroots)
         nelec = self._validate_problem(norb, nelec, nroots)
         weights = self._state_average_weights(nroots)
-        wavefunction_problem = self._wavefunction_problem(
-            norb, nelec, nroots, weights
-        )
+        wavefunction_problem = self._wavefunction_problem(norb, nelec, nroots, weights)
         effective_dav_type = self.dav_type
         h1_block2, eri_block2 = block2_integrals(h1e, eri, norb)
         ecore_value = _real_energy(ecore)
@@ -1196,9 +1182,7 @@ class DMRGCI(StreamObject):
         resume_checkpoint = bool(self.resume)
         resume_manifest = None
         if resume_checkpoint:
-            resume_manifest = self._load_checkpoint(
-                checkpoint_problem, required=True
-            )
+            resume_manifest = self._load_checkpoint(checkpoint_problem, required=True)
         restart_requested = bool(self.restart or self._restart)
         in_memory_compatible = bool(
             self.driver is not None
@@ -1206,9 +1190,7 @@ class DMRGCI(StreamObject):
             and self._mps_signature == wavefunction_problem
         )
         use_internal_mps = (
-            restart_requested
-            and in_memory_compatible
-            and not resume_checkpoint
+            restart_requested and in_memory_compatible and not resume_checkpoint
         )
         minimal_multiroot_restart_fallback = bool(
             use_internal_mps and nroots > 1 and int(norb) <= 2
@@ -1241,9 +1223,7 @@ class DMRGCI(StreamObject):
                     "resuming in the original active-orbital order",
                 )
             else:
-                preserved_reorder_idx = numpy.asarray(
-                    stored_reorder_idx, dtype=int
-                )
+                preserved_reorder_idx = numpy.asarray(stored_reorder_idx, dtype=int)
         if resume_checkpoint:
             run_mode = "checkpoint-resume"
         elif use_internal_mps:
@@ -1267,9 +1247,7 @@ class DMRGCI(StreamObject):
                 "validated internal MPS or a fingerprinted checkpoint",
             )
 
-        schedule = self._schedule_snapshot(
-            restart=run_mode != "cold-start"
-        )
+        schedule = self._schedule_snapshot(restart=run_mode != "cold-start")
         effective_twosite_to_onesite = schedule.twosite_to_onesite
         restart_site_conversion_sweeps = 0
         if (
@@ -1280,9 +1258,7 @@ class DMRGCI(StreamObject):
         ):
             # Retain two two-site sweeps for initial optimization and leave at
             # least one one-site sweep even for deliberately short schedules.
-            effective_twosite_to_onesite = (
-                2 if schedule.n_sweeps >= 3 else 0
-            )
+            effective_twosite_to_onesite = 2 if schedule.n_sweeps >= 3 else 0
 
         if run_mode == "cold-start":
             self._release_run(remove_scratch=True)
@@ -1334,38 +1310,27 @@ class DMRGCI(StreamObject):
                 orb_sym=[0] * int(norb),
             )
             fiedler_idx = numpy.asarray(
-                driver.orbital_reordering(
-                    numpy.abs(h1_block2), numpy.abs(eri_block2)
-                ),
+                driver.orbital_reordering(numpy.abs(h1_block2), numpy.abs(eri_block2)),
                 dtype=int,
             )
             expected_indices = numpy.arange(int(norb))
-            if (
-                fiedler_idx.shape != (int(norb),)
-                or not numpy.array_equal(
-                    numpy.sort(fiedler_idx), expected_indices
-                )
+            if fiedler_idx.shape != (int(norb),) or not numpy.array_equal(
+                numpy.sort(fiedler_idx), expected_indices
             ):
                 raise RuntimeError(
                     "Block2 returned an invalid orbital-reordering permutation"
                 )
             reorder_idx = (
-                fiedler_idx
-                if preserved_reorder_idx is None
-                else preserved_reorder_idx
+                fiedler_idx if preserved_reorder_idx is None else preserved_reorder_idx
             )
-            if (
-                reorder_idx.shape != (int(norb),)
-                or not numpy.array_equal(
-                    numpy.sort(reorder_idx), expected_indices
-                )
+            if reorder_idx.shape != (int(norb),) or not numpy.array_equal(
+                numpy.sort(reorder_idx), expected_indices
             ):
                 raise RuntimeError(
                     "stored DMRG orbital-reordering permutation is invalid"
                 )
-            if (
-                preserved_reorder_idx is not None
-                and not numpy.array_equal(fiedler_idx, reorder_idx)
+            if preserved_reorder_idx is not None and not numpy.array_equal(
+                fiedler_idx, reorder_idx
             ):
                 logger.new_logger(self, verbose).note(
                     "DMRG Fiedler proposal %s replaced by preserved restart "
@@ -1396,17 +1361,14 @@ class DMRGCI(StreamObject):
                 if int(ket.dot) != 1:
                     if int(ket.dot) != 2:
                         raise RuntimeError(
-                            "checkpoint MPS has unsupported site type %s"
-                            % ket.dot
+                            "checkpoint MPS has unsupported site type %s" % ket.dot
                         )
                     restart_site_conversion_sweeps = 2
                     schedule = _convert_twosite_restart_schedule(
                         schedule,
                         conversion_sweeps=restart_site_conversion_sweeps,
                     )
-                    effective_twosite_to_onesite = (
-                        restart_site_conversion_sweeps
-                    )
+                    effective_twosite_to_onesite = restart_site_conversion_sweeps
                     logger.warn(
                         self,
                         "loaded a two-site MPS; running %d conversion sweeps "
@@ -1482,14 +1444,10 @@ class DMRGCI(StreamObject):
                 self.root_overlap = numpy.empty(
                     (nroots, nroots), dtype=numpy.complex128
                 )
-                self.projected_hamiltonian = numpy.empty_like(
-                    self.root_overlap
-                )
+                self.projected_hamiltonian = numpy.empty_like(self.root_overlap)
                 for i in range(nroots):
                     for j in range(i, nroots):
-                        overlap_ij = driver.expectation(
-                            kets[i], identity_mpo, kets[j]
-                        )
+                        overlap_ij = driver.expectation(kets[i], identity_mpo, kets[j])
                         active_hamiltonian_ij = driver.expectation(
                             kets[i], mpo, kets[j]
                         )
@@ -1520,9 +1478,10 @@ class DMRGCI(StreamObject):
                     10.0 * math.sqrt(min(schedule.thrds)),
                     10.0 * self.tol,
                 )
-                if max(
-                    root_orthogonality_error, root_eigen_equation_error
-                ) > root_validation_tolerance:
+                if (
+                    max(root_orthogonality_error, root_eigen_equation_error)
+                    > root_validation_tolerance
+                ):
                     raise RuntimeError(
                         "split state-averaged MultiMPS roots are inconsistent "
                         "with the reported energies (S-I %.3e, H-SE %.3e); "
@@ -1552,9 +1511,7 @@ class DMRGCI(StreamObject):
                     "sweep_energy_origin": "active-space Hamiltonian without ecore",
                     "run_mode": run_mode,
                     "restart_transport": (
-                        None
-                        if run_mode == "cold-start"
-                        else "fresh-driver-mps-reload"
+                        None if run_mode == "cold-start" else "fresh-driver-mps-reload"
                     ),
                     "restart_requested": restart_requested,
                     "minimal_multiroot_restart_fallback": (
@@ -1564,14 +1521,10 @@ class DMRGCI(StreamObject):
                     "schedule": schedule.as_dict(),
                     "block2_sweep_tolerance": block2_sweep_tol,
                     "checkpoint_dir": self.checkpoint_dir,
-                    "checkpoint_fingerprint": checkpoint_problem[
-                        "hamiltonian_sha256"
-                    ],
+                    "checkpoint_fingerprint": checkpoint_problem["hamiltonian_sha256"],
                     "orbital_reordering": reorder_idx.tolist(),
                     "restart_scheduler": dict(self.restart_diagnostics),
-                    "restart_site_conversion_sweeps": (
-                        restart_site_conversion_sweeps
-                    ),
+                    "restart_site_conversion_sweeps": (restart_site_conversion_sweeps),
                 }
             )
             if nroots > 1:
@@ -1609,15 +1562,9 @@ class DMRGCI(StreamObject):
         else:
             energy_change = numpy.inf
         schedule_index = max(nsweep - 1, 0)
-        final_noise = schedule.noises[
-            min(schedule_index, len(schedule.noises) - 1)
-        ]
-        final_thrd = schedule.thrds[
-            min(schedule_index, len(schedule.thrds) - 1)
-        ]
-        discarded = numpy.asarray(
-            list(driver._dmrg.discarded_weights), dtype=float
-        )
+        final_noise = schedule.noises[min(schedule_index, len(schedule.noises) - 1)]
+        final_thrd = schedule.thrds[min(schedule_index, len(schedule.thrds) - 1)]
+        discarded = numpy.asarray(list(driver._dmrg.discarded_weights), dtype=float)
         final_discarded = float(discarded[-1]) if discarded.size else numpy.nan
         converged = bool(
             nsweep >= 2
@@ -1632,8 +1579,7 @@ class DMRGCI(StreamObject):
             "energy_change": energy_change,
             "discarded_weight": final_discarded,
             "max_discarded_weight": (
-                float(numpy.max(numpy.abs(discarded)))
-                if discarded.size else numpy.nan
+                float(numpy.max(numpy.abs(discarded))) if discarded.size else numpy.nan
             ),
             "local_squared_residual_threshold": final_thrd,
         }
@@ -1651,9 +1597,7 @@ class DMRGCI(StreamObject):
             (run["max_discarded_weight"] for run in root_runs),
             default=numpy.nan,
         )
-        final_thrd = max(
-            run["local_squared_residual_threshold"] for run in root_runs
-        )
+        final_thrd = max(run["local_squared_residual_threshold"] for run in root_runs)
         sweep_energies = (
             root_runs[0]["sweep_energies"]
             if len(root_runs) == 1
@@ -1676,9 +1620,7 @@ class DMRGCI(StreamObject):
             "scratch": self._scratch,
             "root_runs": root_runs,
             "root_strategy": (
-                "state-averaged-multimps"
-                if len(self.kets) > 1
-                else "state-averaged"
+                "state-averaged-multimps" if len(self.kets) > 1 else "state-averaged"
             ),
         }
 
@@ -1690,7 +1632,9 @@ class DMRGCI(StreamObject):
         self._require_run()
         if state is None:
             if isinstance(self.ci, list):
-                raise ValueError("a root index or MPS is required for a multi-root result")
+                raise ValueError(
+                    "a root index or MPS is required for a multi-root result"
+                )
             return self.ci
         if isinstance(state, (int, numpy.integer)):
             root = int(state)
@@ -1707,13 +1651,35 @@ class DMRGCI(StreamObject):
         if nelec is not None and _electron_number(nelec) != self.nelecas:
             raise ValueError("RDM nelec does not match the converged DMRG problem")
 
-    def make_rdm1(self, state=None, norb=None, nelec=None, **kwargs):
-        """Return ``dm1[p,q] = <a_p^dagger a_q>``."""
-        return self.make_rdm12(state, norb, nelec, **kwargs)[0]
+    def make_rdm1(self, state=None, norb=None, nelec=None, **_kwargs):
+        """Return ``dm1[p,q] = <a_p^dagger a_q>`` without forming a 2-RDM.
+
+        Calling :meth:`make_rdm12` here is both unnecessarily expensive and
+        unsafe after PySCF dynamically mixes in ``StateAverageFCISolver``:
+        virtual dispatch would reach the wrapper's averaged ``make_rdm12``,
+        which expects a list rather than one Block2 MPS.  The root-resolved
+        cache keeps this path cheap while the full 1-/2-RDM cache remains
+        authoritative whenever a 2-RDM is requested later.
+        """
+        self._check_rdm_problem(norb, nelec)
+        ket = self._resolve_state(state)
+        key = id(ket)
+        if key in self._rdm_cache:
+            return self._rdm_cache[key][0]
+        if key not in self._rdm1_cache:
+            raw1 = self.driver.get_1pdm(
+                ket,
+                site_type=self.npdm_site_type,
+                cutoff=self.npdm_cutoff,
+            )
+            self._rdm1_cache[key] = block2_rdm1(raw1)
+        return self._rdm1_cache[key]
 
     def make_rdm2(self, state=None, norb=None, nelec=None, **kwargs):
         """Return ``dm2[p,q,r,s] = <a_p^dagger a_r^dagger a_s a_q>``."""
-        return self.make_rdm12(state, norb, nelec, **kwargs)[1]
+        # Name the base implementation explicitly so PySCF's dynamically
+        # mixed state-average wrapper cannot reinterpret one MPS as a root list.
+        return DMRGCI.make_rdm12(self, state, norb, nelec, **kwargs)[1]
 
     def make_rdm12(self, state=None, norb=None, nelec=None, **_kwargs):
         """Return raw-converted Block2 1- and 2-RDMs without projection."""
@@ -1721,17 +1687,19 @@ class DMRGCI(StreamObject):
         ket = self._resolve_state(state)
         key = id(ket)
         if key not in self._rdm_cache:
-            raw1 = self.driver.get_1pdm(
-                ket,
-                site_type=self.npdm_site_type,
-                cutoff=self.npdm_cutoff,
-            )
+            dm1 = self._rdm1_cache.get(key)
+            if dm1 is None:
+                raw1 = self.driver.get_1pdm(
+                    ket,
+                    site_type=self.npdm_site_type,
+                    cutoff=self.npdm_cutoff,
+                )
+                dm1 = block2_rdm1(raw1)
             raw2 = self.driver.get_2pdm(
                 ket,
                 site_type=self.npdm_site_type,
                 cutoff=self.npdm_cutoff,
             )
-            dm1 = block2_rdm1(raw1)
             dm2 = block2_rdm2(raw2)
             contraction = numpy.einsum("pqrr->pq", dm2)
             self.rdm_diagnostics[key] = {
@@ -1751,6 +1719,7 @@ class DMRGCI(StreamObject):
                 ),
                 "projection_change": 0.0,
             }
+            self._rdm1_cache[key] = dm1
             self._rdm_cache[key] = (dm1, dm2)
             self._refresh_kramers_results()
         return self._rdm_cache[key]
@@ -1815,15 +1784,11 @@ class DMRGCI(StreamObject):
             raise RuntimeError("Kramers mode is not enabled")
         self.make_kramers_pair_rdm12(pair)
         roots = self.kramers_adapter.root_pairs[int(pair)]
-        root_space = numpy.empty(
-            (2, 2, self.ncas, self.ncas), dtype=numpy.complex128
-        )
+        root_space = numpy.empty((2, 2, self.ncas, self.ncas), dtype=numpy.complex128)
         for i, bra in enumerate(roots):
             for j, ket in enumerate(roots):
                 if i == j:
-                    root_space[i, j] = self.make_rdm1(
-                        bra, self.ncas, self.nelecas
-                    )
+                    root_space[i, j] = self.make_rdm1(bra, self.ncas, self.nelecas)
                 else:
                     root_space[i, j] = self.trans_rdm1(
                         bra, ket, self.ncas, self.nelecas
@@ -1881,7 +1846,11 @@ class DMRGCI(StreamObject):
         log.info("checkpoint each sweep        = %s", self.checkpoint_per_sweep)
         log.info("energy tolerance             = %g", self.tol)
         log.info("maximum sweeps               = %d", self.n_sweeps)
-        log.info("NPDM site type/cutoff        = %d / %g", self.npdm_site_type, self.npdm_cutoff)
+        log.info(
+            "NPDM site type/cutoff        = %d / %g",
+            self.npdm_site_type,
+            self.npdm_cutoff,
+        )
         log.info("Kramers result adapter       = %s", self.kramers_adapter is not None)
         if self.kramers_adapter is not None:
             log.info(

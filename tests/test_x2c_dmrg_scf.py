@@ -6,7 +6,8 @@ import scipy.linalg
 from pyscf import gto
 
 from socutils.dmrg.dmrgci import DMRGCI
-from socutils.mcscf import zmcscf
+from socutils.dmrg.kramers import time_reverse_one_body
+from socutils.mcscf import zmc_superci, zmcscf
 from socutils.scf import spinor_hf
 
 
@@ -30,6 +31,96 @@ def test_dmrg_casscf_production_defaults():
     assert mc.superci_davidson_tol == 1e-8
     assert mc.superci_davidson_max_space == 200
     assert mc.superci_davidson_strict
+    assert not mc.superci_diis
+    assert not mc.supercipt_diis
+
+
+@pytest.mark.parametrize(
+    ("frozen", "freeze_pair", "partner_removed"),
+    [
+        ([0], None, (4, 1)),
+        (None, ([4], [0]), (5, 1)),
+    ],
+    ids=("singleton-frozen", "asymmetric-freeze-pair"),
+)
+def test_kramers_projector_intersects_additional_orbital_masks(
+    frozen,
+    freeze_pair,
+    partner_removed,
+):
+    """KR projection must not restore a frozen partner rotation."""
+
+    class MaskOnlyCASSCF:
+        uniq_var_indices = zmcscf.CASSCF.uniq_var_indices
+        screen_irrep = zmcscf.CASSCF.screen_irrep
+        pack_uniq_var = zmcscf.CASSCF.pack_uniq_var
+        unpack_uniq_var = zmcscf.CASSCF.unpack_uniq_var
+
+    nmo = 8
+    mc = MaskOnlyCASSCF()
+    mc.ncore = 0
+    mc.ncas = 4
+    mc.frozen = frozen
+    mc.freeze_pair = freeze_pair
+    mc.irrep = None
+    mc.mo_coeff = np.eye(nmo, dtype=complex)
+
+    pairs = ((0, 1), (2, 3), (4, 5), (6, 7))
+    phases = (1.0 + 0.0j, 1.0j, np.exp(0.3j), -1.0j)
+    time_reversal = np.zeros((nmo, nmo), dtype=complex)
+    for (first, second), phase in zip(pairs, phases):
+        phase /= abs(phase)
+        time_reversal[second, first] = phase
+        time_reversal[first, second] = -phase
+
+    class Mapping:
+        pass
+
+    mapping = Mapping()
+    mapping.time_reversal = time_reversal
+    mapping.pairs = pairs
+    mapping.phases = phases
+    mapping.diagnostics = {
+        "subspace_closure_error": 0.0,
+        "partner_orbital_error": 0.0,
+    }
+
+    values = np.arange(nmo * nmo, dtype=float).reshape(nmo, nmo)
+    trial = values + 0.17j * values[::-1]
+    generator = trial - trial.T.conj()
+    projected, diagnostics = zmc_superci._project_kramers_rotation(
+        mc,
+        np.eye(nmo, dtype=complex),
+        generator,
+        force=True,
+        mapping=mapping,
+    )
+
+    lower_allowed = mc.uniq_var_indices(nmo, mc.ncore, mc.ncas, mc.frozen)
+    allowed_support = lower_allowed | lower_allowed.T
+    partners = np.argmax(abs(time_reversal) > 0.0, axis=1)
+    intersection = allowed_support & allowed_support[np.ix_(partners, partners)]
+
+    rebuilt = mc.unpack_uniq_var(mc.pack_uniq_var(projected.copy()))
+    repeated, _ = zmc_superci._project_kramers_rotation(
+        mc,
+        np.eye(nmo, dtype=complex),
+        projected,
+        force=True,
+        mapping=mapping,
+    )
+    assert np.linalg.norm(projected) > 0.0
+    assert not intersection[partner_removed]
+    assert np.max(abs(projected[~intersection]), initial=0.0) == 0.0
+    assert np.max(abs(projected + projected.T.conj())) <= 1e-14
+    assert np.max(
+        abs(projected - time_reverse_one_body(time_reversal, projected))
+    ) <= 1e-14
+    assert np.max(abs(projected - rebuilt)) <= 1e-14
+    assert np.max(abs(projected - repeated)) <= 1e-14
+    assert diagnostics["output_generator_residual"] <= 1e-14
+    assert diagnostics["forbidden_support_residual"] == 0.0
+    assert diagnostics["support_directions_removed_by_kramers"] > 0
 
 
 @pytest.fixture(scope='module')
@@ -84,6 +175,7 @@ def test_superci_orbital_diis_reaches_unaccelerated_solution(be_x2c_reference):
     _, mf, initial_mo = be_x2c_reference
     reference = _make_casscf(mf, initial_mo, natorb=False)
     reference.max_cycle_macro = 30
+    reference.superci_diis = False
     reference.kernel()
 
     accelerated = _make_casscf(mf, initial_mo, natorb=False)
@@ -168,6 +260,8 @@ def test_cholesky_x2c_dmrg_scf_matches_exact(
     assert exact.converged and dmrg.converged and solver.converged
     assert exact.superci_diagnostics['converged']
     assert dmrg.superci_diagnostics['converged']
+    assert not exact.superci_diagnostics['diis']
+    assert not dmrg.superci_diagnostics['diis']
     assert exact.final_orbital_gradient_norm <= exact.conv_tol_grad
     assert dmrg.final_orbital_gradient_norm <= dmrg.conv_tol_grad
     assert energy_error <= 1e-7

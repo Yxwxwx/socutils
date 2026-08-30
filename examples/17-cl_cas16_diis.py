@@ -74,21 +74,11 @@ def main(*, optimizer="supercipt", kramers=False, max_cycle=50, n_threads=16):
     mc.superci_davidson_strict = True
     mc.callback = mc.fcisolver.restart_scheduler_()
 
-    symmetry = "kramers" if kramers else None
     try:
         if optimizer == "superci":
-            mc.superci(
-                mo_coeff=initial_mo,
-                use_diis=True,
-                symm=symmetry,
-            )
+            mc.superci(use_diis=True)
         else:
-            mc.supercipt(
-                mo_coeff=initial_mo,
-                use_cderi=True,
-                use_diis=True,
-                symm=symmetry,
-            )
+            mc.supercipt(use_diis=True)
         print("converged =", mc.converged)
         print("E(%s) = %.15f" % (optimizer, mc.e_tot))
         print("final orbital gradient = %.6e" % mc.final_orbital_gradient_norm)

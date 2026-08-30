@@ -70,7 +70,7 @@ def main(
     mf = spinor_hf.KRHF(mol).x2camf(
         with_gaunt=True,
         with_breit=True,
-    )
+    ).cholesky(tau=1e-8)
     if dry_run:
         mol.charge = 3
         mol.spin = 3
@@ -115,11 +115,7 @@ def main(
     mc.conv_tol = 1e-8
     mc.conv_tol_grad = 1e-3
 
-    mc.supercipt(
-        symm="kramers",
-        use_cderi=True,
-        use_diis=True,
-    )
+    mc.supercipt(use_diis=True)
     print("converged =", mc.converged)
     print("E(Super-CIPT) = %.12f" % mc.e_tot)
     analyze_casscf_spinors(mc, threshold=0.05, mo_type="active")

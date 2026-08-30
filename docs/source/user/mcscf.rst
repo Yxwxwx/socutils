@@ -67,23 +67,22 @@ rotation step, repeating until the energy and orbital gradient are converged.
    mc.kernel()
    print(mc.e_tot)
 
-Orbital DIIS can be enabled explicitly for the full Super-CI optimizer::
+Orbital DIIS is an explicit opt-in for the full Super-CI optimizer::
 
    mc.superci(use_diis=True)
-
-For a Kramers-restricted reference or solver, DIIS must be told to retain the
-time-reversal tangent space::
-
-   mc.superci(use_diis=True, symm='kramers')
 
 Full Super-CI DIIS extrapolates unitary orbital transformations in one fixed
 reference frame.  Every extrapolated step is screened through the normal
 frozen/irrep mask and, in Kramers mode, through the actual AO time-reversal
-map.  Partner orbitals therefore need not be adjacent.  For ``kernel()``-style
-input, set ``mc.superci_diis = True`` and, when needed,
-``mc.orbital_symmetry = 'kramers'``.  Shared controls are
-``orbital_diis_space=15``, ``orbital_diis_start_cycle=3`` and
-``orbital_diis_start_gradient=0.02``.
+map.  Partner orbitals therefore need not be adjacent.  ``mc.kernel()`` and
+``mc.superci()`` use the unaccelerated iteration by default; set
+``mc.superci_diis = True`` for a ``kernel()``-style input.  Kramers mode is
+inferred from a KRHF reference or a Kramers-adapted active-space solver.
+Shared controls are ``orbital_diis_space=15``,
+``orbital_diis_start_cycle=3`` and ``orbital_diis_start_gradient=0.02``.  When
+``natorb=True``, Super-CI disables explicitly requested DIIS with a warning
+because the active natural-orbital rotation changes the orbital gauge at
+every macroiteration.
 
 Spinor orbital analysis
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -228,7 +227,7 @@ orbital optimizer.  It is an explicit alternative API: ``kernel()`` and
    )
    mc = zmcscf.CASSCF(mf, ncas=4, nelecas=2)
    mc.fcisolver = solver
-   mc.supercipt(use_diis=True, use_cderi=True)
+   mc.supercipt()
 
 The method uses the same exact-CI/Block2 solver contract and full or Cholesky
 integral containers as Super-CI.  In the repository RDM convention,
@@ -245,17 +244,15 @@ addition generalized eigenproblems use ``D.T`` and ``(I-D).T``, respectively.
 They are positive-semidefinite metrics; numerically null directions are
 removed by canonical orthogonalization.  The three paper blocks
 (core--virtual, core--active, and active--virtual) form one anti-Hermitian
-rotation, whose largest matrix element is capped by ``max_stepsize`` before
+rotation, whose Frobenius norm is capped by ``max_stepsize`` before
 applying ``C <- C exp(kappa)``.
 
-Without DIIS, Super-CIPT semicanonicalizes the redundant core and virtual
-blocks after every orbital step, independently of ``mc.canonicalize_``.  With
-DIIS, it follows the contributed algorithm instead: local perturbative steps
-are accumulated and Pulay-extrapolated in one incremental coordinate system,
-and no intervening core/virtual re-gauging is applied.  Mixing those redundant
-gauge rotations into a fixed-reference DIIS history is unstable for atomic Cl.
-The usual HF or previously semicanonicalized starting orbitals are therefore
-recommended for the DIIS path.
+For every perturbative solve, Super-CIPT constructs a temporary
+semicanonical frame for the redundant core and virtual blocks, independently
+of ``mc.canonicalize_``.  It transforms the physical interspace generator back
+to the input gauge and does not apply the redundant gauge rotation to the
+actual MOs.  Optional DIIS uses fixed-reference unitary-log coordinates, so
+its history remains in one consistent orbital gauge.
 
 Super-CIPT uses the common CASSCF attributes ``max_cycle_macro``,
 ``max_stepsize``, ``conv_tol``, and ``conv_tol_grad``.  Its additional
@@ -267,28 +264,32 @@ attributes are:
   denominator rather than divide silently;
 * ``supercipt_level_shift`` (``0.0``) -- optional sign-preserving shift away
   from zero;
-* ``supercipt_diis`` (``False``) -- enable orbital DIIS;
-* ``supercipt_use_cderi`` (``None``) -- automatically use factors attached to
-  the SCF object.  ``True`` forces the factorized route and generates AO
-  Cholesky vectors once if necessary; ``False`` forces full integral
-  transformation.
+* ``supercipt_diis`` (``False``) -- enable orbital DIIS explicitly, either by
+  setting the attribute to ``True`` or by passing ``use_diis=True``.
 
-The same options can be passed directly to ``supercipt``.  For example, a
-Kramers-restricted calculation with both new accelerators is::
+The normal call uses the plain perturbative iteration::
 
-   mc.supercipt(
-       symm='kramers',
-       use_diis=True,
-       use_cderi=True,
-   )
+   mc.supercipt()
 
-The explicit ``symm='kramers'`` is mandatory when DIIS is enabled on a KRHF
-reference or Kramers-adapted active-space solver.  Without DIIS, Kramers mode
-is detected automatically.  The implementation identifies partner indices
-and phases from ``C.H @ S @ Theta(C)``, projects every orbital generator, and
-uses a quaternion eigensolve whenever core/virtual semicanonicalization is
-requested.  Super-CIPT DIIS uses the perturbative correction itself as the
-Pulay residual; full Super-CI retains its fixed-reference gradient DIIS.
+DIIS can be requested explicitly::
+
+   mc.supercipt(use_diis=True)
+
+The integral route follows the SCF object: ``mf.cholesky(...)`` or an attached
+density-fitting object selects factorized integrals; otherwise Super-CIPT uses
+the full transformation.  Kramers mode is likewise inferred from a KRHF
+reference or a Kramers-adapted active-space solver.  The implementation
+identifies partner indices and phases from ``C.H @ S @ Theta(C)``, projects
+every orbital generator, and uses a quaternion eigensolve whenever
+core/virtual semicanonicalization is requested.  Super-CIPT DIIS uses the
+PT fixed-point displacement in fixed-reference unitary-log coordinates as
+its Pulay residual; the constrained orbital gradient supplies its start and
+descent safeguards.  Full Super-CI uses the same fixed-reference principle
+around its Davidson step.
+Additional ``frozen``, ``freeze_pair`` and ``irrep`` masks are intersected
+with their time-reversed images.  Thus an asymmetric user mask cannot
+silently reintroduce a forbidden rotation; the corresponding partner
+direction is frozen as required by the Kramers constraint.
 Each extrapolated Super-CIPT step is accepted only after the next CASCI energy
 evaluation.  An uphill extrapolation is recorded as rejected, the Pulay
 history is reset, and the optimizer evaluates the ordinary perturbative step
@@ -296,11 +297,12 @@ from the same source orbitals instead.  If this happens at the cycle limit,
 one terminal energy evaluation is reserved for that fallback so the returned
 energy, RDMs, and orbitals describe the same accepted point.
 
-``max_stepsize`` is an upper bound, not an acceleration factor.  If the
-reported ``max(raw)`` is already much smaller than ``max_stepsize``, increasing
-the option cannot make Super-CIPT move faster.  This commonly occurs when a
-large active space must be reselected from mean-field orbitals: the
-first-order Dyall denominators can produce a long linear-convergence region.
+``max_stepsize`` is an upper bound, not an acceleration factor.  In the
+default unaccelerated plain-PT path, increasing it does not alter a raw
+Frobenius proposal that is already below the bound.  The separately reported
+``max(raw)`` is only the largest matrix element.  A long linear-convergence
+region during active-space reselection can be consistent with the
+first-order Dyall update lacking the full Super-CI orbital-Hessian coupling.
 In that case use better selected starting orbitals or pre-optimize them with
 the full Super-CI path; do not loosen the DMRG or denominator tolerances to
 hide the orbital problem.
@@ -312,16 +314,27 @@ integral provenance; ``supercipt_diagnostics`` records the final settings and
 status.  PySCF ``state_average_(weights)`` is supported and supplies the same
 weighted energy and RDMs to every Super-CIPT equation.
 
-At normal logging level each update prints its raw maximum rotation, applied
-scale, rotation norm, minimum absolute denominator, and both metric ranks.
+For a Kramers-restricted calculation, the reported
+``orbital_gradient_norm`` is the packed gradient after projection into the
+phase-resolved Kramers tangent space.  This same constrained value controls
+convergence and the DMRG restart scheduler.  The unprojected Block2/RDM value
+is retained separately as ``raw_orbital_gradient_norm`` together with
+``kramers_gradient`` projection diagnostics; it does not drive an orbital
+step or a convergence decision.
+
+At normal logging level each update prints its raw Frobenius rotation norm,
+largest matrix element, applied scale, minimum absolute denominator, and both
+metric ranks.
 These distinguish an orbital-optimizer plateau from CI nonconvergence,
 metric truncation, an intruder denominator, or trust-radius clipping.
 
 ``CASSCF.supercipt(...)`` is the single supported public driver and delegates
 to the implementation in ``socutils.mcscf.zmc_supercipt``.  The obsolete
 contributed ``zmc_supercipt_new.mcscf_superci_pt`` compatibility wrapper is
-not retained.  The paper/source equation map, immutable historical output,
-and exact/Pykylin/Block2 numerical ladder are recorded in
+not retained.  Spectral-CG, PT-trust and PT-seeded L-BFGS code used by the
+repository convergence audit remains internal and is not part of this public
+API.  The paper/source equation map, immutable historical output, and
+exact/Pykylin/Block2 numerical ladder are recorded in
 ``docs/supercipt_validation.md``.
 
 Orbital localization
@@ -389,6 +402,8 @@ The optimization is controlled by attributes set on the ``CASSCF`` object
 * ``superci_davidson_max_space`` (``200``) -- maximum Super-CI Davidson subspace;
 * ``superci_davidson_strict`` (``True``) -- raise instead of applying an orbital
   step when the configured Super-CI residual was not reached.
+* ``superci_diis`` (``False``) -- enable orbital DIIS for ``kernel()`` and
+  ``superci()`` explicitly.
 
 Convergence and results
 ~~~~~~~~~~~~~~~~~~~~~~~~~~

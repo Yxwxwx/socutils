@@ -105,4 +105,8 @@ benchmarck/kramers/results/**/*.progress.json
 dmrg_scratch/
 dmrg_checkpoint/
 
+# Shelved MRPT prototype and its validation artifacts
+/mrpt/temp/
+
+tests/
 .pytest_cache/

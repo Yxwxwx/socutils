@@ -150,6 +150,51 @@ def test_restart_scheduler_accepts_both_callback_vocabularies():
     assert not callback({"norm_gorb": 2e-3, "norm_ddm": 2e-2})
 
 
+def test_restart_scheduler_guards_structured_optimizer_steps():
+    solver = DMRGCI()
+    callback = solver.restart_scheduler_()
+
+    assert not callback(
+        {
+            "accepted": False,
+            "ci_solver_converged": True,
+            "orbital_gradient_norm": 1e-6,
+            "applied_orbital_step_norm": 1e-4,
+        }
+    )
+    assert "rejected_point" in solver.restart_diagnostics["blockers"]
+
+    assert not callback(
+        {
+            "accepted": True,
+            "ci_solver_converged": True,
+            "orbital_gradient_norm": 1e-6,
+            "applied_orbital_step_norm": 2e-2,
+        }
+    )
+    assert "orbital_step_too_large" in solver.restart_diagnostics["blockers"]
+
+    assert callback(
+        {
+            "accepted": True,
+            "ci_solver_converged": True,
+            "orbital_gradient_norm": 2e-2,
+            "norm_ddm": 2e-2,
+            "applied_orbital_step_norm": 5e-3,
+        }
+    )
+    assert solver.restart_diagnostics["reasons"] == ["orbital_step"]
+
+    assert not callback(
+        {
+            "accepted": True,
+            "ci_solver_converged": True,
+            "orbital_gradient_norm": 1e-6,
+        }
+    )
+    assert "no_outgoing_orbital_step" in solver.restart_diagnostics["blockers"]
+
+
 def test_analytic_one_electron_and_determinant_rdms(tmp_path):
     h1 = np.array(
         [

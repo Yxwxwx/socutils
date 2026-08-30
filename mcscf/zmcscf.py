@@ -6,7 +6,6 @@ from pyscf.lib import logger
 
 from socutils.scf import spinor_hf
 from socutils.mcscf import zcasbase, zcasci
-from socutils.mcscf.zmc_ao2mo import chunked_cholesky
 # mcscf_superci is imported lazily inside superci() to avoid a circular import
 # (zmc_superci imports zmcscf).
 try:
@@ -342,7 +341,7 @@ class CASSCF(zcasci.CASCI):
         'cholesky_diagnostics', 'canonicalization_diagnostics',
         'final_orbital_gradient_norm', 'supercipt_level_shift',
         'supercipt_metric_tol', 'supercipt_denominator_tol',
-        'supercipt_use_cderi', 'supercipt_diis',
+        'supercipt_diis',
         'orbital_symmetry', 'orbital_diis_space',
         'orbital_diis_start_cycle', 'orbital_diis_start_gradient',
         'supercipt_history', 'supercipt_diagnostics',
@@ -374,7 +373,6 @@ class CASSCF(zcasci.CASCI):
         self.supercipt_level_shift = 0.0
         self.supercipt_metric_tol = 1e-6
         self.supercipt_denominator_tol = 1e-10
-        self.supercipt_use_cderi = None
         self.supercipt_diis = False
         self.orbital_symmetry = None
         self.orbital_diis_space = 15
@@ -564,9 +562,7 @@ class CASSCF(zcasci.CASCI):
         callback=None,
         _kern=None,
         *,
-        use_cderi=None,
         use_diis=None,
-        symm=None,
         diis_space=None,
         diis_start_cycle=None,
         diis_start_gradient=None,
@@ -579,8 +575,9 @@ class CASSCF(zcasci.CASCI):
 
         General and Kramers-restricted complex spinors, exact CI, state
         averages and the common Block2 :class:`socutils.dmrg.DMRGCI` solver are
-        supported.  When DIIS is combined with a Kramers calculation, pass
-        ``symm='kramers'`` explicitly.
+        supported.  Kramers symmetry and the full/factorized integral route
+        are inferred from the SCF object and active-space solver.  Orbital
+        DIIS is available as an explicit opt-in acceleration.
         '''
         del ci0  # Orbital changes invalidate untransformed CI/MPS guesses.
         from socutils.mcscf.zmc_supercipt import mcscf_supercipt
@@ -592,12 +589,8 @@ class CASSCF(zcasci.CASCI):
             self.mo_coeff = mo_coeff
         if callback is None:
             callback = self.callback
-        if use_cderi is None:
-            use_cderi = self.supercipt_use_cderi
         if use_diis is None:
             use_diis = self.supercipt_diis
-        if symm is None:
-            symm = self.orbital_symmetry
         if diis_space is None:
             diis_space = self.orbital_diis_space
         if diis_start_cycle is None:
@@ -619,9 +612,7 @@ class CASSCF(zcasci.CASCI):
                     denominator_tol=self.supercipt_denominator_tol,
                     verbose=self.verbose,
                     cderi=self._cderi,
-                    use_cderi=use_cderi,
                     use_diis=use_diis,
-                    symm=symm,
                     diis_space=diis_space,
                     diis_start_cycle=diis_start_cycle,
                     diis_start_gradient=diis_start_gradient,
