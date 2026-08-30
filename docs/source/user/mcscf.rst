@@ -58,9 +58,9 @@ rotation step, repeating until the energy and orbital gradient are converged.
 
    mol = gto.M(atom='H 0 0 0; F 0 0 0.917', basis='ccpvdz', verbose=4)
 
-   # The validated route uses a pivoted-Cholesky factorization.  tau is the
-   # requested maximum AO-integral residual.
-   mf = spinor_hf.SCF(mol).x2camf().cholesky(tau=1e-8)
+   # Omitting .cholesky()/.density_fit() selects full four-index ERIs in
+   # every Super-CI macroiteration.
+   mf = spinor_hf.SCF(mol).x2camf()
    mf.kernel()
 
    mc = zmcscf.CASSCF(mf, 8, 6)   # 6 electrons in 8 active spinor orbitals
@@ -107,12 +107,14 @@ Requirements
 * **zquatev** -- the orbital step is solved with the Kramers-paired
   (quaternion) eigensolver, so the bundled ``zquatev`` solver must be built
   (see :doc:`../install`); ``kernel()`` raises a clear error if it is missing.
-* **a density-fitted reference** -- the optimizer builds its two-electron
-  integrals by Cholesky/DF transformation from ``mf``, so the mean field must
-  carry a ``with_df``: attach it with ``.density_fit()`` or ``.cholesky()``
-  (otherwise ``kernel()`` raises ``Either with_df or cderi must be provided``).
-  See :ref:`the Cholesky decomposition section <cholesky-decomposition>` for the
-  CD route and its on-disk caching.
+
+The integral route follows the SCF object.  A plain mean field, with no
+``with_df``, selects the full four-index spinor transformation.  Attaching
+``.density_fit()`` or ``.cholesky()`` selects the factorized route instead.
+The same choice is retained whenever Super-CI rebuilds transformed integrals
+after an orbital step.  See
+:ref:`the Cholesky decomposition section <cholesky-decomposition>` for the CD
+route and its on-disk caching.
 
 Block2 DMRG and Kramers pairs
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -367,8 +369,12 @@ The optimization is controlled by attributes set on the ``CASSCF`` object
 * ``natorb`` (``False``) -- if enabled, rotate the active orbitals at each
   macro-iteration to natural orbitals (eigenvectors of the active 1-RDM,
   ordered by descending occupation);
-* ``canonicalize_`` (``False``) -- if enabled, diagonalize the core and virtual
-  blocks of the effective Fock matrix at the end;
+* ``canonicalization`` (``True``) -- after the last Super-CI macroiteration,
+  diagonalize the generalized-Fock core and virtual blocks, leave the active
+  orbitals and CI/MPS unchanged, and populate ``mo_energy``;
+* ``canonicalize_`` (``False``) -- legacy in-macroiteration redundant-gauge
+  rotation.  It is independent of the standard final ``canonicalization``
+  switch and is not required by post-CASSCF methods;
 * ``frozen`` (``None``) -- orbitals excluded from rotation; an ``int`` freezes the
   lowest ``frozen`` orbitals, a list/array freezes the listed indices;
 * ``freeze_pair`` (``None``) -- a pair of index sets ``(set_i, set_j)`` whose
@@ -396,16 +402,22 @@ stops at ``max_cycle_macro``.  ``kernel()`` returns
 * ``mc.e_tot`` -- total CASSCF energy;
 * ``mc.e_cas`` -- active-space (CI) energy;
 * ``mc.ci`` -- the active-space CI vector;
-* ``mc.mo_coeff`` / ``mc.mo_energy`` -- optimized orbitals and their energies;
+* ``mc.mo_coeff`` / ``mc.mo_energy`` -- optimized orbitals and generalized-Fock
+  orbital energies; ``mo_energy`` is populated by final canonicalization and is
+  ``None`` when ``mc.canonicalization=False``;
 * ``mc.converged`` -- whether both convergence criteria were met.
 * ``mc.final_orbital_gradient_norm`` -- norm tested at the final macroiteration;
 * ``mc.macro_history`` -- energy, CAS energy, gradient, applied step, natural
   occupations, CI convergence data, and Super-CI residual for each
   macroiteration;
-* ``mc.cholesky_diagnostics`` -- whether the factor source is a genuine
-  ``CD`` object, its threshold, vector count, and ERI-container type;
-* ``mc.superci_diagnostics`` -- final convergence thresholds and linear-solver
-  residual.
+* ``mc.cholesky_diagnostics`` -- backward-compatible integral provenance,
+  including whether the route is full or factorized and, for a genuine
+  ``CD`` source, its threshold and vector count;
+* ``mc.canonicalization_diagnostics`` -- core/virtual Fock off-diagonal norms
+  before and after the final rotation, active-orbital preservation, and
+  orthonormality checks;
+* ``mc.superci_diagnostics`` -- final convergence thresholds, linear-solver
+  residual, and the generic ``integrals`` provenance record.
 
 The production defaults above match the validated F CAS(7e,16 spinor)
 protocol.  They remain ordinary attributes and can be overridden for smaller

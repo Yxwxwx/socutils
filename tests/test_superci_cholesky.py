@@ -67,8 +67,8 @@ def test_cholesky_integrals_jk_and_full_gradient(tilted_hf):
     mol, mf_full, mf_cd, mo = tilted_hf
     mc_full = _casscf(mf_full, mo)
     mc_cd = _casscf(mf_cd, mo)
-    eris_full = zmc_ao2mo._ERIS(mc_full, mo.copy(), level=2)
-    eris_cd = zmc_ao2mo._CDERIS(mc_cd, mo.copy(), level=2)
+    eris_full, full_info = zmc_superci._build_eris(mc_full, mo.copy())
+    eris_cd, cd_info = zmc_superci._build_eris(mc_cd, mo.copy())
 
     aaaa_error = np.max(abs(eris_cd.aaaa - eris_full.aaaa))
     paaa_error = np.max(abs(eris_cd.paaa - eris_full.paaa))
@@ -108,6 +108,24 @@ def test_cholesky_integrals_jk_and_full_gradient(tilted_hf):
 
     assert isinstance(mf_cd.with_df, CD)
     assert mf_cd.with_df.tau == 1e-10
+    assert isinstance(eris_full, zmc_ao2mo._ERIS)
+    assert isinstance(eris_cd, zmc_ao2mo._CDERIS)
+    assert full_info == {
+        'representation': 'full',
+        'factorized': False,
+        'active': False,
+        'container': '_ERIS',
+        'source': 'full-integral',
+        'naux': None,
+        'threshold': None,
+    }
+    assert cd_info['representation'] == 'factorized'
+    assert cd_info['factorized']
+    assert cd_info['active']
+    assert cd_info['container'] == '_CDERIS'
+    assert cd_info['source'] == 'CD'
+    assert cd_info['naux'] == eris_cd.cd_pa.shape[0]
+    assert cd_info['threshold'] == 1e-10
     assert np.max(abs(eris_full.aaaa.imag)) > 1e-4
     assert ao_error <= 1e-9
     assert aaaa_error <= 1e-9
@@ -129,6 +147,109 @@ def test_cholesky_integrals_jk_and_full_gradient(tilted_hf):
         'g2=%.3e' % np.max(abs(g2_cd - g2_full)),
         'gradient_max=%.3e' % np.max(abs(gradient_cd - gradient_full)),
         'gradient_norm=%.3e' % np.linalg.norm(gradient_cd - gradient_full),
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize('natorb', [False, True], ids=['fixed-active', 'natorb'])
+def test_full_eri_superci_completes_an_orbital_macroiteration(
+    tilted_hf,
+    natorb,
+):
+    """The public Super-CI path must run without any CD/DF factor source."""
+    _, mf_full, _, mo = tilted_hf
+    assert getattr(mf_full, 'with_df', None) is None
+
+    mc = _casscf(mf_full, mo)
+    mc.natorb = natorb
+    # Start in a deliberately noncanonical redundant gauge.  These rotations
+    # leave the core and active projectors unchanged, so only the final
+    # canonicalization should remove their Fock off-diagonal elements.
+    nmo = mo.shape[1]
+    nocc = mc.ncore + mc.ncas
+    redundant_rotation = np.eye(nmo, dtype=complex)
+    for first, second, angle in (
+        (0, mc.ncore - 1, 0.19),
+        (nocc, nmo - 1, -0.16),
+    ):
+        if second > first:
+            cosine, sine = np.cos(angle), np.sin(angle)
+            redundant_rotation[first, first] = cosine
+            redundant_rotation[second, second] = cosine
+            redundant_rotation[first, second] = sine
+            redundant_rotation[second, first] = -sine
+    mc.mo_coeff = mo.dot(redundant_rotation)
+    mc.max_cycle_macro = 1
+    mc.conv_tol = 0.0
+    mc.conv_tol_grad = 0.0
+    mc.superci_davidson_tol = 1e-9
+    mc.superci_davidson_max_space = 200
+    mc.superci_davidson_strict = True
+    mc.superci()
+
+    integral_info = mc.superci_diagnostics['integrals']
+    assert not mc.converged
+    assert np.isfinite(mc.e_tot)
+    assert integral_info['representation'] == 'full'
+    assert not integral_info['factorized']
+    assert integral_info['container'] == '_ERIS'
+    assert integral_info['source'] == 'full-integral'
+    assert integral_info['naux'] is None
+    assert mc.canonicalization
+    assert mc.mo_energy.shape == (mc.mo_coeff.shape[1],)
+    assert np.all(np.isfinite(mc.mo_energy))
+    assert mc.cholesky_diagnostics == integral_info
+    assert mc.superci_diagnostics['cholesky'] == integral_info
+    canonicalization = mc.superci_diagnostics['canonicalization']
+    assert canonicalization == mc.canonicalization_diagnostics
+    assert canonicalization['enabled']
+    assert not canonicalization['active_orbitals_changed']
+    assert canonicalization['active_orbital_change'] == 0.0
+    assert canonicalization['ci_object_preserved']
+    assert canonicalization['core_density_change'] <= 1e-9
+    assert canonicalization['virtual_projector_change'] <= 1e-9
+    assert canonicalization['orthonormality_error'] <= 1e-9
+    assert canonicalization['energy_diagonal_error'] <= 1e-9
+    assert canonicalization['core_offdiagonal_before'] >= 1e-6
+    if len(canonicalization['virtual_indices']) > 1:
+        assert canonicalization['virtual_offdiagonal_before'] >= 1e-6
+    assert canonicalization['core_offdiagonal_after'] <= 1e-9
+    assert canonicalization['virtual_offdiagonal_after'] <= 1e-9
+
+    casdm1 = mc.fcisolver.make_rdm1(mc.ci, mc.ncas, mc.nelecas)
+    fock_ao = mc.get_fock(mc.mo_coeff, mc.ci, casdm1=casdm1, verbose=0)
+    fock_mo = mc.mo_coeff.T.conj().dot(fock_ao).dot(mc.mo_coeff)
+    np.testing.assert_allclose(mc.mo_energy, np.diag(fock_mo).real, atol=1e-9)
+    assert len(mc.macro_history) == 1
+    history = mc.macro_history[0]
+    assert history['integral_representation'] == 'full'
+    assert not history['integral_factorized']
+    assert history['integral_source'] == 'full-integral'
+    assert not history['cholesky_active']
+    assert history['cholesky_naux'] is None
+    assert history['linear_solver']['converged']
+
+
+@pytest.mark.integration
+def test_superci_final_canonicalization_can_be_disabled(tilted_hf):
+    _, mf_full, _, mo = tilted_hf
+    mc = _casscf(mf_full, mo)
+    mc.canonicalization = False
+    mc.max_cycle_macro = 1
+    mc.conv_tol = 0.0
+    mc.conv_tol_grad = 0.0
+    mc.superci_davidson_tol = 1e-9
+    mc.superci_davidson_max_space = 200
+    mc.superci()
+
+    assert mc.mo_energy is None
+    assert mc.canonicalization_diagnostics == {
+        'enabled': False,
+        'reason': 'mc.canonicalization is False',
+    }
+    assert (
+        mc.superci_diagnostics['canonicalization']
+        == mc.canonicalization_diagnostics
     )
 
 

@@ -81,72 +81,251 @@ def get_fock(mc, mo_coeff=None, ci=None, eris=None, casdm1=None, verbose=None):
     fock = mc.get_hcore() + vj - vk
     return fock
 
-def canonicalize(mc, mo_coeff=None, ci=None, eris=None, sort=False,     
-                 cas_natorb=False, casdm1=None, verbose=logger.NOTE):
+def canonicalize(
+    mc,
+    mo_coeff=None,
+    ci=None,
+    eris=None,
+    sort=False,
+    cas_natorb=False,
+    casdm1=None,
+    verbose=logger.NOTE,
+):
+    """Semicanonicalize converged CASSCF core and virtual orbitals.
+
+    This follows the post-CASSCF meaning of PySCF's ``canonicalization``
+    option.  The generalized Fock matrix is built from the converged active
+    one-particle density, then diagonalized independently in the inactive-core
+    and external-virtual spaces.  The active orbitals and ``ci`` object are
+    deliberately left unchanged, which keeps an exact-CI vector or DMRG MPS
+    tied to the same active-orbital basis.
+
+    ``cas_natorb=True`` is not supported here.  In socutils, active natural
+    orbitals are generated transactionally by the Super-CI macroiterations,
+    which rerun the active-space solver after changing that basis.
+    """
     log = logger.new_logger(mc, verbose)
-    if mo_coeff is None: mo_coeff = mc.mo_coeff
-    if ci is None: ci = mc.ci
+    if mo_coeff is None:
+        mo_coeff = mc.mo_coeff
+    if ci is None:
+        ci = mc.ci
+    if cas_natorb:
+        raise NotImplementedError(
+            "post-CASSCF active-orbital canonicalization is not supported; "
+            "set mc.natorb=True before running Super-CI so the CI/MPS is "
+            "reoptimized in every changed active basis"
+        )
     if casdm1 is None:
         casdm1 = mc.fcisolver.make_rdm1(ci, mc.ncas, mc.nelecas)
-    
+
+    mo_input = numpy.asarray(mo_coeff)
+    if mo_input.ndim != 2 or not numpy.issubdtype(mo_input.dtype, numpy.number):
+        raise ValueError("mo_coeff must be a numeric two-dimensional array")
+    if not numpy.all(numpy.isfinite(mo_input)):
+        raise ValueError("mo_coeff contains non-finite values")
+    casdm1 = numpy.asarray(casdm1)
+    if casdm1.shape != (mc.ncas, mc.ncas):
+        raise ValueError(
+            "casdm1 must have shape (%d, %d), got %s"
+            % (mc.ncas, mc.ncas, casdm1.shape)
+        )
+    if not numpy.all(numpy.isfinite(casdm1)):
+        raise ValueError("casdm1 contains non-finite values")
+
     ncore = mc.ncore
     nocc = ncore + mc.ncas
-    nmo = mo_coeff.shape[1]
-    fock_ao = mc.get_fock(mo_coeff, ci, eris, casdm1, verbose)
+    nmo = mo_input.shape[1]
+    mo_coeff1 = numpy.array(mo_input, dtype=numpy.complex128, copy=True)
+    core_density_before = mo_coeff1[:, :ncore].dot(
+        mo_coeff1[:, :ncore].T.conj()
+    )
+    active_before = mo_coeff1[:, ncore:nocc].copy()
+    virtual_projector_before = mo_coeff1[:, nocc:].dot(
+        mo_coeff1[:, nocc:].T.conj()
+    )
 
-    if cas_natorb:
-        raise NotImplementedError
-    else:
-        mo_coeff1 = mo_coeff.copy()
-        log.info('Density matrix diagonal elements %s', casdm1.diagonal())
-
-    mo_energy = numpy.einsum('pi,pi->i', mo_coeff.conj(), fock_ao.dot(mo_coeff1))
-    
-
-    def _diag_subfock_(idx):
-        if idx.size > 1:
-            c = mo_coeff1[:,idx]
-            fock = reduce(numpy.dot, (c.conj().T, fock_ao, c))
-            w, c = eig(fock)
-            print(mo_energy[idx])
-            print(w)
-            mo_coeff1[:,idx] = mo_coeff1[:,idx].dot(c)
-            mo_energy[idx] = w
+    fock_ao = numpy.asarray(
+        mc.get_fock(mo_input, ci, eris, casdm1, verbose),
+        dtype=numpy.complex128,
+    )
+    if fock_ao.shape != (mo_input.shape[0],) * 2:
+        raise ValueError(
+            "generalized AO Fock matrix has shape %s, expected (%d, %d)"
+            % (fock_ao.shape, mo_input.shape[0], mo_input.shape[0])
+        )
+    if not numpy.all(numpy.isfinite(fock_ao)):
+        raise ValueError("generalized AO Fock matrix contains non-finite values")
+    fock_hermiticity_error = float(
+        numpy.max(abs(fock_ao - fock_ao.T.conj()), initial=0.0)
+    )
+    fock_ao = (fock_ao + fock_ao.T.conj()) * 0.5
+    fock_mo_before = reduce(
+        numpy.dot, (mo_coeff1.T.conj(), fock_ao, mo_coeff1)
+    )
+    fock_mo_before = (fock_mo_before + fock_mo_before.T.conj()) * 0.5
+    mo_energy = numpy.diag(fock_mo_before).real.copy()
 
     mask = numpy.ones(nmo, dtype=bool)
-    frozen = getattr(mc, 'frozen', None)
-    #if frozen is not None:
-    
-    #    if isinstance(frozen, (int, numpy.integer)):
-    #        mask[:frozen] = False
-    #    else:
-    #        mask[frozen] = False
+    frozen = getattr(mc, "frozen", None)
+    if frozen is not None:
+        if isinstance(frozen, (int, numpy.integer)):
+            if frozen < 0 or frozen > nmo:
+                raise ValueError("frozen integer must be between 0 and nmo")
+            mask[:frozen] = False
+        else:
+            frozen_indices = numpy.asarray(frozen)
+            if frozen_indices.ndim != 1 or not numpy.issubdtype(
+                frozen_indices.dtype, numpy.integer
+            ):
+                raise ValueError("frozen must contain one-dimensional integer indices")
+            if numpy.any(frozen_indices < -nmo) or numpy.any(frozen_indices >= nmo):
+                raise IndexError("frozen contains an out-of-range orbital index")
+            mask[frozen_indices] = False
     core_idx = numpy.where(mask[:ncore])[0]
-    vir_idx = numpy.where(mask[nocc:])[0] + nocc
-    act_idx = numpy.where(mask[ncore:nocc])[0] + ncore
-    print(act_idx)
-    print(core_idx)
-    c = mo_coeff1[:, core_idx]
-    fock = reduce(numpy.dot, (c.conj().T, fock_ao, c))
-    #print(fock)
-    w, c = zquatev.eigh(fock)
-    #print(w, mo_energy[core_idx])
-    #print(c)
-    #mo_coeff1[:, core_idx] = mo_coeff1[:, core_idx].dot(c)
-    
-    c = mo_coeff1[:, act_idx]
-    fock = reduce(numpy.dot, (c.conj().T, fock_ao, c))
-    w, c = zquatev.eigh(fock)
-    #print(fock)
-    #print(w)
-    #print(c)
-    mo_coeff1[:, act_idx] = mo_coeff1[:, act_idx].dot(c)
-    #c = mo_coeff1[:, act_idx]
-    #print(reduce(numpy.dot, (c.T.conj(), fock_ao, c)))
-    #_diag_subfock_(core_idx)
-    #_diag_subfock_(vir_idx)
-    #_diag_subfock_(act_idx)
+    virtual_idx = numpy.where(mask[nocc:])[0] + nocc
 
+    from socutils.mcscf.zmc_superci import (
+        _kramers_subspace_eigh,
+        _resolve_kramers_mode,
+    )
+
+    kramers = _resolve_kramers_mode(
+        mc, getattr(mc, "orbital_symmetry", None)
+    )
+
+    def _subspace_eigh(fock, orbitals):
+        mf = mc._scf
+        if kramers:
+            # Identify the actual partners rather than assuming adjacent pairs.
+            return _kramers_subspace_eigh(mc, fock, orbitals)
+        if isinstance(mf, spinor_hf.SymmSpinorSCF):
+            return mf.eig(fock, mo=orbitals)
+        return scipy.linalg.eigh(fock)
+
+    def _diag_subfock(indices, label):
+        indices = numpy.asarray(indices, dtype=int)
+        if indices.size == 0:
+            return
+        orbitals = mo_coeff1[:, indices]
+        fock = reduce(numpy.dot, (orbitals.T.conj(), fock_ao, orbitals))
+        fock = (fock + fock.T.conj()) * 0.5
+        if indices.size == 1:
+            energies = numpy.array([fock[0, 0].real])
+            rotation = numpy.ones((1, 1), dtype=numpy.complex128)
+        else:
+            energies, rotation = _subspace_eigh(fock, orbitals)
+            energies = numpy.asarray(energies).real
+            rotation = numpy.asarray(rotation, dtype=numpy.complex128)
+        if sort and energies.size > 1:
+            order = numpy.argsort(energies.round(9), kind="mergesort")
+            energies = energies[order]
+            rotation = rotation[:, order]
+        unitary_error = float(
+            numpy.max(
+                abs(rotation.T.conj().dot(rotation) - numpy.eye(indices.size)),
+                initial=0.0,
+            )
+        )
+        if unitary_error > 1e-8:
+            raise RuntimeError(
+                "%s canonicalization returned a nonunitary rotation: %.3e"
+                % (label, unitary_error)
+            )
+        mo_coeff1[:, indices] = orbitals.dot(rotation)
+        mo_energy[indices] = energies
+
+    _diag_subfock(core_idx, "core")
+    _diag_subfock(virtual_idx, "virtual")
+
+    fock_mo_after = reduce(
+        numpy.dot, (mo_coeff1.T.conj(), fock_ao, mo_coeff1)
+    )
+    fock_mo_after = (fock_mo_after + fock_mo_after.T.conj()) * 0.5
+    diagonal_after = numpy.diag(fock_mo_after).real
+    mo_energy[ncore:nocc] = diagonal_after[ncore:nocc]
+
+    def _offdiagonal_norm(matrix, indices):
+        indices = numpy.asarray(indices, dtype=int)
+        if indices.size < 2:
+            return 0.0
+        block = matrix[numpy.ix_(indices, indices)]
+        return float(numpy.linalg.norm(block - numpy.diag(numpy.diag(block))))
+
+    overlap = numpy.asarray(mc._scf.get_ovlp())
+    orthonormality_error = float(
+        numpy.max(
+            abs(
+                mo_coeff1.T.conj().dot(overlap).dot(mo_coeff1)
+                - numpy.eye(nmo)
+            ),
+            initial=0.0,
+        )
+    )
+    active_change = float(
+        numpy.max(abs(mo_coeff1[:, ncore:nocc] - active_before), initial=0.0)
+    )
+    core_density_after = mo_coeff1[:, :ncore].dot(
+        mo_coeff1[:, :ncore].T.conj()
+    )
+    virtual_projector_after = mo_coeff1[:, nocc:].dot(
+        mo_coeff1[:, nocc:].T.conj()
+    )
+    core_density_change = float(
+        numpy.max(abs(core_density_after - core_density_before), initial=0.0)
+    )
+    virtual_projector_change = float(
+        numpy.max(
+            abs(virtual_projector_after - virtual_projector_before),
+            initial=0.0,
+        )
+    )
+    energy_diagonal_error = float(
+        numpy.max(abs(mo_energy - diagonal_after), initial=0.0)
+    )
+    diagnostics = {
+        "enabled": True,
+        "active_orbitals_changed": False,
+        "active_orbital_change": active_change,
+        "ci_object_preserved": True,
+        "core_density_change": core_density_change,
+        "virtual_projector_change": virtual_projector_change,
+        "fock_hermiticity_error": fock_hermiticity_error,
+        "orthonormality_error": orthonormality_error,
+        "energy_diagonal_error": energy_diagonal_error,
+        "core_indices": core_idx.tolist(),
+        "virtual_indices": virtual_idx.tolist(),
+        "frozen_indices": numpy.where(~mask)[0].tolist(),
+        "core_offdiagonal_before": _offdiagonal_norm(fock_mo_before, core_idx),
+        "core_offdiagonal_after": _offdiagonal_norm(fock_mo_after, core_idx),
+        "virtual_offdiagonal_before": _offdiagonal_norm(
+            fock_mo_before, virtual_idx
+        ),
+        "virtual_offdiagonal_after": _offdiagonal_norm(
+            fock_mo_after, virtual_idx
+        ),
+        "sort": bool(sort),
+        "cas_natorb": False,
+    }
+    mc.canonicalization_diagnostics = diagnostics
+    maximum_post_offdiagonal = max(
+        diagnostics["core_offdiagonal_after"],
+        diagnostics["virtual_offdiagonal_after"],
+    )
+    if maximum_post_offdiagonal > 1e-8:
+        log.warn(
+            "CASSCF canonicalization left a %.3e core/virtual Fock "
+            "off-diagonal norm",
+            maximum_post_offdiagonal,
+        )
+    log.info(
+        "CASSCF canonicalization | core offdiag %.3e -> %.3e | "
+        "virtual offdiag %.3e -> %.3e | orthonormality %.3e",
+        diagnostics["core_offdiagonal_before"],
+        diagnostics["core_offdiagonal_after"],
+        diagnostics["virtual_offdiagonal_before"],
+        diagnostics["virtual_offdiagonal_after"],
+        diagnostics["orthonormality_error"],
+    )
     return mo_coeff1, ci, mo_energy
 
 
@@ -160,7 +339,7 @@ class CASSCF(zcasci.CASCI):
         'superci_davidson_tol', 'superci_davidson_max_space',
         'superci_davidson_strict', 'superci_diis', 'macro_history',
         'superci_diagnostics', 'superci_metric_diagnostics',
-        'cholesky_diagnostics',
+        'cholesky_diagnostics', 'canonicalization_diagnostics',
         'final_orbital_gradient_norm', 'supercipt_level_shift',
         'supercipt_metric_tol', 'supercipt_denominator_tol',
         'supercipt_use_cderi', 'supercipt_diis',
@@ -190,6 +369,7 @@ class CASSCF(zcasci.CASCI):
         self.superci_diagnostics = None
         self.superci_metric_diagnostics = None
         self.cholesky_diagnostics = None
+        self.canonicalization_diagnostics = None
         self.final_orbital_gradient_norm = None
         self.supercipt_level_shift = 0.0
         self.supercipt_metric_tol = 1e-6
@@ -316,6 +496,14 @@ class CASSCF(zcasci.CASCI):
         diis_start_gradient=None,
     ):
         '''Super-CI CASSCF orbital optimization.
+
+        The integral representation follows the mean-field object.  An
+        attached ``with_df`` (or legacy ``self._cderi``) selects factorized
+        integrals; otherwise every macroiteration uses the full four-index
+        spinor transformation.  When ``self.canonicalization`` is true, the
+        converged core and virtual orbitals are semicanonicalized afterwards
+        and the returned ``mo_energy`` contains generalized-Fock energies; the
+        active orbitals and CI/MPS are not transformed by this final step.
 
         Returns:
             Five elements -- total energy, active-space CI energy, the

@@ -25,6 +25,8 @@ def test_dmrg_casscf_production_defaults():
     assert mc.conv_tol_grad == 1e-4
     assert not mc.natorb
     assert not mc.canonicalize_
+    assert mc.canonicalization
+    assert mc.canonicalization_diagnostics is None
     assert mc.superci_davidson_tol == 1e-8
     assert mc.superci_davidson_max_space == 200
     assert mc.superci_davidson_strict
@@ -177,6 +179,23 @@ def test_cholesky_x2c_dmrg_scf_matches_exact(
     assert dmrg.cholesky_diagnostics['active']
     assert exact.cholesky_diagnostics['threshold'] == 1e-10
     assert dmrg.cholesky_diagnostics['threshold'] == 1e-10
+    for calculation in (exact, dmrg):
+        canonicalization = calculation.canonicalization_diagnostics
+        assert canonicalization['enabled']
+        assert canonicalization['ci_object_preserved']
+        assert canonicalization['active_orbital_change'] == 0.0
+        assert canonicalization['core_density_change'] <= 1e-9
+        assert canonicalization['virtual_projector_change'] <= 1e-9
+        assert canonicalization['orthonormality_error'] <= 1e-9
+        assert canonicalization['energy_diagonal_error'] <= 1e-9
+        assert canonicalization['core_offdiagonal_after'] <= 1e-9
+        assert canonicalization['virtual_offdiagonal_after'] <= 1e-9
+        assert calculation.mo_energy.shape == (initial_mo.shape[1],)
+        assert np.all(np.isfinite(calculation.mo_energy))
+        assert (
+            calculation.superci_diagnostics['canonicalization']
+            == canonicalization
+        )
 
     assert len(exact.macro_history) == len(dmrg.macro_history)
     trajectory_error = max(

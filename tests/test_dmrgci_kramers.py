@@ -552,6 +552,10 @@ def test_kramers_superci_orbital_diis_preserves_pairs():
     assert mc.converged
     assert mc.superci_diagnostics["kramers_restricted"]
     assert mc.superci_diagnostics["diis"]
+    assert mc.canonicalization_diagnostics["enabled"]
+    assert mc.canonicalization_diagnostics["active_orbital_change"] == 0.0
+    assert mc.canonicalization_diagnostics["virtual_offdiagonal_after"] <= 1e-10
+    assert np.max(abs(mc.mo_energy[0::2] - mc.mo_energy[1::2])) <= 1e-10
     assert mapping.diagnostics["subspace_closure_error"] <= 1e-7
     assert mapping.diagnostics["partner_orbital_error"] <= 1e-7
     assert any(

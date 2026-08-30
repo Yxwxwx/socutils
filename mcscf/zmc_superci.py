@@ -377,6 +377,57 @@ def _contract_dm2_gradient(eris, casdm2):
     raise TypeError("Unsupported ERI container %s" % type(eris).__name__)
 
 
+def _build_eris(mc, mo, cderi=None):
+    """Build the Super-CI integral container selected by the SCF source.
+
+    An attached ``with_df`` object (or the legacy explicit ``cderi`` argument)
+    selects the existing factorized route.  Otherwise the direct four-index
+    spinor transformation is used.  Keeping this decision in one helper is
+    important because Super-CI rebuilds the transformed integrals after every
+    accepted orbital rotation and, optionally, after active natural-orbital
+    rotations.
+
+    Returns
+    -------
+    eris
+        A :class:`~socutils.mcscf.zmc_ao2mo._CDERIS` or
+        :class:`~socutils.mcscf.zmc_ao2mo._ERIS` instance.
+    diagnostics : dict
+        Stable provenance fields shared by the macroiteration history and the
+        final Super-CI diagnostics.
+    """
+    with_df = getattr(mc._scf, "with_df", None)
+    if with_df is not None or cderi is not None:
+        eris = zmc_ao2mo._CDERIS(mc, mo, cderi=cderi, level=2)
+        from socutils.cd.cd import CD
+
+        is_cholesky = isinstance(with_df, CD)
+        return eris, {
+            "representation": "factorized",
+            "factorized": True,
+            "active": is_cholesky,
+            "container": type(eris).__name__,
+            "source": (
+                type(with_df).__name__
+                if with_df is not None
+                else "legacy-cderi"
+            ),
+            "naux": int(eris.cd_pa.shape[0]),
+            "threshold": getattr(with_df, "tau", None),
+        }
+
+    eris = zmc_ao2mo._ERIS(mc, mo, level=2)
+    return eris, {
+        "representation": "full",
+        "factorized": False,
+        "active": False,
+        "container": type(eris).__name__,
+        "source": "full-integral",
+        "naux": None,
+        "threshold": None,
+    }
+
+
 def _subspace_eigh(casscf, matrix, mo_subspace):
     """Diagonalize an MO-space matrix using reference symmetry when needed."""
     from socutils.scf import spinor_hf
@@ -892,6 +943,7 @@ def mcscf_superci(
     davidson_mmax = davidson_maxiter
     log = logger.new_logger(mc, verbose)
     cput0 = (logger.process_clock(), logger.perf_counter())
+    mc.canonicalization_diagnostics = None
     if conv_tol is None:
         conv_tol = mc.conv_tol
     mol = mc.mol
@@ -932,30 +984,17 @@ def mcscf_superci(
         )
 
     mci = mc.view(zcasci.CASCI)
-    # eris = zmc_ao2mo._ERIS(mc, mo, level=2)
-    eris = zmc_ao2mo._CDERIS(mc, mo, cderi=cderi, level=2)
-    if not isinstance(eris, zmc_ao2mo._CDERIS):
-        raise RuntimeError("Super-CI must use the factorized ERI route")
-    with_df = getattr(mc._scf, "with_df", None)
-    from socutils.cd.cd import CD
-
-    is_cholesky = isinstance(with_df, CD)
-    cholesky_info = {
-        "active": is_cholesky,
-        "factorized": True,
-        "container": type(eris).__name__,
-        "source": type(with_df).__name__ if with_df is not None else "legacy-cderi",
-        "naux": int(eris.cd_pa.shape[0]),
-        "threshold": getattr(with_df, "tau", None),
-    }
-    mc.cholesky_diagnostics = cholesky_info
+    eris, integral_info = _build_eris(mc, mo, cderi=cderi)
+    mc.cholesky_diagnostics = dict(integral_info)
     log.info(
-        "Super-CI factorized ERI route: source = %s, naux = %d, "
-        "Cholesky = %s, threshold = %s",
-        cholesky_info["source"],
-        cholesky_info["naux"],
-        cholesky_info["active"],
-        cholesky_info["threshold"],
+        "Super-CI ERI route: representation = %s, source = %s, "
+        "container = %s, naux = %s, Cholesky = %s, threshold = %s",
+        integral_info["representation"],
+        integral_info["source"],
+        integral_info["container"],
+        integral_info["naux"],
+        integral_info["active"],
+        integral_info["threshold"],
     )
     mci = zmcscf._fake_h_for_fast_casci(mc, mo, eris)
     log.info("******** Initial Super-CI CASCI ********")
@@ -1013,7 +1052,7 @@ def mcscf_superci(
             moa_new = np.dot(moa, c)
             mo[:, ncore:nocc] = moa_new
 
-            eris = zmc_ao2mo._CDERIS(mc, mo, cderi=cderi, level=2)
+            eris, integral_info = _build_eris(mc, mo, cderi=cderi)
             t2m = log.timer("update eris", *t2m)
             mci = zmcscf._fake_h_for_fast_casci(mc, mo, eris)
             e_nat_tot, e_cas, fcivec = mci.kernel(mo, ci0=None, verbose=verbose)
@@ -1065,8 +1104,11 @@ def mcscf_superci(
             "converged": False,
             "ci_solver_converged": ci_converged,
             "ci_solver_diagnostics": _ci_convergence_snapshot(mc.fcisolver),
-            "cholesky_active": cholesky_info["active"],
-            "cholesky_naux": int(eris.cd_pa.shape[0]),
+            "integral_representation": integral_info["representation"],
+            "integral_factorized": integral_info["factorized"],
+            "integral_source": integral_info["source"],
+            "cholesky_active": integral_info["active"],
+            "cholesky_naux": integral_info["naux"],
             "superci_metric": dict(mc.superci_metric_diagnostics),
         }
         macro_history.append(history_entry)
@@ -1204,6 +1246,7 @@ def mcscf_superci(
                     "linear_solver": last_linear_info,
                     "final_gradient_norm": float(norm_gorb),
                     "converged": False,
+                    "integrals": dict(integral_info),
                 }
                 raise RuntimeError(message)
             log.warn(message)
@@ -1285,8 +1328,7 @@ def mcscf_superci(
 
         norm_rot = np.linalg.norm(rotation - np.eye(nmo, dtype=complex))
         # e_tot, e_cas, fcivec, _, _ = mci.kernel(mo)
-        # eris = zmc_ao2mo._ERIS(mc, mo_new, level=2)
-        eris = zmc_ao2mo._CDERIS(mc, mo_new, cderi=cderi, level=2)
+        eris, integral_info = _build_eris(mc, mo_new, cderi=cderi)
         t2m = log.timer("update eris", *t2m)
         mci = zmcscf._fake_h_for_fast_casci(mc, mo_new, eris)
         e_tot, e_cas, fcivec = mci.kernel(mo_new, ci0=None, verbose=verbose)
@@ -1332,7 +1374,7 @@ def mcscf_superci(
             rejected = True
             new_rot = expmat(0.01 * dr)
             mo_new = np.dot(mo, new_rot)
-            eris = zmc_ao2mo._CDERIS(mc, mo_new, cderi=cderi, level=2)
+            eris, integral_info = _build_eris(mc, mo_new, cderi=cderi)
             t2m = log.timer("update eris", *t2m)
             mci = zmcscf._fake_h_for_fast_casci(mc, mo, eris)
             log.debug(
@@ -1425,7 +1467,27 @@ def mcscf_superci(
             mc.e_tot = e_tot
             mc.e_cas = e_cas
             mc._finalize()
+    mo_energy = None
+    if mc.canonicalization:
+        log.info("CASSCF final core/virtual canonicalization")
+        mo, fcivec, mo_energy = mc.canonicalize(
+            mo,
+            fcivec,
+            eris=eris,
+            sort=mc.sorting_mo_energy,
+            # Active natural-orbital changes are already performed inside the
+            # macroiterations and followed by a fresh CI/DMRG solve.
+            cas_natorb=False,
+            casdm1=casdm1,
+            verbose=verbose,
+        )
+    else:
+        mc.canonicalization_diagnostics = {
+            "enabled": False,
+            "reason": "mc.canonicalization is False",
+        }
     mc.mo_coeff = mo
+    mc.mo_energy = mo_energy
     mc.final_orbital_gradient_norm = float(norm_gorb)
     mc.superci_diagnostics = {
         "converged": bool(conv),
@@ -1434,13 +1496,16 @@ def mcscf_superci(
         "gradient_tolerance": float(conv_tol_grad),
         "linear_solver": last_linear_info,
         "metric": dict(mc.superci_metric_diagnostics),
-        "cholesky": cholesky_info,
+        "integrals": dict(integral_info),
+        "canonicalization": dict(mc.canonicalization_diagnostics),
+        # Retain the historical key for callers that inspect CD provenance.
+        "cholesky": dict(integral_info),
         "kramers_restricted": bool(kramers),
         "diis": bool(use_diis),
         "diis_space": int(diis_space) if use_diis else None,
         "macro_iterations": int(imacro),
     }
-    return conv, e_tot, e_cas, fcivec, mo, None
+    return conv, e_tot, e_cas, fcivec, mo, mo_energy
 
 
 if __name__ == "__main__":
