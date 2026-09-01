@@ -138,6 +138,20 @@ wheels = [
 ]
 
 [[package]]
+name = "pytblis"
+version = "0.0.16"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c7/09/036d061bad5b405a457a6f65ca6b625d02c7e0eccbb9d0f07ff9c2c866e5/pytblis-0.0.16.tar.gz", hash = "sha256:0b1e09f13f407057b29ef18efc61508fff23dfa61a6b6167e7df3209d235cc8f", size = 486788, upload-time = "2026-08-16T04:10:41.06Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cf/9b/d3b42084de4d15d43f88af32603ffe5437f7af5f32ebed387a51de3b0ce6/pytblis-0.0.16-cp312-abi3-macosx_12_0_arm64.whl", hash = "sha256:249fd0f178f8d3714fbbc2751007727597e81be7b76398ba0a3091208821587d", size = 2149504, upload-time = "2026-08-16T04:10:31.325Z" },
+    { url = "https://files.pythonhosted.org/packages/8b/c9/3b61f4f9d3a6bab54cdd60f4e518c503a66fcc1744b5bef857cc07020fd8/pytblis-0.0.16-cp312-abi3-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ab8167e8aec31da6b357f7498bb8807e3629fda63386aa0e82986906882ba954", size = 2737997, upload-time = "2026-08-16T04:10:32.631Z" },
+    { url = "https://files.pythonhosted.org/packages/81/be/94589ac86195b6c03a629097491908f06a82b6b27b225127e4998c5e6804/pytblis-0.0.16-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b913214c908ca72a5060aed163d14b327e92ce45575d123cdd6233882073c74b", size = 6048335, upload-time = "2026-08-16T04:10:34.463Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "9.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -192,6 +206,7 @@ dependencies = [
     { name = "h5py" },
     { name = "numpy" },
     { name = "pyscf" },
+    { name = "pytblis" },
     { name = "scipy" },
 ]
 
@@ -206,6 +221,7 @@ requires-dist = [
     { name = "h5py", specifier = ">=3.10" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pyscf", specifier = "==2.14.0" },
+    { name = "pytblis", specifier = "==0.0.16" },
     { name = "scipy", specifier = ">=1.11" },
 ]
 

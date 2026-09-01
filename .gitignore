@@ -113,3 +113,5 @@ dmrg_checkpoint/
 /tests/*
 
 .pytest_cache/
+
+*.pdf

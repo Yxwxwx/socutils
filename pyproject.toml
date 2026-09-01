@@ -13,6 +13,7 @@ dependencies = [
     "h5py>=3.10",
     "numpy>=1.26",
     "pyscf==2.14.0",
+    "pytblis==0.0.16",
     "scipy>=1.11",
 ]
 

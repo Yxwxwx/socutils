@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import itertools
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -76,6 +77,8 @@ SUBSPACE_ORDER = ("ijrs", "rsi", "ijr", "rs", "ij", "ir", "r", "i")
 
 _ERIS_BASES = frozenset(("input_mo", "semicanonical"))
 _DENOMINATOR_MODES = frozenset(("hermitianized", "strict_si"))
+_CONTRACTION_BACKENDS = frozenset(("numpy", "pytblis"))
+_DEFAULT_CONTRACTION_BACKEND = "pytblis"
 
 
 def _select_root_ci(ci, root, *, nroots=1):
@@ -131,6 +134,34 @@ def _normalize_denominator_mode(denominator_mode) -> str:
         choices = ", ".join(sorted(_DENOMINATOR_MODES))
         raise ValueError(f"denominator_mode must be one of: {choices}")
     return denominator_mode
+
+
+def _normalize_contraction_backend(contraction_backend) -> str:
+    if (
+        not isinstance(contraction_backend, str)
+        or contraction_backend not in _CONTRACTION_BACKENDS
+    ):
+        choices = ", ".join(sorted(_CONTRACTION_BACKENDS))
+        raise ValueError(f"contraction_backend must be one of: {choices}")
+    return contraction_backend
+
+
+@lru_cache(maxsize=2)
+def _wick_einsum_namespace(contraction_backend):
+    """Return the late-bound ``np.einsum`` namespace for Wick source."""
+
+    contraction_backend = _normalize_contraction_backend(contraction_backend)
+    if contraction_backend == "numpy":
+        einsum = np.einsum
+    else:
+        try:
+            from pytblis import einsum
+        except ImportError as error:  # pragma: no cover - required dependency
+            raise ImportError(
+                "contraction_backend='pytblis' requires the pytblis package"
+            ) from error
+    return SimpleNamespace(einsum=einsum)
+
 
 # Each expression is the fixed-free-index component of P_omega H |Phi>.
 # The factors and signs follow the unantisymmetrized Hamiltonian above.  In
@@ -913,6 +944,7 @@ def _evaluate_wick_subspaces(
     si_numerator_noise_allowance=1.0e-12,
     si_energy_imag_l1_tol=1.0e-10,
     si_projection_shift_l1_tol=1.0e-12,
+    contraction_backend=_DEFAULT_CONTRACTION_BACKEND,
     return_arrays=False,
     return_timings=False,
     return_diagnostics=False,
@@ -920,6 +952,12 @@ def _evaluate_wick_subspaces(
     """Evaluate all generated equations in the supplied semicanonical basis."""
 
     denominator_mode = _normalize_denominator_mode(denominator_mode)
+    contraction_backend = _normalize_contraction_backend(contraction_backend)
+    # Block2 emits source containing ``np.einsum``.  That global name is
+    # resolved only here at exec time, so the cached source is backend-agnostic.
+    wick_globals = {
+        "np": _wick_einsum_namespace(contraction_backend),
+    }
     equations = _compile_wick_equations()
     base_context = _execution_context(eris, pdms)
     sub_eners = {}
@@ -943,11 +981,19 @@ def _evaluate_wick_subspaces(
         left_commutator = np.zeros(shape, dtype=dtype)
         local_context = dict(base_context)
         local_context.update(norm=norm)
-        exec(equations.norm_code[key], {"np": np}, local_context)
+        exec(equations.norm_code[key], wick_globals, local_context)
         local_context["commutator"] = right_commutator
-        exec(equations.right_commutator_code[key], {"np": np}, local_context)
+        exec(
+            equations.right_commutator_code[key],
+            wick_globals,
+            local_context,
+        )
         local_context["commutator"] = left_commutator
-        exec(equations.left_commutator_code[key], {"np": np}, local_context)
+        exec(
+            equations.left_commutator_code[key],
+            wick_globals,
+            local_context,
+        )
         # This reconciles two independently contracted representations of the
         # *same one-sided* scalar.  In exact arithmetic left.conj() == right,
         # so unlike the Hermitian half-sum below it does not remove a physical
@@ -1100,6 +1146,7 @@ def _evaluate_wick_subspaces(
 
         class_diagnostics = {
             **branch_diagnostics,
+            "contraction_backend": contraction_backend,
             "denominator_mode": denominator_mode,
             "selected_denominator_source": (
                 "reconciled_right_si"
@@ -1710,6 +1757,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         self.norm_tol = 1.0e-14
         self.denominator_tol = 1.0e-12
         self.denominator_mode = "strict_si"
+        self.contraction_backend = _DEFAULT_CONTRACTION_BACKEND
         self.si_gap_imag_atol = 1.0e-10
         self.si_gap_imag_rtol = 1.0e-9
         self.si_numerator_noise_allowance = 1.0e-12
@@ -1776,8 +1824,13 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         eris_basis="input_mo",
         denominator_mode=None,
         root=None,
+        contraction_backend=None,
     ):
-        """Compute one root-specific SC-NEVPT2 correction."""
+        """Compute one root-specific SC-NEVPT2 correction.
+
+        ``contraction_backend`` selects ``"pytblis"`` (the default) or the
+        NumPy reference implementation for the Block2-generated contractions.
+        """
 
         if mc is None:
             mc = self._mc
@@ -1788,6 +1841,12 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             denominator_mode = self.denominator_mode
         denominator_mode = _normalize_denominator_mode(denominator_mode)
         self.denominator_mode = denominator_mode
+        if contraction_backend is None:
+            contraction_backend = self.contraction_backend
+        contraction_backend = _normalize_contraction_backend(
+            contraction_backend
+        )
+        self.contraction_backend = contraction_backend
         if root is None:
             root = self.root
         root = int(root)
@@ -1894,6 +1953,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             si_numerator_noise_allowance=self.si_numerator_noise_allowance,
             si_energy_imag_l1_tol=self.si_energy_imag_l1_tol,
             si_projection_shift_l1_tol=self.si_projection_shift_l1_tol,
+            contraction_backend=contraction_backend,
             return_timings=True,
             return_diagnostics=True,
         )
@@ -1946,10 +2006,12 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         )
         logger.info(
             self,
-            "root %d denominator_mode=%s strict_si_compatible=%s; "
+            "root %d contraction_backend=%s denominator_mode=%s "
+            "strict_si_compatible=%s; "
             "physical-scalar realness tolerance = %.3e "
             "(configured %.3e; DMRG local threshold bound %.3e is diagnostic only)",
             root,
+            contraction_backend,
             denominator_mode,
             self.strict_si_compatible,
             self.scalar_tolerance,
