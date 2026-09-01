@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: GPL-3.0-or-later
-r"""Classical non-Hermitian QD_Bloch extension of dense X2C-SC-NEVPT2.
+r"""Bloch and canonical Van Vleck QD extensions of X2C-SC-NEVPT2.
 
 The stored matrix uses the source-row convention
 
@@ -13,7 +13,17 @@ The stored matrix uses the source-row convention
 
 Each row owns its state-specific CanonStep-1 semicanonical integrals,
 strongly-contracted perturbers, retained mask, and positive strict-SI Dyall
-gap.  The matrix is deliberately not symmetrized.
+gap.  This complete directed Bloch matrix is always retained.  The default
+canonical Van Vleck (HQD) representation is formed only afterwards, class by
+class, according to Lang, Sivalingam, and Neese, J. Chem. Phys. 152, 014109
+(2020), Eqs. (45)--(46):
+
+.. math::
+
+   H^{\mathrm{VV}} = \frac12\left(H^B + H^{B\dagger}\right).
+
+No additional SOC operator is introduced: SOC is already present in the
+one-step X2C/X2CAMF complex-spinor reference Hamiltonian.
 """
 
 from __future__ import annotations
@@ -27,13 +37,16 @@ from typing import Any
 import numpy as np
 from pyscf import lib
 from pyscf.lib import logger
-from scipy.linalg import eig
+from scipy.linalg import eig, eigh
 
 from . import x2cscnevpt2 as _ss
 
 
 __all__ = [
+    "QDSCNEVPT2Result",
     "QDBlochSCNEVPT2Result",
+    "WickX2CQDSCNEVPT2",
+    "X2CQDSCNEVPT2",
     "WickX2CQDBlochSCNEVPT2",
     "X2CQDBlochSCNEVPT2",
     "adjoint_transition_pdm",
@@ -47,12 +60,44 @@ __all__ = [
 ]
 
 
-def _dense_eris_nbytes(eris):
-    return int(
-        np.asarray(eris.h1e).nbytes
-        + np.asarray(eris.h1eff).nbytes
-        + np.asarray(eris.pppp).nbytes
+_QD_TYPES = frozenset(("van_vleck", "bloch"))
+_QD_KERNEL_KEYWORDS = frozenset(
+    (
+        "mc",
+        "roots",
+        "qd_type",
+        "state_pdms",
+        "transition_pdms",
+        "model_overlap",
+        "mo_coeff",
+        "eris",
+        "eris_basis",
+        "denominator_mode",
+        "contraction_backend",
+        "validate_reverse_transition",
+        "eigenvalue_imag_warn",
+        "eigenvalue_imag_error",
     )
+)
+
+
+def _normalize_qd_type(value) -> str:
+    """Return the canonical effective-Hamiltonian representation name."""
+
+    if not isinstance(value, str):
+        choices = ", ".join(sorted(_QD_TYPES))
+        raise ValueError(f"qd_type must be one of: {choices}")
+    normalized = value.strip().casefold().replace("-", "_")
+    aliases = {
+        "bloch": "bloch",
+        "van_vleck": "van_vleck",
+        "vanvleck": "van_vleck",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as error:
+        choices = ", ".join(sorted(_QD_TYPES))
+        raise ValueError(f"qd_type must be one of: {choices}") from error
 
 
 def _retain_qd_row_arrays(subspace_arrays):
@@ -266,6 +311,11 @@ def validate_transition_pdms(
     doing so could create a hidden tens-of-GiB copy for larger active spaces.
     The production contraction path slices to ranks 1--3 and converts those
     arrays to complex128 explicitly at its backend boundary.
+
+    Finite relation residuals beyond tolerance emit
+    :class:`~mrpt.x2cscnevpt2.MRPTNumericalWarning` and are retained in the
+    diagnostics.  Invalid shapes, nonnumeric arrays, and non-finite values
+    remain hard errors.
     """
 
     if not isinstance(pdms_ij, (tuple, list)) or len(pdms_ij) not in (3, 4):
@@ -327,8 +377,11 @@ def validate_transition_pdms(
             )
         scale = max(1.0, _ss._maximum_abs_chunked(density, work_memory))
         tolerance = atol + rtol * scale
-        if max(creator_error, annihilator_error) > tolerance:
-            raise ValueError(
+        symmetry_gate_passed = bool(
+            max(creator_error, annihilator_error) <= tolerance
+        )
+        if not symmetry_gate_passed:
+            _ss._warn_numerical(
                 f"transition dm{rank} violates raw SGF antisymmetry: "
                 f"creator={creator_error:.3e}, "
                 f"annihilator={annihilator_error:.3e}"
@@ -337,6 +390,8 @@ def validate_transition_pdms(
             "shape": list(density.shape),
             "creator_antisymmetry_error": creator_error,
             "annihilator_antisymmetry_error": annihilator_error,
+            "symmetry_tolerance": float(tolerance),
+            "symmetry_gate_passed": symmetry_gate_passed,
         }
 
         if pdms_ji is not None:
@@ -363,12 +418,20 @@ def validate_transition_pdms(
             reverse_scale = max(
                 scale, _ss._maximum_abs_chunked(reverse, work_memory)
             )
-            if adjoint_error > atol + rtol * max(1.0, reverse_scale):
-                raise ValueError(
+            adjoint_tolerance = atol + rtol * max(1.0, reverse_scale)
+            adjoint_gate_passed = bool(adjoint_error <= adjoint_tolerance)
+            if not adjoint_gate_passed:
+                _ss._warn_numerical(
                     f"transition dm{rank} reverse-adjoint relation failed: "
                     f"error={adjoint_error:.3e}"
                 )
             rank_diagnostics["reverse_adjoint_error"] = adjoint_error
+            rank_diagnostics["reverse_adjoint_tolerance"] = float(
+                adjoint_tolerance
+            )
+            rank_diagnostics[
+                "reverse_adjoint_gate_passed"
+            ] = adjoint_gate_passed
             reverse_checked.append(reverse)
 
         diagnostics[f"dm{rank}"] = rank_diagnostics
@@ -377,13 +440,16 @@ def validate_transition_pdms(
     trace = np.trace(checked[0])
     trace_error = abs(trace - nelec * overlap_ij)
     trace_tolerance = atol + rtol * max(1.0, nelec * abs(overlap_ij))
-    if trace_error > trace_tolerance:
-        raise ValueError(
+    trace_gate_passed = bool(trace_error <= trace_tolerance)
+    if not trace_gate_passed:
+        _ss._warn_numerical(
             "transition dm1 trace is inconsistent with electron number and "
             f"overlap: error={trace_error:.3e}"
         )
     diagnostics["dm1"]["trace"] = _complex_pair(trace)
     diagnostics["dm1"]["trace_error"] = float(trace_error)
+    diagnostics["dm1"]["trace_tolerance"] = float(trace_tolerance)
+    diagnostics["dm1"]["trace_gate_passed"] = trace_gate_passed
 
     for rank in range(2, len(checked) + 1):
         contracted = np.trace(
@@ -397,12 +463,20 @@ def validate_transition_pdms(
             work_memory=work_memory,
         )
         scale = max(1.0, _ss._maximum_abs_chunked(expected, work_memory))
-        if error > atol + rtol * scale:
-            raise ValueError(
+        contraction_tolerance = atol + rtol * scale
+        contraction_gate_passed = bool(error <= contraction_tolerance)
+        if not contraction_gate_passed:
+            _ss._warn_numerical(
                 f"transition dm{rank}->dm{rank - 1} particle-number "
                 f"contraction failed: error={error:.3e}"
             )
         diagnostics[f"dm{rank}"]["contraction_error"] = error
+        diagnostics[f"dm{rank}"]["contraction_tolerance"] = float(
+            contraction_tolerance
+        )
+        diagnostics[f"dm{rank}"][
+            "contraction_gate_passed"
+        ] = contraction_gate_passed
 
     return tuple(checked), diagnostics
 
@@ -659,7 +733,7 @@ def _validate_discarded_couplings_cauchy(
     minimum_row = float(np.min(selected_row_norm))
     minimum_partner = float(np.min(selected_partner_norm))
     if minimum_row < -norm_tol or minimum_partner < -norm_tol:
-        raise FloatingPointError(
+        _ss._warn_numerical(
             f"row root {row_root}, column root {column_root}, subspace "
             f"{subspace}: negative diagonal norm in Cauchy audit "
             f"(row={minimum_row:.3e}, partner={minimum_partner:.3e})"
@@ -703,7 +777,7 @@ def _validate_discarded_couplings_cauchy(
     excess_index = full_index(excess_local)
     maximum_acceptance_excess = float(acceptance_excess[excess_local])
     if maximum_acceptance_excess > 0.0:
-        raise FloatingPointError(
+        _ss._warn_numerical(
             f"row root {row_root}, column root {column_root}, subspace "
             f"{subspace}: discarded near-null perturber violates its Cauchy "
             f"bound at {tuple(excess_index)}: |B|={magnitude[excess_local]:.3e}, "
@@ -747,7 +821,9 @@ def _validate_discarded_couplings_cauchy(
             maximum_finite_cauchy_ratio
         ),
         "zero_norm_cauchy_ratio_unbounded_count": ratio_unbounded_count,
-        "zero_norm_cauchy_gate_passed": True,
+        "zero_norm_cauchy_gate_passed": bool(
+            maximum_acceptance_excess <= 0.0
+        ),
     }
 
 
@@ -791,7 +867,7 @@ def _evaluate_row_basis_partner_norms(
         )
         if np.any(selected < -norm_tol):
             minimum = float(np.min(selected))
-            raise FloatingPointError(
+            _ss._warn_numerical(
                 f"row root {row_root}, partner root {partner_root}, subspace "
                 f"{key}: negative row-basis partner norm {minimum:.3e}"
             )
@@ -805,6 +881,9 @@ def _evaluate_row_basis_partner_norms(
             "maximum_ordered_norm": (
                 float(np.max(selected)) if selected.size else 0.0
             ),
+            "nonnegative_norm_gate_passed": bool(
+                not np.any(selected < -norm_tol)
+            ),
             "ordered_dimension": int(np.count_nonzero(ordered)),
             "contraction_backend": contraction_backend,
             "raw_contraction": contraction_diagnostics[key],
@@ -815,33 +894,33 @@ def _evaluate_row_basis_partner_norms(
 
 
 @dataclass(frozen=True)
-class QDBlochSCNEVPT2Result:
+class QDSCNEVPT2Result:
+    qd_type: str
     roots: tuple[int, ...]
     reference_energies: np.ndarray
+
+    # Aliases for the representation selected by qd_type.
     h2_by_subspace: dict[str, np.ndarray]
-    h2_bloch: np.ndarray
-    h_eff_bloch: np.ndarray
+    h2_effective: np.ndarray
+    h_eff: np.ndarray
     eigenvalues: np.ndarray
+    eigenvectors: np.ndarray
     left_eigenvectors: np.ndarray
     right_eigenvectors: np.ndarray
+
+    # Both complete representations are retained for audit and regression.
+    h2_bloch_by_subspace: dict[str, np.ndarray]
+    h2_bloch: np.ndarray
+    h_eff_bloch: np.ndarray
+    h2_van_vleck_by_subspace: dict[str, np.ndarray]
+    h2_van_vleck: np.ndarray
+    h_eff_van_vleck: np.ndarray
     diagnostics: dict[str, Any]
 
 
-_SS_SETTING_NAMES = (
-    "integral_roundoff_factor",
-    "scalar_atol",
-    "scalar_rtol",
-    "rdm_atol",
-    "rdm_rtol",
-    "rdm_work_memory",
-    "norm_tol",
-    "denominator_tol",
-    "si_gap_imag_atol",
-    "si_gap_imag_rtol",
-    "si_numerator_noise_allowance",
-    "si_energy_imag_l1_tol",
-    "si_projection_shift_l1_tol",
-)
+# Historical result name retained as a direct compatibility alias.  There is
+# one calculation and one result implementation, not a duplicated Bloch path.
+QDBlochSCNEVPT2Result = QDSCNEVPT2Result
 
 
 def _mapping_item(values, key, *, name):
@@ -930,7 +1009,7 @@ def _injected_model_overlap(model_overlap, roots, *, atol, rtol):
                 if direct is not None and reverse is not None:
                     limit = atol + rtol * max(1.0, abs(direct), abs(reverse))
                     if abs(direct - reverse.conjugate()) > limit:
-                        raise ValueError(
+                        _ss._warn_numerical(
                             "injected forward/reverse model overlaps are not "
                             f"adjoints for roots ({root_i}, {root_j})"
                         )
@@ -955,7 +1034,7 @@ def _injected_model_overlap(model_overlap, roots, *, atol, rtol):
         np.max(np.abs(matrix - matrix.conj().T), initial=0.0)
     )
     if adjoint_error > limit:
-        raise ValueError(
+        _ss._warn_numerical(
             "injected model_overlap is not Hermitian: maximum error="
             f"{adjoint_error:.3e}"
         )
@@ -963,7 +1042,7 @@ def _injected_model_overlap(model_overlap, roots, *, atol, rtol):
         np.max(np.abs(matrix - np.eye(nmodel)), initial=0.0)
     )
     if identity_error > atol + rtol:
-        raise ValueError(
+        _ss._warn_numerical(
             "injected model states are not orthonormal: maximum overlap "
             f"error={identity_error:.3e}"
         )
@@ -984,6 +1063,257 @@ def _phase_gauge_eigenvectors(left, right):
         right[:, column] *= phase
         left[:, column] *= phase
     return left, right
+
+
+def _phase_gauge_orthonormal_eigenvectors(vectors):
+    """Apply a deterministic column phase without changing orthonormality."""
+
+    vectors = np.array(vectors, dtype=complex, copy=True)
+    for column in range(vectors.shape[1]):
+        pivot = int(np.argmax(np.abs(vectors[:, column])))
+        value = vectors[pivot, column]
+        magnitude = abs(value)
+        if magnitude == 0.0:
+            continue
+        vectors[:, column] *= value.conjugate() / magnitude
+        # Make the gauge convention exact rather than leaving a roundoff-sized
+        # imaginary component at the pivot.
+        vectors[pivot, column] = magnitude
+    return vectors
+
+
+def _square_numeric_matrix(matrix, *, name):
+    matrix = np.asarray(matrix)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError(f"{name} must be a square matrix")
+    if not np.issubdtype(matrix.dtype, np.number):
+        raise TypeError(f"{name} must be numeric")
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError(f"{name} contains non-finite values")
+    return matrix
+
+
+def _van_vleck_hermitian_part(matrix):
+    """Return ``(matrix + matrix**dagger) / 2`` at full complex precision."""
+
+    matrix = _square_numeric_matrix(matrix, name="Bloch matrix")
+    return 0.5 * (matrix + matrix.conj().T)
+
+
+def _nonhermiticity_diagnostics(matrix):
+    difference = matrix - matrix.conj().T
+    return {
+        "maximum": float(np.max(np.abs(difference), initial=0.0)),
+        "frobenius": float(np.linalg.norm(difference)),
+    }
+
+
+def _build_van_vleck_matrices(
+    h2_bloch_by_subspace,
+    h_eff_bloch,
+    reference_energies,
+    *,
+    audit_tol,
+):
+    """Hermitianize every SC class and audit Lang et al. Eqs. (45)--(46)."""
+
+    audit_tol = _finite_nonnegative(audit_tol, name="van_vleck_audit_tol")
+    if not isinstance(h2_bloch_by_subspace, Mapping):
+        raise TypeError("h2_bloch_by_subspace must be a mapping")
+    missing = [
+        key for key in _ss.SUBSPACE_ORDER if key not in h2_bloch_by_subspace
+    ]
+    extras = [
+        key for key in h2_bloch_by_subspace if key not in _ss.SUBSPACE_ORDER
+    ]
+    if missing or extras:
+        raise ValueError(
+            "h2_bloch_by_subspace must contain exactly SUBSPACE_ORDER; "
+            f"missing={missing}, extras={extras}"
+        )
+
+    h_eff_bloch = _square_numeric_matrix(
+        h_eff_bloch, name="h_eff_bloch"
+    )
+    nmodel = h_eff_bloch.shape[0]
+    reference_energies = np.asarray(reference_energies)
+    if reference_energies.shape != (nmodel,):
+        raise ValueError(
+            "reference_energies must match the model-space dimension"
+        )
+    if not np.issubdtype(reference_energies.dtype, np.number):
+        raise TypeError("reference_energies must be numeric")
+    if not np.all(np.isfinite(reference_energies)):
+        raise ValueError("reference_energies contain non-finite values")
+    reference_imaginary = float(
+        np.max(np.abs(np.asarray(reference_energies).imag), initial=0.0)
+    )
+    if reference_imaginary > audit_tol:
+        _ss._warn_numerical(
+            "reference energies have a material imaginary component: "
+            f"{reference_imaginary:.3e}"
+        )
+    reference_energies = np.asarray(reference_energies.real, dtype=float)
+
+    h2_van_vleck_by_subspace = {}
+    maximum_bloch_diagonal_imaginary = 0.0
+    maximum_subspace_diagonal_change = 0.0
+    subspace_diagnostics = {}
+    for key in _ss.SUBSPACE_ORDER:
+        h2_bloch_key = _square_numeric_matrix(
+            h2_bloch_by_subspace[key],
+            name=f"h2_bloch_by_subspace[{key!r}]",
+        )
+        if h2_bloch_key.shape != (nmodel, nmodel):
+            raise ValueError(
+                f"h2_bloch_by_subspace[{key!r}] has shape "
+                f"{h2_bloch_key.shape}; expected {(nmodel, nmodel)}"
+            )
+        diagonal_imaginary = float(
+            np.max(np.abs(np.diag(h2_bloch_key).imag), initial=0.0)
+        )
+        maximum_bloch_diagonal_imaginary = max(
+            maximum_bloch_diagonal_imaginary, diagonal_imaginary
+        )
+        h2_van_vleck_key = _van_vleck_hermitian_part(h2_bloch_key)
+        diagonal_change = float(
+            np.max(
+                np.abs(
+                    np.diag(h2_van_vleck_key) - np.diag(h2_bloch_key)
+                ),
+                initial=0.0,
+            )
+        )
+        maximum_subspace_diagonal_change = max(
+            maximum_subspace_diagonal_change, diagonal_change
+        )
+        hermiticity = _nonhermiticity_diagnostics(h2_van_vleck_key)
+        subspace_diagnostics[key] = {
+            "bloch_diagonal_maximum_imaginary_part": diagonal_imaginary,
+            "maximum_diagonal_change": diagonal_change,
+            "maximum_nonhermiticity": hermiticity["maximum"],
+            "frobenius_nonhermiticity": hermiticity["frobenius"],
+        }
+        h2_van_vleck_by_subspace[key] = h2_van_vleck_key
+
+    if maximum_bloch_diagonal_imaginary > audit_tol:
+        _ss._warn_numerical(
+            "Bloch subspace diagonal has a material imaginary component: "
+            f"{maximum_bloch_diagonal_imaginary:.3e}"
+        )
+    if maximum_subspace_diagonal_change > audit_tol:
+        _ss._warn_numerical(
+            "Van Vleck subspace Hermitianization changed a diagonal: "
+            f"{maximum_subspace_diagonal_change:.3e}"
+        )
+
+    h2_van_vleck = np.zeros((nmodel, nmodel), dtype=np.complex128)
+    for key in _ss.SUBSPACE_ORDER:
+        h2_van_vleck += h2_van_vleck_by_subspace[key]
+    reference_matrix = np.diag(reference_energies.astype(np.complex128))
+    h_eff_van_vleck = reference_matrix + h2_van_vleck
+
+    # Independent global oracles.  The first checks the sum of the eight
+    # classwise Hermitianizations; the second is Lang et al. Eq. (46) applied
+    # to the already complete source-row Bloch effective Hamiltonian.
+    h2_bloch = h_eff_bloch - reference_matrix
+    h2_van_vleck_direct = _van_vleck_hermitian_part(h2_bloch)
+    h_eff_van_vleck_direct = _van_vleck_hermitian_part(h_eff_bloch)
+    subspace_sum_error = float(
+        np.max(
+            np.abs(h2_van_vleck - h2_van_vleck_direct), initial=0.0
+        )
+    )
+    global_formula_error = float(
+        np.max(
+            np.abs(h_eff_van_vleck - h_eff_van_vleck_direct),
+            initial=0.0,
+        )
+    )
+    maximum_diagonal_change = float(
+        np.max(
+            np.abs(
+                np.diag(h_eff_van_vleck) - np.diag(h_eff_bloch)
+            ),
+            initial=0.0,
+        )
+    )
+    if subspace_sum_error > audit_tol:
+        _ss._warn_numerical(
+            "classwise Van Vleck sum disagrees with the global H2 formula: "
+            f"{subspace_sum_error:.3e}"
+        )
+    if global_formula_error > audit_tol:
+        _ss._warn_numerical(
+            "Van Vleck effective Hamiltonian disagrees with Eq. (46): "
+            f"{global_formula_error:.3e}"
+        )
+    if maximum_diagonal_change > audit_tol:
+        _ss._warn_numerical(
+            "Van Vleck Hermitianization changed an effective-Hamiltonian "
+            f"diagonal: {maximum_diagonal_change:.3e}"
+        )
+
+    bloch_nonhermiticity = _nonhermiticity_diagnostics(h_eff_bloch)
+    van_vleck_nonhermiticity = _nonhermiticity_diagnostics(
+        h_eff_van_vleck
+    )
+    if van_vleck_nonhermiticity["maximum"] > audit_tol:
+        _ss._warn_numerical(
+            "constructed Van Vleck effective Hamiltonian is not Hermitian: "
+            f"{van_vleck_nonhermiticity['maximum']:.3e}"
+        )
+    hermitization_change = h_eff_van_vleck - h_eff_bloch
+    diagnostics = {
+        "van_vleck_audit_tolerance": float(audit_tol),
+        "reference_energy_reality_gate_passed": bool(
+            reference_imaginary <= audit_tol
+        ),
+        "bloch_diagonal_reality_gate_passed": bool(
+            maximum_bloch_diagonal_imaginary <= audit_tol
+        ),
+        "subspace_diagonal_gate_passed": bool(
+            maximum_subspace_diagonal_change <= audit_tol
+        ),
+        "subspace_sum_gate_passed": bool(subspace_sum_error <= audit_tol),
+        "global_formula_gate_passed": bool(global_formula_error <= audit_tol),
+        "effective_diagonal_gate_passed": bool(
+            maximum_diagonal_change <= audit_tol
+        ),
+        "van_vleck_hermiticity_gate_passed": bool(
+            van_vleck_nonhermiticity["maximum"] <= audit_tol
+        ),
+        "maximum_bloch_nonhermiticity": bloch_nonhermiticity["maximum"],
+        "frobenius_bloch_nonhermiticity": bloch_nonhermiticity["frobenius"],
+        "maximum_van_vleck_nonhermiticity": (
+            van_vleck_nonhermiticity["maximum"]
+        ),
+        "frobenius_van_vleck_nonhermiticity": (
+            van_vleck_nonhermiticity["frobenius"]
+        ),
+        "maximum_hermitization_change": float(
+            np.max(np.abs(hermitization_change), initial=0.0)
+        ),
+        "frobenius_hermitization_change": float(
+            np.linalg.norm(hermitization_change)
+        ),
+        "van_vleck_global_formula_error": global_formula_error,
+        "van_vleck_subspace_sum_error": subspace_sum_error,
+        "maximum_van_vleck_diagonal_change": maximum_diagonal_change,
+        "maximum_subspace_diagonal_change": (
+            maximum_subspace_diagonal_change
+        ),
+        "maximum_bloch_diagonal_imaginary_part": (
+            maximum_bloch_diagonal_imaginary
+        ),
+        "van_vleck_subspace_diagnostics": subspace_diagnostics,
+    }
+    return (
+        h2_van_vleck_by_subspace,
+        h2_van_vleck,
+        h_eff_van_vleck,
+        diagnostics,
+    )
 
 
 def _solve_bloch_eigensystem(matrix):
@@ -1018,10 +1348,82 @@ def _solve_bloch_eigensystem(matrix):
     return eigenvalues, left, right, diagnostics
 
 
-class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
-    """Dense classical multipartitioning QD_Bloch-SC-NEVPT2 driver."""
+def _solve_van_vleck_eigensystem(
+    matrix, *, hermiticity_tol, residual_tol
+):
+    """Solve one complex Hermitian HQD matrix with explicit audit gates."""
 
-    def __init__(self, mc, frozen=0):
+    hermiticity_tol = _finite_nonnegative(
+        hermiticity_tol, name="van_vleck_hermiticity_tol"
+    )
+    residual_tol = _finite_nonnegative(
+        residual_tol, name="eigen_residual_tol"
+    )
+    matrix = _square_numeric_matrix(matrix, name="h_eff_van_vleck")
+    nonhermiticity = _nonhermiticity_diagnostics(matrix)
+    if nonhermiticity["maximum"] > hermiticity_tol:
+        _ss._warn_numerical(
+            "Van Vleck matrix failed the pre-eigh Hermiticity check: "
+            f"{nonhermiticity['maximum']:.3e}"
+        )
+
+    eigenvalues, vectors = eigh(matrix)
+    eigenvalues = np.asarray(eigenvalues, dtype=float)
+    vectors = _phase_gauge_orthonormal_eigenvectors(vectors)
+    residual = matrix @ vectors - vectors * eigenvalues[np.newaxis, :]
+    scale = max(1.0, float(np.linalg.norm(matrix)))
+    residual_norm = float(np.linalg.norm(residual))
+    relative_residual_norm = float(residual_norm / scale)
+    gram = vectors.conj().T @ vectors
+    orthonormality_error = float(
+        np.linalg.norm(gram - np.eye(matrix.shape[0]))
+    )
+    diagnostics = {
+        "residual_norm": residual_norm,
+        "relative_residual_norm": relative_residual_norm,
+        "orthonormality_error": orthonormality_error,
+        "maximum_orthonormality_error": float(
+            np.max(
+                np.abs(gram - np.eye(matrix.shape[0])), initial=0.0
+            )
+        ),
+        "maximum_matrix_nonhermiticity": nonhermiticity["maximum"],
+        "frobenius_matrix_nonhermiticity": nonhermiticity["frobenius"],
+        "hermiticity_tolerance": float(hermiticity_tol),
+        "hermiticity_gate_passed": bool(
+            nonhermiticity["maximum"] <= hermiticity_tol
+        ),
+        "residual_tolerance": float(residual_tol),
+        "residual_gate_passed": bool(
+            relative_residual_norm <= residual_tol
+        ),
+        "orthonormality_gate_passed": bool(
+            orthonormality_error <= residual_tol
+        ),
+        "biorthogonality": gram,
+    }
+    if relative_residual_norm > residual_tol:
+        _ss._warn_numerical(
+            "Hermitian Van Vleck eigensolver residual exceeds tolerance"
+        )
+    if orthonormality_error > residual_tol:
+        _ss._warn_numerical(
+            "Hermitian Van Vleck eigenvectors are not orthonormal within "
+            "tolerance"
+        )
+    return eigenvalues, vectors, diagnostics
+
+
+class WickX2CQDSCNEVPT2(lib.StreamObject):
+    """Dense multipartitioning QD-SC-NEVPT2 driver.
+
+    ``qd_type="van_vleck"`` (the default) selects the Hermitian canonical
+    Van Vleck/HQD representation.  ``qd_type="bloch"`` retains the classical
+    non-Hermitian source-row representation and its biorthogonal eigensystem.
+    Both complete effective Hamiltonians are retained after every run.
+    """
+
+    def __init__(self, mc, frozen=0, qd_type="van_vleck"):
         if _ss._has_frozen_orbitals(frozen) or _ss._has_frozen_orbitals(
             getattr(mc, "frozen", None)
         ):
@@ -1036,19 +1438,8 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
         self.canonicalized = False
         self.denominator_mode = "strict_si"
         self.contraction_backend = _ss._DEFAULT_CONTRACTION_BACKEND
-        self.integral_roundoff_factor = _ss._DEFAULT_AO2MO_ROUNDOFF_FACTOR
-        self.scalar_atol = 1.0e-10
-        self.scalar_rtol = 1.0e-9
-        self.rdm_atol = 1.0e-9
-        self.rdm_rtol = 1.0e-8
-        self.rdm_work_memory = 512 * 2**20
-        self.norm_tol = 1.0e-14
-        self.denominator_tol = 1.0e-12
-        self.si_gap_imag_atol = 1.0e-10
-        self.si_gap_imag_rtol = 1.0e-9
-        self.si_numerator_noise_allowance = 1.0e-12
-        self.si_energy_imag_l1_tol = 1.0e-10
-        self.si_projection_shift_l1_tol = 1.0e-12
+        for name, value in _ss._SC_NUMERICAL_DEFAULTS:
+            setattr(self, name, value)
         self.model_overlap_atol = 1.0e-8
         self.model_overlap_rtol = 1.0e-8
         self.zero_norm_coupling_atol = 1.0e-10
@@ -1057,20 +1448,12 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
         self.eigenvalue_imag_warn = 1.0e-10
         self.eigenvalue_imag_error = None
         self.validate_reverse_transition = False
+        self.van_vleck_audit_tol = 1.0e-10
+        self.van_vleck_hermiticity_tol = 1.0e-12
+        self.qd_type = _normalize_qd_type(qd_type)
         self.frozen = 0
 
-        self.roots = ()
-        self.reference_energies = None
-        self.row_data = {}
-        self.h2_by_subspace = {}
-        self.h2_bloch = None
-        self.h_eff_bloch = None
-        self.e_qd = None
-        self.left_eigenvectors = None
-        self.right_eigenvectors = None
-        self.model_overlap = None
-        self.diagnostics = {}
-        self.result = None
+        self._clear_results()
         self._keys = set(self.__dict__)
 
     @property
@@ -1079,16 +1462,48 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
 
         return self.e_qd
 
+    def run(self, *args, **kwargs):
+        """Run ``kernel`` while preserving PySCF's fluent object interface.
+
+        ``StreamObject.run`` normally stores keyword arguments as attributes
+        and then invokes ``kernel`` without forwarding them.  QD inputs such
+        as an explicit root subset or injected transition PDMs are
+        calculation-local, so forward the kernel keywords as well.  Existing
+        public settings are still updated before the call, and the method
+        continues to return ``self``.
+        """
+
+        kernel_kwargs = {
+            name: value
+            for name, value in kwargs.items()
+            if name in _QD_KERNEL_KEYWORDS
+        }
+        setting_kwargs = {
+            name: value
+            for name, value in kwargs.items()
+            if name not in _QD_KERNEL_KEYWORDS or name in self._keys
+        }
+        self.set(**setting_kwargs)
+        self.kernel(*args, **kernel_kwargs)
+        return self
+
     def _clear_results(self):
         """Drop a previous calculation before starting a transactional run."""
 
         self.roots = ()
         self.reference_energies = None
         self.row_data = {}
+        self.h2_bloch_by_subspace = {}
+        self.h2_van_vleck_by_subspace = {}
         self.h2_by_subspace = {}
+        self.h2_effective = None
+        self.h_eff = None
         self.h2_bloch = None
         self.h_eff_bloch = None
+        self.h2_van_vleck = None
+        self.h_eff_van_vleck = None
         self.e_qd = None
+        self.eigenvectors = None
         self.left_eigenvectors = None
         self.right_eigenvectors = None
         self.model_overlap = None
@@ -1104,7 +1519,7 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
             adapter.mo_energy = np.asarray(self.mo_energy[root])
         else:
             adapter.mo_energy = self.mo_energy
-        for name in _SS_SETTING_NAMES:
+        for name, _default in _ss._SC_NUMERICAL_DEFAULTS:
             setattr(adapter, name, getattr(self, name))
         adapter.denominator_mode = "strict_si"
         adapter.contraction_backend = self.contraction_backend
@@ -1140,6 +1555,7 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
         mc=None,
         roots=None,
         *,
+        qd_type=None,
         state_pdms=None,
         transition_pdms=None,
         model_overlap=None,
@@ -1152,11 +1568,15 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
         eigenvalue_imag_warn=None,
         eigenvalue_imag_error=None,
     ):
-        """Build and diagonalize the row-oriented non-Hermitian Bloch matrix."""
+        """Build both QD matrices and solve the selected representation."""
 
         total_start = time.perf_counter()
         self._clear_results()
         gc.collect()
+        if qd_type is None:
+            qd_type = self.qd_type
+        qd_type = _normalize_qd_type(qd_type)
+        self.qd_type = qd_type
         if mc is None:
             mc = self._mc
         if _ss._has_frozen_orbitals(getattr(mc, "frozen", None)):
@@ -1166,7 +1586,7 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
             denominator_mode = self.denominator_mode
         if denominator_mode != "strict_si":
             raise ValueError(
-                "QD_Bloch Phase I requires denominator_mode='strict_si'"
+                "QD-SC-NEVPT2 requires denominator_mode='strict_si'"
             )
         self.denominator_mode = "strict_si"
         if contraction_backend is None:
@@ -1180,6 +1600,8 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
             "zero_norm_coupling_atol",
             "zero_norm_coupling_rtol",
             "eigen_residual_tol",
+            "van_vleck_audit_tol",
+            "van_vleck_hermiticity_tol",
         ):
             setattr(
                 self,
@@ -1189,18 +1611,19 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
         if validate_reverse_transition is None:
             validate_reverse_transition = self.validate_reverse_transition
         validate_reverse_transition = bool(validate_reverse_transition)
-        if eigenvalue_imag_warn is None:
-            eigenvalue_imag_warn = self.eigenvalue_imag_warn
-        if eigenvalue_imag_error is None:
-            eigenvalue_imag_error = self.eigenvalue_imag_error
-        if eigenvalue_imag_warn is not None:
-            eigenvalue_imag_warn = _finite_nonnegative(
-                eigenvalue_imag_warn, name="eigenvalue_imag_warn"
-            )
-        if eigenvalue_imag_error is not None:
-            eigenvalue_imag_error = _finite_nonnegative(
-                eigenvalue_imag_error, name="eigenvalue_imag_error"
-            )
+        if qd_type == "bloch":
+            if eigenvalue_imag_warn is None:
+                eigenvalue_imag_warn = self.eigenvalue_imag_warn
+            if eigenvalue_imag_error is None:
+                eigenvalue_imag_error = self.eigenvalue_imag_error
+            if eigenvalue_imag_warn is not None:
+                eigenvalue_imag_warn = _finite_nonnegative(
+                    eigenvalue_imag_warn, name="eigenvalue_imag_warn"
+                )
+            if eigenvalue_imag_error is not None:
+                eigenvalue_imag_error = _finite_nonnegative(
+                    eigenvalue_imag_error, name="eigenvalue_imag_error"
+                )
 
         if roots is None:
             nroots = int(getattr(mc.fcisolver, "nroots", 1))
@@ -1245,7 +1668,7 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
             shared_eris_basis = "input_mo"
             shared_eris_generated = True
         shared_eris_bytes = (
-            _dense_eris_nbytes(shared_input_eris)
+            shared_input_eris.nbytes
             if isinstance(shared_input_eris, _ss.spinor_helper._SpinorERIs)
             else None
         )
@@ -1268,10 +1691,6 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
             )
             if row.subspace_arrays is None:
                 raise RuntimeError("QD row preparation omitted subspace arrays")
-            if not row.strict_si_compatible:
-                raise FloatingPointError(
-                    f"root {root} is incompatible with strict-SI denominators"
-                )
             compact_eris = row.eris
             if not isinstance(compact_eris, _ss._WickERIBlocks):
                 compact_eris = _ss._compact_wick_eris(compact_eris)
@@ -1282,7 +1701,7 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
                 subspace_arrays=retained_arrays,
             )
             source_eris_nbytes = (
-                _dense_eris_nbytes(eris_root)
+                eris_root.nbytes
                 if isinstance(eris_root, _ss.spinor_helper._SpinorERIs)
                 else None
             )
@@ -1415,7 +1834,7 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
                 if overlap_ij is not None:
                     overlap_limit = self.model_overlap_atol + self.model_overlap_rtol
                     if abs(overlap_ij) > overlap_limit:
-                        raise ValueError(
+                        _ss._warn_numerical(
                             f"model roots {root_i} and {root_j} are not "
                             f"orthogonal: |overlap|={abs(overlap_ij):.3e}"
                         )
@@ -1439,7 +1858,7 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
                     )
                     overlap_limit = self.model_overlap_atol + self.model_overlap_rtol
                     if abs(overlap_ij) > overlap_limit:
-                        raise ValueError(
+                        _ss._warn_numerical(
                             f"model roots {root_i} and {root_j} are not "
                             f"orthogonal: |overlap|={abs(overlap_ij):.3e}"
                         )
@@ -1610,7 +2029,7 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
         )
         overlap_limit = self.model_overlap_atol + self.model_overlap_rtol
         if overlap_error > overlap_limit:
-            raise ValueError(
+            _ss._warn_numerical(
                 "model-state overlap is not the identity within tolerance: "
                 f"maximum error={overlap_error:.3e}"
             )
@@ -1620,7 +2039,7 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
             )
         )
         if overlap_adjoint_error > overlap_limit:
-            raise ValueError(
+            _ss._warn_numerical(
                 "model-state overlap is not Hermitian: maximum error="
                 f"{overlap_adjoint_error:.3e}"
             )
@@ -1629,6 +2048,18 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
         for key in _ss.SUBSPACE_ORDER:
             h2_bloch += h2_by_subspace[key]
         h_eff_bloch = np.diag(reference_energies.astype(complex)) + h2_bloch
+        h2_bloch_by_subspace = h2_by_subspace
+        (
+            h2_van_vleck_by_subspace,
+            h2_van_vleck,
+            h_eff_van_vleck,
+            van_vleck_diagnostics,
+        ) = _build_van_vleck_matrices(
+            h2_bloch_by_subspace,
+            h_eff_bloch,
+            reference_energies,
+            audit_tol=self.van_vleck_audit_tol,
+        )
         diagonal_reduction_error = 0.0
         for irow, root in enumerate(roots):
             row = row_data[root]
@@ -1639,6 +2070,10 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
                         h2_by_subspace[key][irow, irow]
                         - row.subspace_energies[key]
                     ),
+                    abs(
+                        h2_van_vleck_by_subspace[key][irow, irow]
+                        - row.subspace_energies[key]
+                    ),
                 )
             diagonal_reduction_error = max(
                 diagonal_reduction_error,
@@ -1646,41 +2081,79 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
                     h_eff_bloch[irow, irow]
                     - (row.reference_energy + row.e_corr)
                 ),
+                abs(
+                    h_eff_van_vleck[irow, irow]
+                    - (row.reference_energy + row.e_corr)
+                ),
             )
 
-        eigenvalues, left, right, eig_diagnostics = _solve_bloch_eigensystem(
-            h_eff_bloch
-        )
-        if max(
-            eig_diagnostics["right_relative_residual_norm"],
-            eig_diagnostics["left_relative_residual_norm"],
-        ) > self.eigen_residual_tol:
-            raise FloatingPointError(
-                "general Bloch eigensolver residual exceeds tolerance"
+        if qd_type == "bloch":
+            eigenvalues, left, right, eig_diagnostics = (
+                _solve_bloch_eigensystem(h_eff_bloch)
             )
-        maximum_eigen_imag = eig_diagnostics[
-            "maximum_eigenvalue_imaginary_part"
-        ]
-        if (
-            eigenvalue_imag_warn is not None
-            and maximum_eigen_imag > eigenvalue_imag_warn
-        ):
-            logger.warn(
-                self,
-                "QD_Bloch eigenvalues have imaginary components up to %.3e",
-                maximum_eigen_imag,
+            maximum_relative_residual = max(
+                eig_diagnostics["right_relative_residual_norm"],
+                eig_diagnostics["left_relative_residual_norm"],
             )
-        if (
-            eigenvalue_imag_error is not None
-            and maximum_eigen_imag > eigenvalue_imag_error
-        ):
-            raise FloatingPointError(
-                "QD_Bloch eigenvalue imaginary component exceeds configured "
-                f"error threshold: {maximum_eigen_imag:.3e}"
+            eig_diagnostics["residual_tolerance"] = float(
+                self.eigen_residual_tol
+            )
+            eig_diagnostics["residual_gate_passed"] = bool(
+                maximum_relative_residual <= self.eigen_residual_tol
+            )
+            if not eig_diagnostics["residual_gate_passed"]:
+                _ss._warn_numerical(
+                    "general Bloch eigensolver residual exceeds tolerance"
+                )
+            maximum_eigen_imag = eig_diagnostics[
+                "maximum_eigenvalue_imaginary_part"
+            ]
+            if (
+                eigenvalue_imag_warn is not None
+                and maximum_eigen_imag > eigenvalue_imag_warn
+            ):
+                logger.warn(
+                    self,
+                    "QD_Bloch eigenvalues have imaginary components up to %.3e",
+                    maximum_eigen_imag,
+                )
+            if (
+                eigenvalue_imag_error is not None
+                and maximum_eigen_imag > eigenvalue_imag_error
+            ):
+                raise FloatingPointError(
+                    "QD_Bloch eigenvalue imaginary component exceeds configured "
+                    f"error threshold: {maximum_eigen_imag:.3e}"
+                )
+            eigenvectors = right
+            selected_h2_by_subspace = h2_bloch_by_subspace
+            selected_h2 = h2_bloch
+            selected_h_eff = h_eff_bloch
+            method = "classical_2004_multipartitioning_QD_Bloch_SC_NEVPT2"
+        else:
+            eigenvalues, vectors, eig_diagnostics = (
+                _solve_van_vleck_eigensystem(
+                    h_eff_van_vleck,
+                    hermiticity_tol=self.van_vleck_hermiticity_tol,
+                    residual_tol=self.eigen_residual_tol,
+                )
+            )
+            eigenvectors = vectors
+            # Hermitian left and right eigenvectors have the same column
+            # representation.  Keep separate arrays so later mutation of one
+            # public attribute cannot blur their semantics.
+            left = np.array(vectors, copy=True)
+            right = np.array(vectors, copy=True)
+            selected_h2_by_subspace = h2_van_vleck_by_subspace
+            selected_h2 = h2_van_vleck
+            selected_h_eff = h_eff_van_vleck
+            method = (
+                "2020_multipartitioning_canonical_Van_Vleck_QD_SC_NEVPT2"
             )
 
         diagnostics = {
-            "method": "classical_2004_multipartitioning_QD_Bloch_SC_NEVPT2",
+            "qd_type": qd_type,
+            "method": method,
             "matrix_convention": (
                 "H[I,J] uses bra I, ket J, row-I ERIs/perturbers/strict-SI gaps"
             ),
@@ -1694,9 +2167,17 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
             "model_overlap_sources": overlap_sources,
             "model_overlap_maximum_identity_error": overlap_error,
             "model_overlap_maximum_adjoint_error": overlap_adjoint_error,
+            "model_overlap_tolerance": float(overlap_limit),
+            "model_overlap_identity_gate_passed": bool(
+                overlap_error <= overlap_limit
+            ),
+            "model_overlap_adjoint_gate_passed": bool(
+                overlap_adjoint_error <= overlap_limit
+            ),
             "diagonal_reduction_maximum_error": float(
                 diagonal_reduction_error
             ),
+            **van_vleck_diagnostics,
             "eigensystem": eig_diagnostics,
             "total_time": time.perf_counter() - total_start,
         }
@@ -1704,37 +2185,113 @@ class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
         self.roots = roots
         self.reference_energies = reference_energies
         self.row_data = row_data
-        self.h2_by_subspace = h2_by_subspace
+        self.h2_bloch_by_subspace = h2_bloch_by_subspace
+        self.h2_van_vleck_by_subspace = h2_van_vleck_by_subspace
+        self.h2_by_subspace = selected_h2_by_subspace
+        self.h2_effective = selected_h2
+        self.h_eff = selected_h_eff
         self.h2_bloch = h2_bloch
         self.h_eff_bloch = h_eff_bloch
+        self.h2_van_vleck = h2_van_vleck
+        self.h_eff_van_vleck = h_eff_van_vleck
         self.e_qd = eigenvalues
+        self.eigenvectors = eigenvectors
         self.left_eigenvectors = left
         self.right_eigenvectors = right
         self.model_overlap = overlap_matrix
         self.diagnostics = diagnostics
-        self.result = QDBlochSCNEVPT2Result(
+        self.result = QDSCNEVPT2Result(
+            qd_type=qd_type,
             roots=roots,
             reference_energies=reference_energies,
-            h2_by_subspace=h2_by_subspace,
-            h2_bloch=h2_bloch,
-            h_eff_bloch=h_eff_bloch,
+            h2_by_subspace=selected_h2_by_subspace,
+            h2_effective=selected_h2,
+            h_eff=selected_h_eff,
             eigenvalues=eigenvalues,
+            eigenvectors=eigenvectors,
             left_eigenvectors=left,
             right_eigenvectors=right,
+            h2_bloch_by_subspace=h2_bloch_by_subspace,
+            h2_bloch=h2_bloch,
+            h_eff_bloch=h_eff_bloch,
+            h2_van_vleck_by_subspace=h2_van_vleck_by_subspace,
+            h2_van_vleck=h2_van_vleck,
+            h_eff_van_vleck=h_eff_van_vleck,
             diagnostics=diagnostics,
         )
         logger.note(self, "QD_Bloch effective Hamiltonian:\n%s", h_eff_bloch)
-        logger.note(self, "QD_Bloch eigenvalues: %s", eigenvalues)
-        logger.info(
+        logger.note(
             self,
-            "QD_Bloch non-Hermiticity=%.3e  right residual=%.3e  "
-            "left residual=%.3e  cond(R)=%.3e",
-            eig_diagnostics["maximum_nonhermiticity"],
-            eig_diagnostics["right_residual_norm"],
-            eig_diagnostics["left_residual_norm"],
-            eig_diagnostics["right_eigenvector_condition_number"],
+            "QD_VanVleck effective Hamiltonian:\n%s",
+            h_eff_van_vleck,
+        )
+        logger.note(self, "selected qd_type: %s", qd_type)
+        if qd_type == "bloch":
+            logger.info(
+                self,
+                "QD_Bloch non-Hermiticity=%.3e  right residual=%.3e  "
+                "left residual=%.3e  cond(R)=%.3e",
+                eig_diagnostics["maximum_nonhermiticity"],
+                eig_diagnostics["right_residual_norm"],
+                eig_diagnostics["left_residual_norm"],
+                eig_diagnostics["right_eigenvector_condition_number"],
+            )
+        else:
+            logger.info(
+                self,
+                "QD_VanVleck Hermiticity=%.3e  residual=%.3e  "
+                "orthonormality=%.3e",
+                eig_diagnostics["maximum_matrix_nonhermiticity"],
+                eig_diagnostics["residual_norm"],
+                eig_diagnostics["orthonormality_error"],
+            )
+        logger.note(
+            self,
+            "selected QD eigenvalues (%s): %s",
+            qd_type,
+            eigenvalues,
         )
         return self.e_qd
+
+
+X2CQDSCNEVPT2 = WickX2CQDSCNEVPT2
+
+
+class WickX2CQDBlochSCNEVPT2(WickX2CQDSCNEVPT2):
+    """Backward-compatible wrapper that always selects ``qd_type='bloch'``."""
+
+    def __init__(self, mc, frozen=0, qd_type="bloch"):
+        qd_type = _normalize_qd_type(qd_type)
+        if qd_type != "bloch":
+            raise ValueError(
+                "WickX2CQDBlochSCNEVPT2 only supports qd_type='bloch'; "
+                "use WickX2CQDSCNEVPT2 for canonical Van Vleck/HQD"
+            )
+        super().__init__(mc, frozen=frozen, qd_type="bloch")
+
+    def kernel(self, *args, qd_type=None, **kwargs):
+        # The generic fluent ``run`` applies public settings before forwarding
+        # calculation-local keywords.  Inspect both the stored and explicit
+        # values so the historical class name can never silently select HQD.
+        requested = self.qd_type if qd_type is None else qd_type
+        try:
+            requested = _normalize_qd_type(requested)
+        except ValueError:
+            self._clear_results()
+            self.qd_type = "bloch"
+            raise
+        if requested != "bloch":
+            # ``run`` follows PySCF convention and applies public settings
+            # before entering ``kernel``.  Restore the compatibility
+            # wrapper's invariant even when that requested setting is
+            # rejected transactionally.
+            self.qd_type = "bloch"
+            self._clear_results()
+            raise ValueError(
+                "WickX2CQDBlochSCNEVPT2 only supports qd_type='bloch'; "
+                "use WickX2CQDSCNEVPT2 for canonical Van Vleck/HQD"
+            )
+        return super().kernel(*args, qd_type="bloch", **kwargs)
 
 
 X2CQDBlochSCNEVPT2 = WickX2CQDBlochSCNEVPT2

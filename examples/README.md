@@ -22,6 +22,7 @@ They use the canonical `.x2camf()` / `.x2cmp()` driver API.
 | `16-nd_h2o8_supercipt_diis.py` | Nd3+(H2O)8 CAS(3,14), 52-root Kramers Super-CIPT/DIIS input |
 | `17-cl_cas16_diis.py` | Cl CAS(7,16), six-root DMRG Super-CIPT/Super-CI DIIS comparison, with optional Kramers restriction |
 | `18-x2c_dmrg_sc_nevpt2.py` | BH CAS(4,6) no-Kramers dense X2C-DMRG-SCF to strict-SI Wick SC-NEVPT2 (needs Block2) |
+| `19-x2c_dmrg_qd_sc_nevpt2.py` | neutral Cl CAS(5,12), six-root SA-X2C-DMRG-SCF to Bloch/canonical Van Vleck QD-SC-NEVPT2 (needs Block2) |
 
 The `fci/` subfolder has examples for the spinor CI module (`socutils.fci`):
 
@@ -35,5 +36,5 @@ The `fci/` subfolder has examples for the spinor CI module (`socutils.fci`):
 
 Most examples need the optional `x2camf` package for the spin-orbit integrals;
 the Kramers-restricted SCF examples additionally need `zquatev`, and the
-DMRG-SCF and SC-NEVPT2 examples need Block2. See the
+DMRG-SCF, SC-NEVPT2, and QD-SC-NEVPT2 examples need Block2. See the
 [installation guide](https://xubwa.github.io/socutils/install.html).

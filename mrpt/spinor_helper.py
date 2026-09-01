@@ -184,6 +184,12 @@ class _SpinorERIs:
         self.h1eff = h1eff
         self.pppp = eri
 
+    @property
+    def nbytes(self) -> int:
+        """Total storage owned or referenced by the dense integral arrays."""
+
+        return int(self.h1e.nbytes + self.h1eff.nbytes + self.pppp.nbytes)
+
     get_chem = get_chem_eri
     get_phys = get_phys_eri
     get_h1 = get_h1_eri

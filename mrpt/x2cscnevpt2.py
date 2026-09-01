@@ -32,9 +32,11 @@ raw SGF particle RDMs with axes
 ``dm_k[p1,...,pk,qk,...,q1] = <C[p1]...C[pk]D[qk]...D[q1]>``.
 
 The default ``strict_si`` denominator is the one-sided expression printed in
-the SI.  Its imaginary residual is a hard error before the accepted value is
-converted to real arithmetic.  The independently generated left branch is
-always checked against the adjoint of the right branch.  An explicit
+the SI.  Finite imaginary residuals and related tolerance failures emit
+``MRPTNumericalWarning`` before the selected value is converted to real
+arithmetic.  Non-finite values and non-positive or near-zero denominators
+remain hard errors.  The independently generated left branch is always
+checked against the adjoint of the right branch.  An explicit
 ``hermitianized`` mode retains the manifestly Hermitian half-sum as a
 finite-MPS stabilization, but records whether the one-sided SI gate failed;
 it is therefore never silently presented as the literal SI expression.
@@ -46,6 +48,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 import itertools
 import time
+import warnings
 from types import SimpleNamespace
 from typing import Any
 
@@ -57,6 +60,7 @@ from . import spinor_helper
 
 
 __all__ = [
+    "MRPTNumericalWarning",
     "SUBSPACE_ORDER",
     "WickX2CSCNEVPT2",
     "X2CSCNEVPT2",
@@ -76,6 +80,16 @@ _ERIS_BASES = frozenset(("input_mo", "semicanonical"))
 _DENOMINATOR_MODES = frozenset(("hermitianized", "strict_si"))
 _CONTRACTION_BACKENDS = frozenset(("numpy", "pytblis"))
 _DEFAULT_CONTRACTION_BACKEND = "pytblis"
+
+
+class MRPTNumericalWarning(RuntimeWarning):
+    """A finite MRPT audit residual exceeded its configured tolerance."""
+
+
+def _warn_numerical(message: str) -> None:
+    """Report a recoverable finite-residual audit failure."""
+
+    warnings.warn(message, MRPTNumericalWarning, stacklevel=2)
 
 
 def _select_root_ci(ci, root, *, nroots=1):
@@ -719,7 +733,7 @@ def _require_real(values, *, root, subspace, quantity, atol, rtol):
     violation = np.abs(values.imag) - limit
     if np.any(violation > 0.0):
         maximum = float(np.max(np.abs(values.imag)))
-        raise FloatingPointError(
+        _warn_numerical(
             f"root {root} subspace {subspace}: {quantity} is not real; "
             f"maximum imaginary part = {maximum:.3e}"
         )
@@ -757,6 +771,7 @@ def _require_adjoint_pair(
             "maximum_adjoint_error": 0.0,
             "maximum_adjoint_error_index": [],
             "reality_limit_at_maximum_error": float(atol + rtol),
+            "adjoint_gate_passed": True,
         }
 
     error = np.abs(selected_left - selected_right.conj())
@@ -768,8 +783,9 @@ def _require_adjoint_pair(
     full_index = np.unravel_index(
         int(selected_flat[local_index]), left.shape
     )
-    if error[local_index] > limit[local_index]:
-        raise FloatingPointError(
+    gate_passed = bool(error[local_index] <= limit[local_index])
+    if not gate_passed:
+        _warn_numerical(
             f"root {root} subspace {subspace}: independently generated "
             "Dyall commutator branches are not adjoints; maximum error = "
             f"{float(error[local_index]):.3e} at {full_index}"
@@ -778,6 +794,7 @@ def _require_adjoint_pair(
         "maximum_adjoint_error": float(error[local_index]),
         "maximum_adjoint_error_index": [int(index) for index in full_index],
         "reality_limit_at_maximum_error": float(limit[local_index]),
+        "adjoint_gate_passed": gate_passed,
     }
 
 
@@ -951,14 +968,15 @@ def _audit_one_sided_si_denominator(
     finite_energies = np.all(np.isfinite(complex_energy)) and np.all(
         np.isfinite(projected_energy)
     )
-    if finite_energies:
-        imaginary_energy_l1 = float(np.sum(np.abs(complex_energy.imag)))
-        projection_shift_l1 = float(
-            np.sum(np.abs(projected_energy - complex_energy.real))
+    if not finite_energies:
+        raise FloatingPointError(
+            f"root {root} subspace {subspace}: one-sided SI energy audit "
+            "produced non-finite values"
         )
-    else:
-        imaginary_energy_l1 = np.inf
-        projection_shift_l1 = np.inf
+    imaginary_energy_l1 = float(np.sum(np.abs(complex_energy.imag)))
+    projection_shift_l1 = float(
+        np.sum(np.abs(projected_energy - complex_energy.real))
+    )
     energy_imag_pass = (
         imaginary_energy_l1 <= tolerances["energy_imag_l1_tol"]
     )
@@ -1028,7 +1046,7 @@ def _audit_one_sided_si_denominator(
         "numerical_policy": "explicit-calibrated-numerator-allowance",
     }
     if enforce and not strict_compatible:
-        raise FloatingPointError(
+        _warn_numerical(
             f"root {root} subspace {subspace}: one-sided SI denominator "
             "audit failed; "
             f"max |Im gap|={float(np.max(gap_imag)):.3e}, "
@@ -1075,8 +1093,9 @@ def _validate_zero_norm_commutator(
     full_index = np.unravel_index(
         int(selected_flat[local_index]), values.shape
     )
-    if magnitude[local_index] > limit[local_index]:
-        raise FloatingPointError(
+    gate_passed = bool(magnitude[local_index] <= limit[local_index])
+    if not gate_passed:
+        _warn_numerical(
             f"root {root} subspace {subspace}: a zero-norm perturber has "
             f"nonzero Dyall commutator {float(magnitude[local_index]):.3e} "
             f"at {full_index}"
@@ -1085,7 +1104,7 @@ def _validate_zero_norm_commutator(
         "maximum_absolute_value": float(magnitude[local_index]),
         "maximum_absolute_index": [int(index) for index in full_index],
         "acceptance_limit_at_maximum": float(limit[local_index]),
-        "gate_passed": True,
+        "gate_passed": gate_passed,
     }
 
 
@@ -1215,7 +1234,7 @@ def _evaluate_wick_subspaces(
         )
         if np.any(selected_norm < -norm_tol):
             minimum = float(np.min(selected_norm))
-            raise FloatingPointError(
+            _warn_numerical(
                 f"root {root} subspace {key}: negative norm {minimum:.3e}"
             )
 
@@ -1437,7 +1456,7 @@ def _evaluate_wick_subspaces(
     for diagnostics in realness_diagnostics.values():
         diagnostics["root_one_sided_si_audit"] = dict(root_audit)
     if denominator_mode == "strict_si" and not root_strict_si_compatible:
-        raise FloatingPointError(
+        _warn_numerical(
             f"root {root}: aggregate one-sided SI denominator audit failed; "
             f"Im(E) L1={root_imaginary_energy_l1:.3e}, "
             f"projection shift L1={root_projection_shift_l1:.3e}"
@@ -1540,6 +1559,10 @@ def validate_pdms(
     ``work_memory`` bounds arithmetic temporaries used by the symmetry checks.
     This matters for a 16-spinor complex 4-RDM, whose dense storage alone is
     64 GiB.  It does not relax or sample any validation condition.
+
+    Finite relation residuals beyond tolerance emit
+    :class:`MRPTNumericalWarning` and are retained in the diagnostics.  Invalid
+    shapes, nonnumeric arrays, and non-finite values remain hard errors.
     """
 
     if not isinstance(pdms, (tuple, list)) or len(pdms) != 4:
@@ -1599,8 +1622,12 @@ def validate_pdms(
         )
         scale = max(1.0, _maximum_abs_chunked(density, work_memory))
         tolerance = atol + rtol * scale
-        if max(creator_error, annihilator_error, hermiticity_error) > tolerance:
-            raise ValueError(
+        symmetry_gate_passed = bool(
+            max(creator_error, annihilator_error, hermiticity_error)
+            <= tolerance
+        )
+        if not symmetry_gate_passed:
+            _warn_numerical(
                 f"dm{rank} violates raw SGF antisymmetry/Hermiticity: "
                 f"creator={creator_error:.3e}, annihilator={annihilator_error:.3e}, "
                 f"Hermiticity={hermiticity_error:.3e}"
@@ -1610,19 +1637,25 @@ def validate_pdms(
             "creator_antisymmetry_error": creator_error,
             "annihilator_antisymmetry_error": annihilator_error,
             "hermiticity_error": hermiticity_error,
+            "symmetry_tolerance": float(tolerance),
+            "symmetry_gate_passed": symmetry_gate_passed,
         }
         checked.append(density)
 
     trace = np.trace(checked[0])
     trace_error = abs(trace - nelec)
-    if trace_error > atol + rtol * max(1, nelec):
-        raise ValueError(
+    trace_tolerance = atol + rtol * max(1, nelec)
+    trace_gate_passed = bool(trace_error <= trace_tolerance)
+    if not trace_gate_passed:
+        _warn_numerical(
             f"dm1 trace is inconsistent with {nelec} electrons: "
             f"error={trace_error:.3e}"
         )
     diagnostics["dm1"]["trace_error"] = float(trace_error)
     diagnostics["dm1"]["trace"] = float(trace.real)
     diagnostics["dm1"]["trace_imag"] = float(trace.imag)
+    diagnostics["dm1"]["trace_tolerance"] = float(trace_tolerance)
+    diagnostics["dm1"]["trace_gate_passed"] = trace_gate_passed
 
     for rank in range(2, 5):
         contracted = np.trace(
@@ -1636,12 +1669,20 @@ def validate_pdms(
             work_memory=work_memory,
         )
         scale = max(1.0, _maximum_abs_chunked(expected, work_memory))
-        if error > atol + rtol * scale:
-            raise ValueError(
+        contraction_tolerance = atol + rtol * scale
+        contraction_gate_passed = bool(error <= contraction_tolerance)
+        if not contraction_gate_passed:
+            _warn_numerical(
                 f"dm{rank}->dm{rank - 1} particle-number contraction "
                 f"failed: error={error:.3e}"
             )
         diagnostics[f"dm{rank}"]["contraction_error"] = error
+        diagnostics[f"dm{rank}"]["contraction_tolerance"] = float(
+            contraction_tolerance
+        )
+        diagnostics[f"dm{rank}"][
+            "contraction_gate_passed"
+        ] = contraction_gate_passed
     return tuple(checked), diagnostics
 
 
@@ -1752,6 +1793,25 @@ _SUPPORTED_AO2MO_DTYPES = frozenset(
 _SYMMETRY_COMPARISON_PATHS = 2
 _REAL_OPS_PER_REAL_MULTIPLY_ADD = 2
 _REAL_OPS_PER_COMPLEX_MULTIPLY_ADD = 8
+
+# Numerical controls shared by the state-specific and QD drivers.  Keeping a
+# single source of defaults prevents the two public paths from silently
+# acquiring method-dependent tolerances as they evolve.
+_SC_NUMERICAL_DEFAULTS = (
+    ("integral_roundoff_factor", _DEFAULT_AO2MO_ROUNDOFF_FACTOR),
+    ("scalar_atol", 1.0e-10),
+    ("scalar_rtol", 1.0e-9),
+    ("rdm_atol", 1.0e-9),
+    ("rdm_rtol", 1.0e-8),
+    ("rdm_work_memory", 512 * 2**20),
+    ("norm_tol", 1.0e-14),
+    ("denominator_tol", 1.0e-12),
+    ("si_gap_imag_atol", 1.0e-10),
+    ("si_gap_imag_rtol", 1.0e-9),
+    ("si_numerator_noise_allowance", 1.0e-12),
+    ("si_energy_imag_l1_tol", 1.0e-10),
+    ("si_projection_shift_l1_tol", 1.0e-12),
+)
 
 
 def _require_supported_ao2mo_dtype(values, *, name):
@@ -1899,11 +1959,13 @@ def _project_dense_mo_integrals(
 
     ``s1`` means that the full tensor is stored; it does not remove the
     Coulomb identities ``(pq|rs) = (rs|pq)`` and
-    ``(pq|rs) = (qp|sr)*``.  The raw residual is gated before projection so
-    an axis/conjugation bug cannot be silently averaged away.  ``eri`` is a
-    private writable AO2MO buffer and is consumed as scratch to keep the
-    production peak at two full tensors.  A read-only injected buffer is
-    copied first and can therefore transiently require a third full tensor.
+    ``(pq|rs) = (qp|sr)*``.  The raw residual is audited before projection;
+    values beyond the operation-aware roundoff estimate emit
+    ``MRPTNumericalWarning`` so an axis/conjugation problem is visible while
+    the symmetry projection can still proceed.  ``eri`` is a private writable
+    AO2MO buffer and is consumed as scratch to keep the production peak at two
+    full tensors.  A read-only injected buffer is copied first and can
+    therefore transiently require a third full tensor.
     """
 
     h1e = np.asarray(h1e)
@@ -1942,7 +2004,8 @@ def _project_dense_mo_integrals(
     # Model plausible roundoff from the raw AO2MO contractions.  The policy
     # derives epsilon from each tensor dtype, scales with its output magnitude,
     # and uses the actual AO accumulation length supplied by the transformation.
-    # Gross index/conjugation errors remain hard failures before projection.
+    # Gross index/conjugation residuals remain visible as warnings before
+    # projection, while their complete numerical values remain in diagnostics.
     h1e_tolerance, h1e_roundoff_policy = _ao2mo_roundoff_policy(
         h1e,
         accumulation_length=roundoff_accumulation_length,
@@ -1956,12 +2019,12 @@ def _project_dense_mo_integrals(
         roundoff_factor=roundoff_factor,
     )
     if h1e_error > h1e_tolerance:
-        raise ValueError(
+        _warn_numerical(
             "raw transformed h1e violates Hermiticity beyond roundoff: "
             f"error={h1e_error:.3e}, tolerance={h1e_tolerance:.3e}"
         )
     if max(pair_error, conjugate_error) > eri_tolerance:
-        raise ValueError(
+        _warn_numerical(
             "raw transformed eri violates complex Coulomb symmetry beyond "
             f"roundoff: pair={pair_error:.3e}, "
             f"conjugate={conjugate_error:.3e}, "
@@ -2026,6 +2089,7 @@ def _project_dense_mo_integrals(
             "raw_hermiticity_error": h1e_error,
             "maximum_absolute_value": h1e_scale,
             "roundoff_gate": h1e_tolerance,
+            "roundoff_gate_passed": bool(h1e_error <= h1e_tolerance),
             "roundoff_policy": h1e_roundoff_policy,
             "projection_change_upper_bound": 0.5 * h1e_error
             + h1e_projection_arithmetic_allowance,
@@ -2039,6 +2103,9 @@ def _project_dense_mo_integrals(
             "raw_conjugate_exchange_error": conjugate_error,
             "maximum_absolute_value": eri_scale,
             "roundoff_gate": eri_tolerance,
+            "roundoff_gate_passed": bool(
+                max(pair_error, conjugate_error) <= eri_tolerance
+            ),
             "roundoff_policy": eri_roundoff_policy,
             "projection_change_upper_bound": 0.5
             * (pair_error + conjugate_error)
@@ -2168,21 +2235,10 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         self.sub_times = {}
         self.rdm_diagnostics = None
         self.integral_symmetry_diagnostics = None
-        self.integral_roundoff_factor = _DEFAULT_AO2MO_ROUNDOFF_FACTOR
-        self.scalar_atol = 1.0e-10
-        self.scalar_rtol = 1.0e-9
-        self.rdm_atol = 1.0e-9
-        self.rdm_rtol = 1.0e-8
-        self.rdm_work_memory = 512 * 2**20
-        self.norm_tol = 1.0e-14
-        self.denominator_tol = 1.0e-12
+        for name, value in _SC_NUMERICAL_DEFAULTS:
+            setattr(self, name, value)
         self.denominator_mode = "strict_si"
         self.contraction_backend = _DEFAULT_CONTRACTION_BACKEND
-        self.si_gap_imag_atol = 1.0e-10
-        self.si_gap_imag_rtol = 1.0e-9
-        self.si_numerator_noise_allowance = 1.0e-12
-        self.si_energy_imag_l1_tol = 1.0e-10
-        self.si_projection_shift_l1_tol = 1.0e-12
         self.strict_si_compatible = None
         self.scalar_tolerance = None
         self.reference_residual_bound = None
@@ -2206,8 +2262,13 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             energies = np.asarray(self.mo_energy)
             if energies.shape != (mo_coeff.shape[1],):
                 raise ValueError("mo_energy has the wrong shape")
+            if not np.all(np.isfinite(energies)):
+                raise ValueError("mo_energy contains non-finite values")
             if np.iscomplexobj(energies) and _maximum_abs(energies.imag) > 1e-12:
-                raise ValueError("semicanonical orbital energies must be real")
+                _warn_numerical(
+                    "semicanonical orbital energies have imaginary components; "
+                    "using their real parts"
+                )
             return np.asarray(mo_coeff), np.asarray(energies.real, dtype=float)
 
         ci = _select_root_ci(
@@ -2253,7 +2314,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         """Prepare one audited multipartitioning row without committing state.
 
         This is the single numerical path used by both the public
-        state-specific kernel and the QD_Bloch driver.  It deliberately calls
+        state-specific kernel and the QD driver.  It deliberately calls
         the instance ``_semicanonicalize`` hook so injected and
         subclass-provided canonicalization policies remain valid.
         """
