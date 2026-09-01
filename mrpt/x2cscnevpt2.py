@@ -53,10 +53,7 @@ import numpy as np
 from pyscf import lib
 from pyscf.lib import logger
 
-try:
-    from . import spinor_helper
-except ImportError:  # pragma: no cover - permits running the reference file
-    import spinor_helper
+from . import spinor_helper
 
 
 __all__ = [
@@ -144,6 +141,24 @@ def _normalize_contraction_backend(contraction_backend) -> str:
         choices = ", ".join(sorted(_CONTRACTION_BACKENDS))
         raise ValueError(f"contraction_backend must be one of: {choices}")
     return contraction_backend
+
+
+def _validate_tblis_operand_dtypes(named_arrays):
+    """Fail before TBLIS when an operand has unsupported base precision."""
+
+    unsupported = []
+    allowed = {np.dtype(np.float64), np.dtype(np.complex128)}
+    for name, value in named_arrays:
+        dtype = np.asarray(value).dtype
+        if dtype not in allowed:
+            unsupported.append(f"{name}={dtype}")
+    if unsupported:
+        details = ", ".join(unsupported)
+        raise TypeError(
+            "pytblis contractions require float64/complex128 operands; "
+            f"unsupported base precision: {details}. Convert explicitly or "
+            "use contraction_backend='numpy'."
+        )
 
 
 @lru_cache(maxsize=2)
@@ -234,12 +249,155 @@ _W_KEYS = (
 
 
 @dataclass(frozen=True)
+class _WickERIBlocks:
+    """Detached integral blocks required by the generated Wick equations."""
+
+    ncore: int
+    ncas: int
+    nvirt: int
+    h1eff_blocks: dict[str, np.ndarray]
+    phys_blocks: dict[str, np.ndarray]
+
+    @property
+    def nocc(self):
+        return self.ncore + self.ncas
+
+    @property
+    def nmo(self):
+        return self.nocc + self.nvirt
+
+    @property
+    def nbytes(self):
+        return int(
+            sum(array.nbytes for array in self.h1eff_blocks.values())
+            + sum(array.nbytes for array in self.phys_blocks.values())
+        )
+
+    def get_h1eff(self, key):
+        return self.h1eff_blocks[key]
+
+    def get_phys(self, key):
+        return self.phys_blocks[key]
+
+
+def _compact_wick_eris(eris):
+    """Copy only the integral blocks consumed by the Wick source."""
+
+    if isinstance(eris, _WickERIBlocks):
+        return eris
+    return _WickERIBlocks(
+        ncore=int(eris.ncore),
+        ncas=int(eris.ncas),
+        nvirt=int(eris.nvirt),
+        h1eff_blocks={
+            key: np.array(eris.get_h1eff(key), copy=True, order="C")
+            for key in _H1_KEYS
+        },
+        phys_blocks={
+            key: np.array(eris.get_phys(key), copy=True, order="C")
+            for key in _W_KEYS
+        },
+    )
+
+
+def _rotate_wick_eris(eris, rotation, *, block_atol=1.0e-10):
+    """Rotate only required blocks under a core/active/virtual block unitary.
+
+    CanonStep 1 leaves the active orbitals fixed and independently rotates
+    the core and virtual spaces.  In that case every requested output block
+    depends on the identically labelled input block, so forming a full
+    ``nmo**4`` row tensor is unnecessary.
+    """
+
+    if not isinstance(eris, spinor_helper._SpinorERIs):
+        raise TypeError("blockwise Wick rotation requires dense input ERIs")
+    rotation = np.asarray(rotation)
+    if rotation.shape != (eris.nmo, eris.nmo):
+        raise ValueError("orbital rotation has the wrong shape")
+    block_atol = float(block_atol)
+    if not np.isfinite(block_atol) or block_atol < 0.0:
+        raise ValueError("block_atol must be finite and non-negative")
+    unitary_error = _maximum_abs(
+        rotation.T.conj() @ rotation - np.eye(eris.nmo)
+    )
+    if unitary_error > block_atol:
+        raise RuntimeError(
+            "CanonStep-1 orbital transformation is not unitary; maximum "
+            f"error={unitary_error:.3e}"
+        )
+    slices = {
+        "I": slice(0, eris.ncore),
+        "A": slice(eris.ncore, eris.nocc),
+        "E": slice(eris.nocc, eris.nmo),
+    }
+    maximum_off_block = 0.0
+    for left, right in itertools.product("IAE", repeat=2):
+        if left != right:
+            maximum_off_block = max(
+                maximum_off_block,
+                _maximum_abs(rotation[slices[left], slices[right]]),
+            )
+    if maximum_off_block > block_atol:
+        raise RuntimeError(
+            "CanonStep-1 rotation mixes core, active, or virtual spaces; "
+            f"maximum off-block element={maximum_off_block:.3e}"
+        )
+    blocks = {
+        label: rotation[space, space]
+        for label, space in slices.items()
+    }
+    active_identity_error = _maximum_abs(
+        blocks["A"] - np.eye(eris.ncas)
+    )
+    if active_identity_error > block_atol:
+        raise RuntimeError(
+            "CanonStep-1 rotation changed the active basis; maximum active "
+            f"rotation error={active_identity_error:.3e}"
+        )
+    h1eff_blocks = {}
+    for key in _H1_KEYS:
+        left, right = (blocks[label] for label in key)
+        h1eff_blocks[key] = np.ascontiguousarray(
+            np.einsum(
+                "ap,ab,bq->pq",
+                left.conj(),
+                eris.get_h1eff(key),
+                right,
+                optimize=True,
+            )
+        )
+    phys_blocks = {}
+    for key in _W_KEYS:
+        first, second, third, fourth = (blocks[label] for label in key)
+        phys_blocks[key] = np.ascontiguousarray(
+            np.einsum(
+                "ap,bq,cr,ds,abcd->pqrs",
+                first.conj(),
+                second.conj(),
+                third,
+                fourth,
+                eris.get_phys(key),
+                optimize=True,
+            )
+        )
+    return _WickERIBlocks(
+        ncore=int(eris.ncore),
+        ncas=int(eris.ncas),
+        nvirt=int(eris.nvirt),
+        h1eff_blocks=h1eff_blocks,
+        phys_blocks=phys_blocks,
+    )
+
+
+@dataclass(frozen=True)
 class _WickEquationBundle:
     norm_code: dict[str, str]
+    transition_norm_code: dict[str, str]
     right_commutator_code: dict[str, str]
     left_commutator_code: dict[str, str]
     commutator_code: dict[str, str]
     norm_text: dict[str, str]
+    transition_norm_text: dict[str, str]
     right_commutator_text: dict[str, str]
     left_commutator_text: dict[str, str]
     commutator_text: dict[str, str]
@@ -330,8 +488,15 @@ def _vacuum_reduce(expression):
     )
 
 
-def _lower_active_operators(expression, types):
-    """Replace each active normal-ordered C...D... string by one raw RDM."""
+def _lower_active_operators(expression, types, *, include_overlap=False):
+    """Lower active strings to raw RDMs, optionally including rank zero.
+
+    Ordinary expectation values may leave an active-space identity implicit.
+    A transition matrix element may not: its rank-zero density is the model
+    state overlap.  ``include_overlap`` therefore appends an explicit scalar
+    ``dm0[]`` tensor to every term without active creation/destruction
+    operators.
+    """
 
     tensor_type = types["WickTensorTypes"]
     vector_index = types["VectorWickIndex"]
@@ -374,6 +539,8 @@ def _lower_active_operators(expression, types):
             for tensor in operators:
                 indices.append(tensor.indices[0])
             coefficients.append(wick_tensor(f"dm{ncreation}", indices))
+        elif include_overlap:
+            coefficients.append(wick_tensor("dm0", vector_index()))
 
         lowered_terms.append(
             wick_string(coefficients, term.ctr_indices, term.factor)
@@ -392,10 +559,12 @@ def _compile_wick_equations() -> _WickEquationBundle:
     )
 
     norm_code = {}
+    transition_norm_code = {}
     right_commutator_code = {}
     left_commutator_code = {}
     commutator_code = {}
     norm_text = {}
+    transition_norm_text = {}
     right_commutator_text = {}
     left_commutator_text = {}
     commutator_text = {}
@@ -403,7 +572,11 @@ def _compile_wick_equations() -> _WickEquationBundle:
         ket = parse(_PERTURBER_EXPRESSIONS[key])
         bra = _conjugate_with_coefficients(ket, types)
 
-        norm = _lower_active_operators(_vacuum_reduce(bra * ket), types)
+        reduced_norm = _vacuum_reduce(bra * ket)
+        norm = _lower_active_operators(reduced_norm, types)
+        transition_norm = _lower_active_operators(
+            reduced_norm, types, include_overlap=True
+        )
 
         # [one-/two-body H_D, at-most-two-body T] is connected and contains
         # at most three creation and three destruction operators.  Asking
@@ -440,6 +613,7 @@ def _compile_wick_equations() -> _WickEquationBundle:
         norm_target = parse_tensor(f"norm[{key}]")
         commutator_target = parse_tensor(f"commutator[{key}]")
         norm_code[key] = norm.to_einsum(norm_target)
+        transition_norm_code[key] = transition_norm.to_einsum(norm_target)
         right_commutator_code[key] = right_commutator.to_einsum(
             commutator_target
         )
@@ -448,16 +622,19 @@ def _compile_wick_equations() -> _WickEquationBundle:
         )
         commutator_code[key] = commutator.to_einsum(commutator_target)
         norm_text[key] = repr(norm)
+        transition_norm_text[key] = repr(transition_norm)
         right_commutator_text[key] = repr(right_commutator)
         left_commutator_text[key] = repr(left_commutator)
         commutator_text[key] = repr(commutator)
 
     return _WickEquationBundle(
         norm_code=norm_code,
+        transition_norm_code=transition_norm_code,
         right_commutator_code=right_commutator_code,
         left_commutator_code=left_commutator_code,
         commutator_code=commutator_code,
         norm_text=norm_text,
+        transition_norm_text=transition_norm_text,
         right_commutator_text=right_commutator_text,
         left_commutator_text=left_commutator_text,
         commutator_text=commutator_text,
@@ -475,6 +652,10 @@ def dump_wick_equations(filename: str | None = None) -> str:
                 f"[{key}] perturber\n{_PERTURBER_EXPRESSIONS[key]}",
                 f"[{key}] norm expression\n{equations.norm_text[key]}",
                 f"[{key}] norm einsum\n{equations.norm_code[key]}",
+                f"[{key}] transition norm expression\n"
+                f"{equations.transition_norm_text[key]}",
+                f"[{key}] transition norm einsum\n"
+                f"{equations.transition_norm_code[key]}",
                 f"[{key}] right Dyall commutator expression\n"
                 f"{equations.right_commutator_text[key]}",
                 f"[{key}] right Dyall commutator einsum\n"
@@ -908,7 +1089,7 @@ def _validate_zero_norm_commutator(
     }
 
 
-def _execution_context(eris, pdms):
+def _execution_context(eris, pdms, *, overlap=None):
     context = {
         "deltaAA": np.eye(eris.ncas),
         "deltaII": np.eye(eris.ncore),
@@ -916,6 +1097,8 @@ def _execution_context(eris, pdms):
     }
     for rank, density in enumerate(pdms, start=1):
         context[f"dm{rank}{'A' * (2 * rank)}"] = density
+    if overlap is not None:
+        context["dm0"] = np.asarray(overlap)
     for key in _H1_KEYS:
         value = eris.get_h1eff(key)
         context[f"h{key}"] = value
@@ -953,6 +1136,12 @@ def _evaluate_wick_subspaces(
 
     denominator_mode = _normalize_denominator_mode(denominator_mode)
     contraction_backend = _normalize_contraction_backend(contraction_backend)
+    if contraction_backend == "pytblis":
+        _validate_tblis_operand_dtypes(
+            [(f"h{key}", eris.get_h1eff(key)) for key in _H1_KEYS]
+            + [(f"w{key}", eris.get_phys(key)) for key in _W_KEYS]
+            + [(f"dm{rank}", density) for rank, density in enumerate(pdms, 1)]
+        )
     # Block2 emits source containing ``np.einsum``.  That global name is
     # resolved only here at exec time, so the cached source is backend-agnostic.
     wick_globals = {
@@ -970,10 +1159,12 @@ def _evaluate_wick_subspaces(
     for key in SUBSPACE_ORDER:
         subspace_start = time.perf_counter()
         shape = _free_index_shape(key, eris)
+        integral_dtypes = tuple(
+            eris.get_h1eff(block).dtype for block in _H1_KEYS
+        ) + tuple(eris.get_phys(block).dtype for block in _W_KEYS)
         dtype = np.result_type(
             np.complex128,
-            eris.h1eff.dtype,
-            eris.pppp.dtype,
+            *integral_dtypes,
             *(density.dtype for density in pdms),
         )
         norm = np.zeros(shape, dtype=dtype)
@@ -1553,15 +1744,166 @@ def _rotate_eris(eris, rotation):
     )
 
 
-def _project_dense_mo_integrals(h1e, eri):
+_DEFAULT_AO2MO_ROUNDOFF_FACTOR = 1.0
+_SUPPORTED_AO2MO_DTYPES = frozenset(
+    np.dtype(dtype)
+    for dtype in (np.float32, np.float64, np.complex64, np.complex128)
+)
+_SYMMETRY_COMPARISON_PATHS = 2
+_REAL_OPS_PER_REAL_MULTIPLY_ADD = 2
+_REAL_OPS_PER_COMPLEX_MULTIPLY_ADD = 8
+
+
+def _require_supported_ao2mo_dtype(values, *, name):
+    dtype = np.asarray(values).dtype
+    if dtype not in _SUPPORTED_AO2MO_DTYPES:
+        supported = ", ".join(
+            sorted(item.name for item in _SUPPORTED_AO2MO_DTYPES)
+        )
+        raise TypeError(
+            f"{name} has unsupported dtype {dtype}; supported AO2MO dtypes: "
+            f"{supported}"
+        )
+    return dtype
+
+
+def _roundoff_gamma(operation_count, epsilon, *, name):
+    try:
+        accumulated_roundoff = int(operation_count) * float(epsilon)
+    except OverflowError as error:
+        raise ValueError(
+            f"{name} roundoff model requires 0 < operation_count * eps < 1"
+        ) from error
+    if (
+        not np.isfinite(accumulated_roundoff)
+        or not 0.0 < accumulated_roundoff < 1.0
+    ):
+        raise ValueError(
+            f"{name} roundoff model requires 0 < operation_count * eps < 1"
+        )
+    return accumulated_roundoff / (1.0 - accumulated_roundoff)
+
+
+def _ao2mo_roundoff_policy(
+    values,
+    *,
+    accumulation_length,
+    contraction_stages,
+    roundoff_factor,
+):
+    """Return an operation-aware floating-point gate and its provenance.
+
+    ``gamma(k) = k*eps / (1 - k*eps)`` is the standard accumulation factor for
+    ``k`` rounded operations.  AO-to-MO transformation applies two dense
+    contractions to a one-electron tensor and four to a two-electron tensor,
+    each accumulating over the AO dimension.  A real multiply-add is modelled
+    as two real rounded operations and a complex multiply-add as at most eight.
+    A symmetry residual compares two independently rounded transformation
+    paths, hence the explicit factor of two.  Scaling ``gamma(k)`` by
+    ``max(1, maximum_absolute_value)`` gives an operation-aware gate, not a
+    rigorous forward error bound in the presence of cancellation.
+    ``roundoff_factor`` is an explicit backend-specific multiplier on this
+    model.
+    """
+
+    if isinstance(accumulation_length, (bool, np.bool_)) or not isinstance(
+        accumulation_length, (int, np.integer)
+    ):
+        raise TypeError("roundoff_accumulation_length must be an integer")
+    accumulation_length = int(accumulation_length)
+    if accumulation_length <= 0:
+        raise ValueError("roundoff_accumulation_length must be positive")
+    if isinstance(contraction_stages, (bool, np.bool_)) or not isinstance(
+        contraction_stages, (int, np.integer)
+    ):
+        raise TypeError("contraction_stages must be an integer")
+    contraction_stages = int(contraction_stages)
+    if contraction_stages <= 0:
+        raise ValueError("contraction_stages must be positive")
+    try:
+        roundoff_factor = float(roundoff_factor)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "roundoff_factor must be finite and positive"
+        ) from error
+    if not np.isfinite(roundoff_factor) or roundoff_factor <= 0.0:
+        raise ValueError("roundoff_factor must be finite and positive")
+
+    input_dtype = _require_supported_ao2mo_dtype(values, name="values")
+    is_complex = bool(np.issubdtype(input_dtype, np.complexfloating))
+    real_dtype = np.asarray(np.asarray(values).real).dtype
+    epsilon = float(np.finfo(real_dtype).eps)
+    real_operations_per_multiply_add = (
+        _REAL_OPS_PER_COMPLEX_MULTIPLY_ADD
+        if is_complex
+        else _REAL_OPS_PER_REAL_MULTIPLY_ADD
+    )
+    operation_count = (
+        contraction_stages
+        * real_operations_per_multiply_add
+        * accumulation_length
+    )
+    gamma = _roundoff_gamma(operation_count, epsilon, name="AO2MO")
+    with np.errstate(over="ignore", invalid="ignore"):
+        maximum_absolute_value = _maximum_abs(values)
+    if not np.isfinite(maximum_absolute_value):
+        raise ValueError(
+            "AO2MO maximum absolute value is non-finite; the roundoff gate "
+            "cannot be constructed"
+        )
+    effective_scale = max(1.0, maximum_absolute_value)
+    gate = (
+        roundoff_factor
+        * _SYMMETRY_COMPARISON_PATHS
+        * gamma
+        * effective_scale
+    )
+    if not np.isfinite(gate):
+        raise ValueError(
+            "AO2MO roundoff gate is non-finite; reduce roundoff_factor or "
+            "the transformed-integral scale"
+        )
+    return float(gate), {
+        "formula": (
+            "roundoff_factor * symmetry_comparison_paths * "
+            "gamma(operation_count) * effective_scale"
+        ),
+        "input_dtype": input_dtype.name,
+        "is_complex": is_complex,
+        "real_dtype": np.dtype(real_dtype).name,
+        "machine_epsilon": epsilon,
+        "maximum_absolute_value": maximum_absolute_value,
+        "effective_scale": effective_scale,
+        "accumulation_length": accumulation_length,
+        "contraction_stages": contraction_stages,
+        "real_operations_per_multiply_add": real_operations_per_multiply_add,
+        "operation_count": operation_count,
+        "gamma": float(gamma),
+        "symmetry_comparison_paths": _SYMMETRY_COMPARISON_PATHS,
+        "symmetry_comparison_path_provenance": (
+            "raw symmetry residual compares two independently rounded "
+            "AO2MO paths"
+        ),
+        "roundoff_factor": roundoff_factor,
+    }
+
+
+def _project_dense_mo_integrals(
+    h1e,
+    eri,
+    *,
+    roundoff_accumulation_length=None,
+    roundoff_factor=_DEFAULT_AO2MO_ROUNDOFF_FACTOR,
+):
     """Project AO2MO roundoff back onto the physical spinor symmetries.
 
     ``s1`` means that the full tensor is stored; it does not remove the
     Coulomb identities ``(pq|rs) = (rs|pq)`` and
     ``(pq|rs) = (qp|sr)*``.  The raw residual is gated before projection so
     an axis/conjugation bug cannot be silently averaged away.  ``eri`` is a
-    private writable AO2MO buffer and is consumed as scratch to keep the peak
-    at two full tensors.
+    private writable AO2MO buffer and is consumed as scratch to keep the
+    production peak at two full tensors.  A read-only injected buffer is
+    copied first and can therefore transiently require a third full tensor.
     """
 
     h1e = np.asarray(h1e)
@@ -1571,14 +1913,14 @@ def _project_dense_mo_integrals(h1e, eri):
     nmo = h1e.shape[0]
     if eri.shape != (nmo,) * 4:
         raise ValueError("eri has the wrong shape before symmetry projection")
-    if not np.issubdtype(h1e.dtype, np.inexact):
-        raise TypeError("h1e must have a real or complex floating dtype")
-    if not np.issubdtype(eri.dtype, np.inexact):
-        raise TypeError("eri must have a real or complex floating dtype")
+    _require_supported_ao2mo_dtype(h1e, name="h1e")
+    _require_supported_ao2mo_dtype(eri, name="eri")
     if not np.all(np.isfinite(h1e)):
         raise ValueError("raw transformed h1e contains non-finite values")
     if not eri.flags.writeable:
         eri = np.array(eri, copy=True)
+    if roundoff_accumulation_length is None:
+        roundoff_accumulation_length = nmo
 
     h1e_scale = _maximum_abs(h1e)
     h1e_error = _maximum_abs(h1e - h1e.T.conj())
@@ -1597,18 +1939,22 @@ def _project_dense_mo_integrals(h1e, eri):
             conjugate_error, _maximum_abs(block - conjugate)
         )
 
-    # AO2MO consists of several long complex contractions.  A 4096-epsilon
-    # gate is deliberately much wider than the observed Cl/dyall-v3z
-    # residual while remaining many orders of magnitude below an index or
-    # missing-conjugation error.  This gate is only for the raw input; the
-    # returned arrays are projected onto the identities exactly below.
-    roundoff_factor = 4096.0
-    h1e_epsilon = float(np.finfo(np.asarray(h1e.real).dtype).eps)
-    eri_epsilon = float(np.finfo(np.asarray(eri.real).dtype).eps)
-    h1e_tolerance = (
-        roundoff_factor * h1e_epsilon * max(1.0, h1e_scale)
+    # Model plausible roundoff from the raw AO2MO contractions.  The policy
+    # derives epsilon from each tensor dtype, scales with its output magnitude,
+    # and uses the actual AO accumulation length supplied by the transformation.
+    # Gross index/conjugation errors remain hard failures before projection.
+    h1e_tolerance, h1e_roundoff_policy = _ao2mo_roundoff_policy(
+        h1e,
+        accumulation_length=roundoff_accumulation_length,
+        contraction_stages=2,
+        roundoff_factor=roundoff_factor,
     )
-    eri_tolerance = roundoff_factor * eri_epsilon * max(1.0, eri_scale)
+    eri_tolerance, eri_roundoff_policy = _ao2mo_roundoff_policy(
+        eri,
+        accumulation_length=roundoff_accumulation_length,
+        contraction_stages=4,
+        roundoff_factor=roundoff_factor,
+    )
     if h1e_error > h1e_tolerance:
         raise ValueError(
             "raw transformed h1e violates Hermiticity beyond roundoff: "
@@ -1622,22 +1968,32 @@ def _project_dense_mo_integrals(h1e, eri):
             f"tolerance={eri_tolerance:.3e}"
         )
 
-    projected_h1e = np.empty_like(h1e)
-    np.add(h1e, h1e.T.conj(), out=projected_h1e)
+    # Scale before every pairwise sum so symmetry-perfect values near the dtype
+    # maximum remain finite.  ``eri`` is the documented scratch tensor.
+    projected_h1e = np.array(h1e, copy=True)
     projected_h1e *= 0.5
+    projected_h1e += 0.5 * h1e.T.conj()
+    if not np.all(np.isfinite(projected_h1e)):
+        raise FloatingPointError(
+            "h1e symmetry projection produced non-finite values"
+        )
 
+    eri *= 0.5
     projected_eri = np.empty_like(eri)
     np.add(eri, eri.transpose(2, 3, 0, 1), out=projected_eri)
     projected_eri *= 0.5
     np.conjugate(projected_eri.transpose(1, 0, 3, 2), out=eri)
     projected_eri += eri
-    projected_eri *= 0.5
 
     post_h1e_error = _maximum_abs(projected_h1e - projected_h1e.T.conj())
     post_pair_error = 0.0
     post_conjugate_error = 0.0
     for p in range(nmo):
         block = projected_eri[p]
+        if not np.all(np.isfinite(block)):
+            raise FloatingPointError(
+                "eri symmetry projection produced non-finite values"
+            )
         pair = projected_eri[:, :, p, :].transpose(2, 0, 1)
         conjugate = (
             projected_eri[:, p, :, :].transpose(0, 2, 1).conj()
@@ -1649,13 +2005,33 @@ def _project_dense_mo_integrals(h1e, eri):
             post_conjugate_error, _maximum_abs(block - conjugate)
         )
 
+    # Each stable pair average uses at most four rounded scalar operations per
+    # component.  The allowances below conservatively cover one such average
+    # for h1e and the two sequential averages forming the four-element ERI
+    # group projection.  They describe projection arithmetic only; the raw
+    # AO2MO gate above has its own operation-aware policy.
+    h1e_projection_arithmetic_allowance = _roundoff_gamma(
+        4,
+        h1e_roundoff_policy["machine_epsilon"],
+        name="h1e projection",
+    ) * h1e_roundoff_policy["effective_scale"]
+    eri_projection_arithmetic_allowance = _roundoff_gamma(
+        8,
+        eri_roundoff_policy["machine_epsilon"],
+        name="eri projection",
+    ) * eri_roundoff_policy["effective_scale"]
+
     diagnostics = {
         "h1e": {
             "raw_hermiticity_error": h1e_error,
             "maximum_absolute_value": h1e_scale,
             "roundoff_gate": h1e_tolerance,
+            "roundoff_policy": h1e_roundoff_policy,
             "projection_change_upper_bound": 0.5 * h1e_error
-            + 2.0 * h1e_epsilon * max(1.0, h1e_scale),
+            + h1e_projection_arithmetic_allowance,
+            "projection_arithmetic_allowance": (
+                h1e_projection_arithmetic_allowance
+            ),
             "post_projection_hermiticity_error": post_h1e_error,
         },
         "eri": {
@@ -1663,9 +2039,13 @@ def _project_dense_mo_integrals(h1e, eri):
             "raw_conjugate_exchange_error": conjugate_error,
             "maximum_absolute_value": eri_scale,
             "roundoff_gate": eri_tolerance,
+            "roundoff_policy": eri_roundoff_policy,
             "projection_change_upper_bound": 0.5
             * (pair_error + conjugate_error)
-            + 4.0 * eri_epsilon * max(1.0, eri_scale),
+            + eri_projection_arithmetic_allowance,
+            "projection_arithmetic_allowance": (
+                eri_projection_arithmetic_allowance
+            ),
             "post_projection_pair_exchange_error": post_pair_error,
             "post_projection_conjugate_exchange_error": post_conjugate_error,
         },
@@ -1673,7 +2053,12 @@ def _project_dense_mo_integrals(h1e, eri):
     return projected_h1e, projected_eri, diagnostics
 
 
-def _dense_eris_from_mc(mc, mo_coeff):
+def _dense_eris_from_mc(
+    mc,
+    mo_coeff,
+    *,
+    roundoff_factor=_DEFAULT_AO2MO_ROUNDOFF_FACTOR,
+):
     from pyscf.ao2mo import nrr_outcore
 
     mo_coeff = np.asarray(mo_coeff)
@@ -1688,7 +2073,12 @@ def _dense_eris_from_mc(mc, mo_coeff):
     nmo = mo_coeff.shape[1]
     raw_eri = np.asarray(dense).reshape((nmo,) * 4)
     del dense
-    h1e, eri, symmetry_diagnostics = _project_dense_mo_integrals(h1e, raw_eri)
+    h1e, eri, symmetry_diagnostics = _project_dense_mo_integrals(
+        h1e,
+        raw_eri,
+        roundoff_accumulation_length=mo_coeff.shape[0],
+        roundoff_factor=roundoff_factor,
+    )
     del raw_eri
     result = spinor_helper.init_eris(
         h1e,
@@ -1721,6 +2111,35 @@ def _reference_energy(mc, root):
     return float(energies)
 
 
+@dataclass(frozen=True)
+class _PreparedSCRoot:
+    """One fully audited state-specific row for SS or QD-SC-NEVPT2."""
+
+    root: int
+    reference_energy: float
+    reference_residual_bound: float
+    scalar_tolerance: float
+    mo_coeff: np.ndarray
+    orbital_energy: np.ndarray
+    eris: Any
+    eris_basis: str
+    core_energy: np.ndarray
+    virtual_energy: np.ndarray
+    pdms123: tuple[np.ndarray, np.ndarray, np.ndarray] | None
+    subspace_arrays: dict[str, dict[str, np.ndarray]] | None
+    subspace_energies: dict[str, float]
+    subspace_norms: dict[str, float]
+    subspace_gaps: dict[str, tuple[float, float]]
+    subspace_diagnostics: dict[str, dict[str, Any]]
+    subspace_times: dict[str, float]
+    rdm_diagnostics: dict[str, Any]
+    integral_symmetry_diagnostics: dict[str, Any] | None
+    pdm_time: float
+    integral_time: float
+    strict_si_compatible: bool
+    e_corr: float
+
+
 class WickX2CSCNEVPT2(lib.StreamObject):
     """State-specific dense spinor SC-NEVPT2 generated with Block2 Wick."""
 
@@ -1749,6 +2168,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         self.sub_times = {}
         self.rdm_diagnostics = None
         self.integral_symmetry_diagnostics = None
+        self.integral_roundoff_factor = _DEFAULT_AO2MO_ROUNDOFF_FACTOR
         self.scalar_atol = 1.0e-10
         self.scalar_rtol = 1.0e-9
         self.rdm_atol = 1.0e-9
@@ -1815,6 +2235,177 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             )
         return rotated, np.asarray(energies, dtype=float)
 
+    def _prepare_sc_root(
+        self,
+        mc,
+        *,
+        mo_coeff,
+        pdms,
+        eris,
+        eris_basis,
+        root,
+        denominator_mode,
+        contraction_backend,
+        return_arrays=False,
+        compact_eris=False,
+        retain_pdms123=False,
+    ) -> _PreparedSCRoot:
+        """Prepare one audited multipartitioning row without committing state.
+
+        This is the single numerical path used by both the public
+        state-specific kernel and the QD_Bloch driver.  It deliberately calls
+        the instance ``_semicanonicalize`` hook so injected and
+        subclass-provided canonicalization policies remain valid.
+        """
+
+        reference_energy = _reference_energy(mc, root)
+        solver = mc.fcisolver
+        residual_bound = getattr(solver, "convergence_info", {}).get(
+            "local_residual_bound", 0.0
+        )
+        residual_bound = float(residual_bound)
+        if not np.isfinite(residual_bound) or residual_bound < 0.0:
+            residual_bound = 0.0
+        # The requested local eigensolver threshold is useful provenance, but
+        # is not a measured contraction-error bound and therefore does not
+        # relax either the strict-SI or Hermitianized scalar checks.
+        scalar_tolerance = float(self.scalar_atol)
+
+        pdm_start = time.perf_counter()
+        if pdms is None:
+            pdms = make_dm1234(mc.fcisolver, root=root)
+        solver_nelecas = getattr(mc.fcisolver, "nelecas", None)
+        if solver_nelecas is None:
+            solver_nelecas = mc.nelecas
+        pdms, rdm_diagnostics = validate_pdms(
+            pdms,
+            int(mc.ncas),
+            _total_nelec(solver_nelecas),
+            atol=self.rdm_atol,
+            rtol=self.rdm_rtol,
+            work_memory=self.rdm_work_memory,
+        )
+        retained_pdms123 = tuple(pdms[:3]) if retain_pdms123 else None
+        pdm_time = time.perf_counter() - pdm_start
+
+        integral_start = time.perf_counter()
+        original_mo = np.asarray(mo_coeff)
+        semicanonical_mo, orbital_energy = self._semicanonicalize(
+            mc, original_mo, pdms[0], root
+        )
+        if eris is None:
+            prepared_eris = _dense_eris_from_mc(
+                mc,
+                semicanonical_mo,
+                roundoff_factor=self.integral_roundoff_factor,
+            )
+            integral_symmetry_diagnostics = getattr(
+                prepared_eris, "symmetry_diagnostics", None
+            )
+            if compact_eris:
+                prepared_eris = _compact_wick_eris(prepared_eris)
+        else:
+            if not isinstance(eris, spinor_helper._SpinorERIs):
+                raise TypeError(
+                    "eris must be a spinor_helper._SpinorERIs instance"
+                )
+            if (eris.ncore, eris.ncas, eris.nmo) != (
+                int(mc.ncore),
+                int(mc.ncas),
+                semicanonical_mo.shape[1],
+            ):
+                raise ValueError("eris partition does not match the CASSCF object")
+            prepared_eris = eris
+            integral_symmetry_diagnostics = getattr(
+                prepared_eris, "symmetry_diagnostics", None
+            )
+            if (
+                eris_basis == "input_mo"
+                and not np.array_equal(semicanonical_mo, original_mo)
+            ):
+                overlap = np.asarray(mc._scf.get_ovlp())
+                rotation = original_mo.T.conj() @ overlap @ semicanonical_mo
+                if compact_eris:
+                    prepared_eris = _rotate_wick_eris(eris, rotation)
+                else:
+                    prepared_eris = _rotate_eris(eris, rotation)
+            elif compact_eris:
+                prepared_eris = _compact_wick_eris(eris)
+        integral_time = time.perf_counter() - integral_start
+
+        ncore = prepared_eris.ncore
+        nocc = prepared_eris.nocc
+        core_energy = orbital_energy[:ncore]
+        virtual_energy = orbital_energy[nocc:]
+        evaluated = _evaluate_wick_subspaces(
+            prepared_eris,
+            pdms,
+            core_energy,
+            virtual_energy,
+            root=root,
+            scalar_atol=scalar_tolerance,
+            scalar_rtol=self.scalar_rtol,
+            norm_tol=self.norm_tol,
+            denominator_tol=self.denominator_tol,
+            denominator_mode=denominator_mode,
+            si_gap_imag_atol=self.si_gap_imag_atol,
+            si_gap_imag_rtol=self.si_gap_imag_rtol,
+            si_numerator_noise_allowance=self.si_numerator_noise_allowance,
+            si_energy_imag_l1_tol=self.si_energy_imag_l1_tol,
+            si_projection_shift_l1_tol=self.si_projection_shift_l1_tol,
+            contraction_backend=contraction_backend,
+            return_arrays=return_arrays,
+            return_timings=True,
+            return_diagnostics=True,
+        )
+        if return_arrays:
+            (
+                sub_eners,
+                sub_norms,
+                sub_gaps,
+                subspace_arrays,
+                subspace_times,
+                realness_diagnostics,
+            ) = evaluated
+        else:
+            (
+                sub_eners,
+                sub_norms,
+                sub_gaps,
+                subspace_times,
+                realness_diagnostics,
+            ) = evaluated
+            subspace_arrays = None
+        strict_si_compatible = all(
+            diagnostics["root_one_sided_si_audit"]["strict_si_compatible"]
+            for diagnostics in realness_diagnostics.values()
+        )
+        return _PreparedSCRoot(
+            root=root,
+            reference_energy=reference_energy,
+            reference_residual_bound=residual_bound,
+            scalar_tolerance=scalar_tolerance,
+            mo_coeff=semicanonical_mo,
+            orbital_energy=orbital_energy,
+            eris=prepared_eris,
+            eris_basis="semicanonical",
+            core_energy=core_energy,
+            virtual_energy=virtual_energy,
+            pdms123=retained_pdms123,
+            subspace_arrays=subspace_arrays,
+            subspace_energies=sub_eners,
+            subspace_norms=sub_norms,
+            subspace_gaps=sub_gaps,
+            subspace_diagnostics=realness_diagnostics,
+            subspace_times=subspace_times,
+            rdm_diagnostics=rdm_diagnostics,
+            integral_symmetry_diagnostics=integral_symmetry_diagnostics,
+            pdm_time=pdm_time,
+            integral_time=integral_time,
+            strict_si_compatible=strict_si_compatible,
+            e_corr=float(sum(sub_eners.values())),
+        )
+
     def kernel(
         self,
         mc=None,
@@ -1825,11 +2416,15 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         denominator_mode=None,
         root=None,
         contraction_backend=None,
+        compact_eris=False,
     ):
         """Compute one root-specific SC-NEVPT2 correction.
 
         ``contraction_backend`` selects ``"pytblis"`` (the default) or the
         NumPy reference implementation for the Block2-generated contractions.
+        With a dense input-basis ``eris``, ``compact_eris=True`` rotates and
+        retains only the blocks used by Wick; the default preserves the
+        historical full-ERI result object.
         """
 
         if mc is None:
@@ -1856,111 +2451,39 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         if mo_coeff is None:
             mo_coeff = mc.mo_coeff
         mo_coeff = np.asarray(mo_coeff)
-        self.reference_energy = _reference_energy(mc, root)
-
-        solver = mc.fcisolver
-        residual_bound = getattr(solver, "convergence_info", {}).get(
-            "local_residual_bound", 0.0
+        row = self._prepare_sc_root(
+            mc,
+            mo_coeff=mo_coeff,
+            pdms=pdms,
+            eris=eris,
+            eris_basis=eris_basis,
+            root=root,
+            denominator_mode=denominator_mode,
+            contraction_backend=contraction_backend,
+            return_arrays=False,
+            compact_eris=bool(compact_eris),
         )
-        residual_bound = float(residual_bound)
-        if not np.isfinite(residual_bound) or residual_bound < 0.0:
-            residual_bound = 0.0
-        self.reference_residual_bound = residual_bound
-        # The requested local eigensolver threshold is useful provenance, but
-        # is not a measured contraction-error bound and therefore does not
-        # relax either the strict-SI or Hermitianized scalar checks.
-        self.scalar_tolerance = float(self.scalar_atol)
+        self.reference_energy = row.reference_energy
+        self.reference_residual_bound = row.reference_residual_bound
+        self.scalar_tolerance = row.scalar_tolerance
+        self.rdm_diagnostics = row.rdm_diagnostics
+        self.mo_coeff = row.mo_coeff
+        self.mo_energy = row.orbital_energy
+        self.eris = row.eris
+        self.eris_basis = row.eris_basis
+        self.integral_symmetry_diagnostics = row.integral_symmetry_diagnostics
+        self.strict_si_compatible = row.strict_si_compatible
 
-        pdm_start = time.perf_counter()
-        if pdms is None:
-            pdms = make_dm1234(mc.fcisolver, root=root)
-        solver_nelecas = getattr(mc.fcisolver, "nelecas", None)
-        if solver_nelecas is None:
-            solver_nelecas = mc.nelecas
-        pdms, self.rdm_diagnostics = validate_pdms(
-            pdms,
-            int(mc.ncas),
-            _total_nelec(solver_nelecas),
-            atol=self.rdm_atol,
-            rtol=self.rdm_rtol,
-            work_memory=self.rdm_work_memory,
-        )
-        pdm_time = time.perf_counter() - pdm_start
-
-        integral_start = time.perf_counter()
-        original_mo = mo_coeff
-        semicanonical_mo, orbital_energy = self._semicanonicalize(
-            mc, original_mo, pdms[0], root
-        )
-        if eris is None:
-            eris = _dense_eris_from_mc(mc, semicanonical_mo)
-            effective_eris_basis = "semicanonical"
-        else:
-            if not isinstance(eris, spinor_helper._SpinorERIs):
-                raise TypeError("eris must be a spinor_helper._SpinorERIs instance")
-            if (eris.ncore, eris.ncas, eris.nmo) != (
-                int(mc.ncore),
-                int(mc.ncas),
-                semicanonical_mo.shape[1],
-            ):
-                raise ValueError("eris partition does not match the CASSCF object")
-            if (
-                eris_basis == "input_mo"
-                and not np.array_equal(semicanonical_mo, original_mo)
-            ):
-                overlap = np.asarray(mc._scf.get_ovlp())
-                rotation = original_mo.T.conj() @ overlap @ semicanonical_mo
-                eris = _rotate_eris(eris, rotation)
-            effective_eris_basis = "semicanonical"
-        integral_time = time.perf_counter() - integral_start
-
-        self.mo_coeff = semicanonical_mo
-        self.mo_energy = orbital_energy
-        self.eris = eris
-        self.eris_basis = effective_eris_basis
-        self.integral_symmetry_diagnostics = getattr(
-            eris, "symmetry_diagnostics", None
-        )
-        ncore = eris.ncore
-        nocc = eris.nocc
-        core_energy = orbital_energy[:ncore]
-        virtual_energy = orbital_energy[nocc:]
-
-        self.sub_times = {"pdms": pdm_time, "eris": integral_time}
+        sub_eners = row.subspace_energies
+        sub_norms = row.subspace_norms
+        sub_gaps = row.subspace_gaps
+        subspace_times = row.subspace_times
+        realness_diagnostics = row.subspace_diagnostics
+        self.sub_times = {"pdms": row.pdm_time, "eris": row.integral_time}
         self.sub_eners = {}
         self.sub_norms = {}
         self.sub_denominators = {}
         self.sub_realness_diagnostics = {}
-        (
-            sub_eners,
-            sub_norms,
-            sub_gaps,
-            subspace_times,
-            realness_diagnostics,
-        ) = _evaluate_wick_subspaces(
-            eris,
-            pdms,
-            core_energy,
-            virtual_energy,
-            root=root,
-            scalar_atol=self.scalar_tolerance,
-            scalar_rtol=self.scalar_rtol,
-            norm_tol=self.norm_tol,
-            denominator_tol=self.denominator_tol,
-            denominator_mode=denominator_mode,
-            si_gap_imag_atol=self.si_gap_imag_atol,
-            si_gap_imag_rtol=self.si_gap_imag_rtol,
-            si_numerator_noise_allowance=self.si_numerator_noise_allowance,
-            si_energy_imag_l1_tol=self.si_energy_imag_l1_tol,
-            si_projection_shift_l1_tol=self.si_projection_shift_l1_tol,
-            contraction_backend=contraction_backend,
-            return_timings=True,
-            return_diagnostics=True,
-        )
-        self.strict_si_compatible = all(
-            diagnostics["root_one_sided_si_audit"]["strict_si_compatible"]
-            for diagnostics in realness_diagnostics.values()
-        )
         if denominator_mode == "hermitianized" and not self.strict_si_compatible:
             failed = ", ".join(
                 key
@@ -2016,7 +2539,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             self.strict_si_compatible,
             self.scalar_tolerance,
             self.scalar_atol,
-            residual_bound,
+            self.reference_residual_bound,
         )
         logger.note(
             self,

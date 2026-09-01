@@ -1,0 +1,1740 @@
+#!/usr/bin/env python
+# SPDX-License-Identifier: GPL-3.0-or-later
+r"""Classical non-Hermitian QD_Bloch extension of dense X2C-SC-NEVPT2.
+
+The stored matrix uses the source-row convention
+
+.. math::
+
+   H^{B}_{IJ} = \delta_{IJ} E_I^{(0)}
+       - \sum_{\alpha\in\mathcal R_I}
+       \frac{\langle\Psi_I|T_\alpha^{I\dagger}T_\alpha^I|\Psi_J\rangle}
+            {\Delta_\alpha^I}.
+
+Each row owns its state-specific CanonStep-1 semicanonical integrals,
+strongly-contracted perturbers, retained mask, and positive strict-SI Dyall
+gap.  The matrix is deliberately not symmetrized.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+import gc
+import time
+from typing import Any
+
+import numpy as np
+from pyscf import lib
+from pyscf.lib import logger
+from scipy.linalg import eig
+
+from . import x2cscnevpt2 as _ss
+
+
+__all__ = [
+    "QDBlochSCNEVPT2Result",
+    "WickX2CQDBlochSCNEVPT2",
+    "X2CQDBlochSCNEVPT2",
+    "adjoint_transition_pdm",
+    "make_transition_overlap",
+    "make_transition_dm1234",
+    "make_transition_rdm1",
+    "make_transition_rdm2",
+    "make_transition_rdm3",
+    "make_transition_rdm4",
+    "validate_transition_pdms",
+]
+
+
+def _dense_eris_nbytes(eris):
+    return int(
+        np.asarray(eris.h1e).nbytes
+        + np.asarray(eris.h1eff).nbytes
+        + np.asarray(eris.pppp).nbytes
+    )
+
+
+def _retain_qd_row_arrays(subspace_arrays):
+    """Detach only audited row tensors needed after diagonal preparation."""
+
+    retained = {}
+    for key in _ss.SUBSPACE_ORDER:
+        arrays = subspace_arrays[key]
+        retained[key] = {
+            "norm": np.array(np.asarray(arrays["norm"]).real, copy=True),
+            "denominator": np.array(
+                np.asarray(arrays["denominator"]).real, copy=True
+            ),
+            "ordered": np.array(arrays["ordered"], dtype=bool, copy=True),
+            "nonzero": np.array(arrays["nonzero"], dtype=bool, copy=True),
+        }
+    return retained
+
+
+def _nested_array_nbytes(values):
+    return int(
+        sum(
+            np.asarray(array).nbytes
+            for arrays in values.values()
+            for array in arrays.values()
+        )
+    )
+
+
+def adjoint_transition_pdm(dm):
+    """Return the reverse raw-SGF transition PDM.
+
+    For axes ``p1,...,pk,qk,...,q1`` the adjoint relation reverses all
+    ``2*k`` axes and complex conjugates the tensor.
+    """
+
+    density = np.asarray(dm)
+    if density.ndim == 0 or density.ndim % 2:
+        raise ValueError("a transition PDM must have a positive even rank")
+    axes = tuple(range(density.ndim - 1, -1, -1))
+    return density.transpose(axes).conj()
+
+
+def _transition_root_kets(dmrgci, bra_root, ket_root):
+    bra_driver, bra = _ss._root_ket(dmrgci, bra_root)
+    ket_driver, ket = _ss._root_ket(dmrgci, ket_root)
+    if bra_driver is not ket_driver:
+        raise RuntimeError("transition MPS roots do not share one Block2 driver")
+    return bra_driver, bra, ket
+
+
+def _make_transition_rdm(dmrgci, bra_root, ket_root, rank):
+    bra_root = int(bra_root)
+    ket_root = int(ket_root)
+    rank = int(rank)
+    if rank not in (1, 2, 3, 4):
+        raise ValueError("transition RDM rank must be between one and four")
+    if bra_root == ket_root:
+        return _ss._make_rdm(dmrgci, bra_root, rank)
+
+    driver, bra, ket = _transition_root_kets(dmrgci, bra_root, ket_root)
+    kwargs = {
+        "site_type": int(getattr(dmrgci, "npdm_site_type", 0)),
+        "cutoff": float(getattr(dmrgci, "npdm_cutoff", 1.0e-24)),
+    }
+    method = getattr(driver, f"get_trans_{rank}pdm", None)
+    if callable(method):
+        density = method(bra, ket, **kwargs)
+    else:
+        method = getattr(driver, "get_npdm", None)
+        if not callable(method):
+            raise RuntimeError(
+                f"the installed pyblock2 driver has no transition {rank}-RDM "
+                "interface"
+            )
+        # Installed block2 0.5.4rc16 signature:
+        # get_npdm(ket, pdm_type=1, bra=None, ..., site_type=0, cutoff=1e-24)
+        density = method(ket, pdm_type=rank, bra=bra, **kwargs)
+    density = np.asarray(density)
+    ncas = int(getattr(dmrgci, "ncas"))
+    expected_shape = (ncas,) * (2 * rank)
+    if density.shape != expected_shape:
+        raise ValueError(
+            f"Block2 transition ({bra_root},{ket_root}) {rank}-RDM has "
+            f"shape {density.shape}; expected raw SGF shape {expected_shape}"
+        )
+    if not np.issubdtype(density.dtype, np.number):
+        raise TypeError("Block2 returned a non-numeric transition PDM")
+    return np.asarray(density, dtype=np.complex128)
+
+
+def make_transition_rdm1(dmrgci, bra_root, ket_root):
+    """Return ``<bra|C[p]D[q]|ket>`` in raw SGF order."""
+
+    return _make_transition_rdm(dmrgci, bra_root, ket_root, 1)
+
+
+def make_transition_rdm2(dmrgci, bra_root, ket_root):
+    """Return the explicit raw SGF transition 2-particle RDM."""
+
+    return _make_transition_rdm(dmrgci, bra_root, ket_root, 2)
+
+
+def make_transition_rdm3(dmrgci, bra_root, ket_root):
+    """Return the explicit raw SGF transition 3-particle RDM."""
+
+    return _make_transition_rdm(dmrgci, bra_root, ket_root, 3)
+
+
+def make_transition_rdm4(dmrgci, bra_root, ket_root):
+    """Return the explicit, uncompressed transition 4-particle RDM."""
+
+    return _make_transition_rdm(dmrgci, bra_root, ket_root, 4)
+
+
+def make_transition_dm1234(dmrgci, bra_root, ket_root):
+    """Form raw transition 1--4 PDMs for one ordered MPS root pair."""
+
+    return tuple(
+        _make_transition_rdm(dmrgci, bra_root, ket_root, rank)
+        for rank in range(1, 5)
+    )
+
+
+def _make_transition_dm123(dmrgci, bra_root, ket_root):
+    """Form only the ranks required by Angeli Eq. (18) SC couplings."""
+
+    return tuple(
+        _make_transition_rdm(dmrgci, bra_root, ket_root, rank)
+        for rank in range(1, 4)
+    )
+
+
+def _transition_contraction_pdms(pdms):
+    """Normalize only production ranks 1--3 to the TBLIS complex ABI."""
+
+    if not isinstance(pdms, (tuple, list)) or len(pdms) < 3:
+        raise ValueError("transition contractions require RDM ranks 1--3")
+    return tuple(
+        np.asarray(density, dtype=np.complex128) for density in pdms[:3]
+    )
+
+
+def _complex_scalar(value, *, name):
+    array = np.asarray(value)
+    if array.size != 1 or not np.issubdtype(array.dtype, np.number):
+        raise TypeError(f"{name} must be one numeric scalar")
+    result = complex(array.reshape(()))
+    if not np.isfinite(result):
+        raise ValueError(f"{name} is not finite")
+    return result
+
+
+def _finite_nonnegative(value, *, name):
+    value = float(value)
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return value
+
+
+def _make_transition_overlap(dmrgci, bra_root, ket_root, *, dm1=None):
+    driver, bra, ket = _transition_root_kets(dmrgci, bra_root, ket_root)
+    get_identity = getattr(driver, "get_identity_mpo", None)
+    expectation = getattr(driver, "expectation", None)
+    if callable(get_identity) and callable(expectation):
+        identity = get_identity()
+        overlap = expectation(bra, identity, ket)
+        return _complex_scalar(overlap, name="model-state overlap"), "identity_mpo"
+
+    if dm1 is None:
+        dm1 = make_transition_rdm1(dmrgci, bra_root, ket_root)
+    nelecas = getattr(dmrgci, "nelecas", None)
+    if nelecas is None:
+        raise RuntimeError(
+            "cannot infer overlap from transition dm1 without active electron count"
+        )
+    nelec = _ss._total_nelec(nelecas)
+    if nelec == 0:
+        if int(bra_root) == int(ket_root):
+            return 1.0 + 0.0j, "zero_electron_identity"
+        raise RuntimeError("a zero-electron transition overlap needs identity MPO")
+    overlap = np.trace(np.asarray(dm1)) / nelec
+    return _complex_scalar(overlap, name="dm1-derived overlap"), "dm1_trace_fallback"
+
+
+def make_transition_overlap(dmrgci, bra_root, ket_root):
+    """Return ``<bra_root|ket_root>`` using the Block2 identity MPO."""
+
+    return _make_transition_overlap(dmrgci, bra_root, ket_root)[0]
+
+
+def _complex_pair(value):
+    value = complex(value)
+    return [float(value.real), float(value.imag)]
+
+
+def validate_transition_pdms(
+    pdms_ij,
+    ncas,
+    nelec,
+    *,
+    overlap_ij,
+    pdms_ji=None,
+    atol=1.0e-9,
+    rtol=1.0e-8,
+    work_memory=512 * 2**20,
+):
+    """Validate raw SGF transition ranks 1--3 or 1--4.
+
+    This deliberately does not normalize a possible rank-4 tensor's dtype:
+    doing so could create a hidden tens-of-GiB copy for larger active spaces.
+    The production contraction path slices to ranks 1--3 and converts those
+    arrays to complex128 explicitly at its backend boundary.
+    """
+
+    if not isinstance(pdms_ij, (tuple, list)) or len(pdms_ij) not in (3, 4):
+        raise ValueError(
+            "pdms_ij must contain consecutive transition RDM ranks 1--3 "
+            "or 1--4"
+        )
+    if pdms_ji is not None and (
+        not isinstance(pdms_ji, (tuple, list))
+        or len(pdms_ji) != len(pdms_ij)
+    ):
+        raise ValueError("pdms_ji must contain the same ranks as pdms_ij")
+    ncas = int(ncas)
+    nelec = int(nelec)
+    work_memory = int(work_memory)
+    if work_memory <= 0:
+        raise ValueError("work_memory must be positive")
+    overlap_ij = _complex_scalar(overlap_ij, name="overlap_ij")
+
+    checked = []
+    reverse_checked = [] if pdms_ji is not None else None
+    diagnostics = {"overlap": _complex_pair(overlap_ij)}
+    for rank, density in enumerate(pdms_ij, start=1):
+        density = np.asarray(density)
+        expected_shape = (ncas,) * (2 * rank)
+        if density.shape != expected_shape:
+            raise ValueError(
+                f"transition dm{rank} must have shape {expected_shape}, "
+                f"got {density.shape}"
+            )
+        if not np.issubdtype(density.dtype, np.number):
+            raise TypeError(f"transition dm{rank} must be numeric")
+        if not _ss._all_finite_chunked(density, work_memory):
+            raise ValueError(f"transition dm{rank} contains non-finite values")
+
+        creator_error = 0.0
+        annihilator_error = 0.0
+        for axis in range(rank - 1):
+            creator_error = max(
+                creator_error,
+                _ss._maximum_abs_relation(
+                    density,
+                    density.swapaxes(axis, axis + 1),
+                    sign=1.0,
+                    work_memory=work_memory,
+                ),
+            )
+            annihilator_axis = rank + axis
+            annihilator_error = max(
+                annihilator_error,
+                _ss._maximum_abs_relation(
+                    density,
+                    density.swapaxes(
+                        annihilator_axis, annihilator_axis + 1
+                    ),
+                    sign=1.0,
+                    work_memory=work_memory,
+                ),
+            )
+        scale = max(1.0, _ss._maximum_abs_chunked(density, work_memory))
+        tolerance = atol + rtol * scale
+        if max(creator_error, annihilator_error) > tolerance:
+            raise ValueError(
+                f"transition dm{rank} violates raw SGF antisymmetry: "
+                f"creator={creator_error:.3e}, "
+                f"annihilator={annihilator_error:.3e}"
+            )
+        rank_diagnostics = {
+            "shape": list(density.shape),
+            "creator_antisymmetry_error": creator_error,
+            "annihilator_antisymmetry_error": annihilator_error,
+        }
+
+        if pdms_ji is not None:
+            reverse = np.asarray(pdms_ji[rank - 1])
+            if reverse.shape != expected_shape:
+                raise ValueError(
+                    f"reverse transition dm{rank} has shape {reverse.shape}; "
+                    f"expected {expected_shape}"
+                )
+            if not np.issubdtype(reverse.dtype, np.number):
+                raise TypeError(f"reverse transition dm{rank} must be numeric")
+            if not _ss._all_finite_chunked(reverse, work_memory):
+                raise ValueError(
+                    f"reverse transition dm{rank} contains non-finite values"
+                )
+            axes = tuple(range(2 * rank - 1, -1, -1))
+            adjoint_error = _ss._maximum_abs_relation(
+                reverse,
+                density.transpose(axes),
+                sign=-1.0,
+                conjugate_right=True,
+                work_memory=work_memory,
+            )
+            reverse_scale = max(
+                scale, _ss._maximum_abs_chunked(reverse, work_memory)
+            )
+            if adjoint_error > atol + rtol * max(1.0, reverse_scale):
+                raise ValueError(
+                    f"transition dm{rank} reverse-adjoint relation failed: "
+                    f"error={adjoint_error:.3e}"
+                )
+            rank_diagnostics["reverse_adjoint_error"] = adjoint_error
+            reverse_checked.append(reverse)
+
+        diagnostics[f"dm{rank}"] = rank_diagnostics
+        checked.append(density)
+
+    trace = np.trace(checked[0])
+    trace_error = abs(trace - nelec * overlap_ij)
+    trace_tolerance = atol + rtol * max(1.0, nelec * abs(overlap_ij))
+    if trace_error > trace_tolerance:
+        raise ValueError(
+            "transition dm1 trace is inconsistent with electron number and "
+            f"overlap: error={trace_error:.3e}"
+        )
+    diagnostics["dm1"]["trace"] = _complex_pair(trace)
+    diagnostics["dm1"]["trace_error"] = float(trace_error)
+
+    for rank in range(2, len(checked) + 1):
+        contracted = np.trace(
+            checked[rank - 1], axis1=rank - 1, axis2=rank
+        )
+        expected = (nelec - rank + 1) * checked[rank - 2]
+        error = _ss._maximum_abs_relation(
+            contracted,
+            expected,
+            sign=-1.0,
+            work_memory=work_memory,
+        )
+        scale = max(1.0, _ss._maximum_abs_chunked(expected, work_memory))
+        if error > atol + rtol * scale:
+            raise ValueError(
+                f"transition dm{rank}->dm{rank - 1} particle-number "
+                f"contraction failed: error={error:.3e}"
+            )
+        diagnostics[f"dm{rank}"]["contraction_error"] = error
+
+    return tuple(checked), diagnostics
+
+
+def _evaluate_transition_perturber_couplings(
+    eris_row,
+    transition_pdms,
+    overlap,
+    *,
+    row_root,
+    column_root,
+    row_nonzero=None,
+    row_norm=None,
+    partner_norm=None,
+    norm_tol=1.0e-14,
+    zero_norm_atol=1.0e-10,
+    zero_norm_rtol=1.0e-9,
+    contraction_backend=_ss._DEFAULT_CONTRACTION_BACKEND,
+    return_diagnostics=False,
+):
+    """Evaluate complex ``<I|T_I^dagger T_I|J>`` tensors for all classes."""
+
+    norm_tol = _finite_nonnegative(norm_tol, name="norm_tol")
+    zero_norm_atol = _finite_nonnegative(
+        zero_norm_atol, name="zero_norm_atol"
+    )
+    zero_norm_rtol = _finite_nonnegative(
+        zero_norm_rtol, name="zero_norm_rtol"
+    )
+    if row_nonzero is not None and (
+        row_norm is None or partner_norm is None
+    ):
+        raise ValueError(
+            "discarded row perturbers require row_norm and partner_norm "
+            "for a Cauchy-bound audit"
+        )
+    contraction_backend = _ss._normalize_contraction_backend(
+        contraction_backend
+    )
+    transition_pdms = _transition_contraction_pdms(transition_pdms)
+    if contraction_backend == "pytblis":
+        _ss._validate_tblis_operand_dtypes(
+            [
+                (f"h{key}", eris_row.get_h1eff(key))
+                for key in _ss._H1_KEYS
+            ]
+            + [
+                (f"w{key}", eris_row.get_phys(key))
+                for key in _ss._W_KEYS
+            ]
+            + [
+                (f"dm{rank}", density)
+                for rank, density in enumerate(transition_pdms, 1)
+            ]
+        )
+    overlap = _complex_scalar(overlap, name="transition overlap")
+    equations = _ss._compile_wick_equations()
+    wick_globals = {"np": _ss._wick_einsum_namespace(contraction_backend)}
+    base_context = _ss._execution_context(
+        eris_row, transition_pdms, overlap=overlap
+    )
+    couplings = {}
+    diagnostics = {}
+    for key in _ss.SUBSPACE_ORDER:
+        shape = _ss._free_index_shape(key, eris_row)
+        integral_dtypes = tuple(
+            eris_row.get_h1eff(block).dtype for block in _ss._H1_KEYS
+        ) + tuple(eris_row.get_phys(block).dtype for block in _ss._W_KEYS)
+        dtype = np.result_type(
+            np.complex128,
+            *integral_dtypes,
+            *(np.asarray(dm).dtype for dm in transition_pdms),
+        )
+        coupling = np.zeros(shape, dtype=dtype)
+        local_context = dict(base_context)
+        local_context["norm"] = coupling
+        exec(
+            equations.transition_norm_code[key],
+            wick_globals,
+            local_context,
+        )
+        ordered = _ss._strict_pair_mask(key, shape)
+        selected = coupling[ordered]
+        if not np.all(np.isfinite(selected)):
+            raise FloatingPointError(
+                f"row root {row_root}, column root {column_root}, subspace "
+                f"{key}: transition coupling contains non-finite values"
+            )
+
+        if row_nonzero is None:
+            nonzero = ordered
+        else:
+            try:
+                nonzero = np.asarray(row_nonzero[key], dtype=bool)
+            except (KeyError, TypeError) as error:
+                raise ValueError(
+                    f"row_nonzero has no mask for subspace {key}"
+                ) from error
+            if nonzero.shape != shape or np.any(nonzero & ~ordered):
+                raise ValueError(
+                    f"row_nonzero mask for subspace {key} is inconsistent"
+                )
+        zero_norm = ordered & ~nonzero
+        if row_nonzero is None:
+            cauchy_diagnostics = {
+                "zero_norm_count": 0,
+                "zero_norm_maximum_absolute_value": 0.0,
+                "zero_norm_maximum_absolute_index": [],
+                "zero_norm_row_norm_at_maximum": 0.0,
+                "zero_norm_partner_norm_at_maximum": 0.0,
+                "zero_norm_cauchy_bound_at_maximum": 0.0,
+                "zero_norm_numerical_allowance_at_maximum": 0.0,
+                "zero_norm_acceptance_limit_at_maximum": 0.0,
+                "zero_norm_physical_excess_at_maximum": 0.0,
+                "zero_norm_maximum_acceptance_excess": 0.0,
+                "zero_norm_maximum_acceptance_excess_index": [],
+                "zero_norm_maximum_cauchy_ratio": 0.0,
+                "zero_norm_maximum_finite_cauchy_ratio": 0.0,
+                "zero_norm_cauchy_ratio_unbounded_count": 0,
+                "zero_norm_cauchy_gate_passed": True,
+            }
+        else:
+            try:
+                row_norm_key = np.asarray(row_norm[key])
+            except (KeyError, TypeError) as error:
+                raise ValueError(
+                    f"row_norm has no tensor for subspace {key}"
+                ) from error
+            try:
+                partner_norm_key = np.asarray(partner_norm[key])
+            except (KeyError, TypeError) as error:
+                raise ValueError(
+                    f"partner_norm has no tensor for subspace {key}"
+                ) from error
+            cauchy_diagnostics = _validate_discarded_couplings_cauchy(
+                coupling,
+                zero_norm,
+                row_norm_key,
+                partner_norm_key,
+                row_root=row_root,
+                column_root=column_root,
+                subspace=key,
+                norm_tol=norm_tol,
+                atol=zero_norm_atol,
+                rtol=zero_norm_rtol,
+            )
+        couplings[key] = coupling
+        diagnostics[key] = {
+            "maximum_absolute_value": float(
+                np.max(np.abs(selected), initial=0.0)
+            ),
+            "maximum_imaginary_part": float(
+                np.max(np.abs(selected.imag), initial=0.0)
+            ),
+            **cauchy_diagnostics,
+            "retained_dimension": int(np.count_nonzero(nonzero)),
+            "contraction_backend": contraction_backend,
+        }
+    if return_diagnostics:
+        return couplings, diagnostics
+    return couplings
+
+
+def _validate_discarded_couplings_cauchy(
+    coupling,
+    discarded,
+    row_norm,
+    partner_norm,
+    *,
+    row_root,
+    column_root,
+    subspace,
+    norm_tol=1.0e-14,
+    atol=1.0e-10,
+    rtol=1.0e-9,
+):
+    """Gate discarded cross terms with their elementwise Cauchy bound.
+
+    For a row-owned perturber ``T_alpha^I`` this checks
+
+    ``|<I|T^dagger T|J>| <= sqrt(N_alpha(I) N_alpha(J)) + roundoff``,
+
+    where *both* diagonal norms use the row-I operator and orbital basis.
+    """
+
+    coupling = np.asarray(coupling)
+    discarded = np.asarray(discarded, dtype=bool)
+    row_norm = np.asarray(row_norm)
+    partner_norm = np.asarray(partner_norm)
+    if not (
+        coupling.shape
+        == discarded.shape
+        == row_norm.shape
+        == partner_norm.shape
+    ):
+        raise ValueError(
+            f"subspace {subspace}: Cauchy-audit arrays have inconsistent shapes"
+        )
+    norm_tol = _finite_nonnegative(norm_tol, name="norm_tol")
+    atol = _finite_nonnegative(atol, name="zero_norm_atol")
+    rtol = _finite_nonnegative(rtol, name="zero_norm_rtol")
+    flat_indices = np.flatnonzero(discarded)
+    if not flat_indices.size:
+        return {
+            "zero_norm_count": 0,
+            "zero_norm_maximum_absolute_value": 0.0,
+            "zero_norm_maximum_absolute_index": [],
+            "zero_norm_row_norm_at_maximum": 0.0,
+            "zero_norm_partner_norm_at_maximum": 0.0,
+            "zero_norm_cauchy_bound_at_maximum": 0.0,
+            "zero_norm_numerical_allowance_at_maximum": 0.0,
+            "zero_norm_acceptance_limit_at_maximum": 0.0,
+            "zero_norm_physical_excess_at_maximum": 0.0,
+            "zero_norm_maximum_acceptance_excess": 0.0,
+            "zero_norm_maximum_acceptance_excess_index": [],
+            "zero_norm_maximum_cauchy_ratio": 0.0,
+            "zero_norm_maximum_finite_cauchy_ratio": 0.0,
+            "zero_norm_cauchy_ratio_unbounded_count": 0,
+            "zero_norm_cauchy_gate_passed": True,
+        }
+
+    selected_coupling = coupling[discarded]
+    selected_row_norm = row_norm[discarded]
+    selected_partner_norm = partner_norm[discarded]
+    if (
+        not np.all(np.isfinite(selected_coupling))
+        or not np.all(np.isfinite(selected_row_norm))
+        or not np.all(np.isfinite(selected_partner_norm))
+    ):
+        raise FloatingPointError(
+            f"row root {row_root}, column root {column_root}, subspace "
+            f"{subspace}: Cauchy audit contains non-finite values"
+        )
+    if np.iscomplexobj(selected_row_norm):
+        selected_row_norm = _ss._require_real(
+            selected_row_norm,
+            root=row_root,
+            subspace=subspace,
+            quantity="discarded row perturber norm",
+            atol=atol,
+            rtol=rtol,
+        )
+    if np.iscomplexobj(selected_partner_norm):
+        selected_partner_norm = _ss._require_real(
+            selected_partner_norm,
+            root=column_root,
+            subspace=subspace,
+            quantity="row-basis partner perturber norm",
+            atol=atol,
+            rtol=rtol,
+        )
+    selected_row_norm = np.asarray(selected_row_norm, dtype=float)
+    selected_partner_norm = np.asarray(selected_partner_norm, dtype=float)
+    minimum_row = float(np.min(selected_row_norm))
+    minimum_partner = float(np.min(selected_partner_norm))
+    if minimum_row < -norm_tol or minimum_partner < -norm_tol:
+        raise FloatingPointError(
+            f"row root {row_root}, column root {column_root}, subspace "
+            f"{subspace}: negative diagonal norm in Cauchy audit "
+            f"(row={minimum_row:.3e}, partner={minimum_partner:.3e})"
+        )
+
+    magnitude = np.abs(selected_coupling)
+    cauchy_bound = np.sqrt(
+        np.maximum(selected_row_norm, 0.0)
+        * np.maximum(selected_partner_norm, 0.0)
+    )
+    numerical_allowance = atol + rtol * np.maximum.reduce(
+        (np.ones_like(magnitude), magnitude, cauchy_bound)
+    )
+    acceptance_limit = cauchy_bound + numerical_allowance
+    acceptance_excess = magnitude - acceptance_limit
+    physical_excess = magnitude - cauchy_bound
+    cauchy_ratio = np.divide(
+        magnitude,
+        cauchy_bound,
+        out=np.zeros_like(magnitude, dtype=float),
+        where=cauchy_bound > 0.0,
+    )
+    ratio_unbounded = (magnitude > 0.0) & (cauchy_bound == 0.0)
+    ratio_unbounded_count = int(np.count_nonzero(ratio_unbounded))
+    maximum_finite_cauchy_ratio = float(
+        np.max(cauchy_ratio, initial=0.0)
+    )
+
+    maximum_local = int(np.argmax(magnitude))
+    excess_local = int(np.argmax(acceptance_excess))
+
+    def full_index(local_index):
+        return [
+            int(index)
+            for index in np.unravel_index(
+                int(flat_indices[int(local_index)]), coupling.shape
+            )
+        ]
+
+    maximum_index = full_index(maximum_local)
+    excess_index = full_index(excess_local)
+    maximum_acceptance_excess = float(acceptance_excess[excess_local])
+    if maximum_acceptance_excess > 0.0:
+        raise FloatingPointError(
+            f"row root {row_root}, column root {column_root}, subspace "
+            f"{subspace}: discarded near-null perturber violates its Cauchy "
+            f"bound at {tuple(excess_index)}: |B|={magnitude[excess_local]:.3e}, "
+            f"N_row={selected_row_norm[excess_local]:.3e}, "
+            f"N_partner={selected_partner_norm[excess_local]:.3e}, "
+            f"sqrt(N_row*N_partner)={cauchy_bound[excess_local]:.3e}, "
+            f"roundoff={numerical_allowance[excess_local]:.3e}, "
+            f"excess={maximum_acceptance_excess:.3e}"
+        )
+
+    return {
+        "zero_norm_count": int(flat_indices.size),
+        "zero_norm_maximum_absolute_value": float(magnitude[maximum_local]),
+        "zero_norm_maximum_absolute_index": maximum_index,
+        "zero_norm_row_norm_at_maximum": float(
+            selected_row_norm[maximum_local]
+        ),
+        "zero_norm_partner_norm_at_maximum": float(
+            selected_partner_norm[maximum_local]
+        ),
+        "zero_norm_cauchy_bound_at_maximum": float(
+            cauchy_bound[maximum_local]
+        ),
+        "zero_norm_numerical_allowance_at_maximum": float(
+            numerical_allowance[maximum_local]
+        ),
+        "zero_norm_acceptance_limit_at_maximum": float(
+            acceptance_limit[maximum_local]
+        ),
+        "zero_norm_physical_excess_at_maximum": float(
+            physical_excess[maximum_local]
+        ),
+        "zero_norm_maximum_acceptance_excess": maximum_acceptance_excess,
+        "zero_norm_maximum_acceptance_excess_index": excess_index,
+        "zero_norm_maximum_cauchy_ratio": (
+            None
+            if ratio_unbounded_count
+            else maximum_finite_cauchy_ratio
+        ),
+        "zero_norm_maximum_finite_cauchy_ratio": (
+            maximum_finite_cauchy_ratio
+        ),
+        "zero_norm_cauchy_ratio_unbounded_count": ratio_unbounded_count,
+        "zero_norm_cauchy_gate_passed": True,
+    }
+
+
+def _evaluate_row_basis_partner_norms(
+    eris_row,
+    partner_pdms123,
+    *,
+    row_root,
+    partner_root,
+    scalar_atol=1.0e-10,
+    scalar_rtol=1.0e-9,
+    norm_tol=1.0e-14,
+    contraction_backend=_ss._DEFAULT_CONTRACTION_BACKEND,
+    return_diagnostics=False,
+):
+    """Evaluate ``<J|T_I^dagger T_I|J>`` in the row-I orbital basis."""
+
+    raw_norms, contraction_diagnostics = (
+        _evaluate_transition_perturber_couplings(
+            eris_row,
+            partner_pdms123,
+            1.0,
+            row_root=row_root,
+            column_root=partner_root,
+            contraction_backend=contraction_backend,
+            return_diagnostics=True,
+        )
+    )
+    norms = {}
+    diagnostics = {}
+    for key in _ss.SUBSPACE_ORDER:
+        raw = raw_norms[key]
+        ordered = _ss._strict_pair_mask(key, raw.shape)
+        selected = _ss._require_real(
+            raw[ordered],
+            root=partner_root,
+            subspace=key,
+            quantity=f"row-{row_root} perturber norm on partner state",
+            atol=scalar_atol,
+            rtol=scalar_rtol,
+        )
+        if np.any(selected < -norm_tol):
+            minimum = float(np.min(selected))
+            raise FloatingPointError(
+                f"row root {row_root}, partner root {partner_root}, subspace "
+                f"{key}: negative row-basis partner norm {minimum:.3e}"
+            )
+        norm = np.zeros(raw.shape, dtype=float)
+        norm[ordered] = selected
+        norms[key] = norm
+        diagnostics[key] = {
+            "minimum_ordered_norm": (
+                float(np.min(selected)) if selected.size else 0.0
+            ),
+            "maximum_ordered_norm": (
+                float(np.max(selected)) if selected.size else 0.0
+            ),
+            "ordered_dimension": int(np.count_nonzero(ordered)),
+            "contraction_backend": contraction_backend,
+            "raw_contraction": contraction_diagnostics[key],
+        }
+    if return_diagnostics:
+        return norms, diagnostics
+    return norms
+
+
+@dataclass(frozen=True)
+class QDBlochSCNEVPT2Result:
+    roots: tuple[int, ...]
+    reference_energies: np.ndarray
+    h2_by_subspace: dict[str, np.ndarray]
+    h2_bloch: np.ndarray
+    h_eff_bloch: np.ndarray
+    eigenvalues: np.ndarray
+    left_eigenvectors: np.ndarray
+    right_eigenvectors: np.ndarray
+    diagnostics: dict[str, Any]
+
+
+_SS_SETTING_NAMES = (
+    "integral_roundoff_factor",
+    "scalar_atol",
+    "scalar_rtol",
+    "rdm_atol",
+    "rdm_rtol",
+    "rdm_work_memory",
+    "norm_tol",
+    "denominator_tol",
+    "si_gap_imag_atol",
+    "si_gap_imag_rtol",
+    "si_numerator_noise_allowance",
+    "si_energy_imag_l1_tol",
+    "si_projection_shift_l1_tol",
+)
+
+
+def _mapping_item(values, key, *, name):
+    if values is None:
+        return None
+    if not isinstance(values, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    try:
+        return values[key]
+    except KeyError as error:
+        raise KeyError(f"{name} has no entry for {key!r}") from error
+
+
+def _transition_mapping_item(values, bra_root, ket_root, *, max_rank=None):
+    if values is None:
+        return None, None
+    if not isinstance(values, Mapping):
+        raise TypeError("transition_pdms must be a mapping")
+    direct_key = (bra_root, ket_root)
+    reverse_key = (ket_root, bra_root)
+    if direct_key in values:
+        densities = values[direct_key]
+        if not isinstance(densities, (tuple, list)):
+            raise TypeError("an injected transition PDM entry must be a sequence")
+        if max_rank is not None:
+            densities = densities[: int(max_rank)]
+        return tuple(densities), "injected_direct"
+    if reverse_key in values:
+        densities = values[reverse_key]
+        if not isinstance(densities, (tuple, list)):
+            raise TypeError("an injected transition PDM entry must be a sequence")
+        if max_rank is not None:
+            densities = densities[: int(max_rank)]
+        return (
+            tuple(adjoint_transition_pdm(dm) for dm in densities),
+            "injected_adjoint",
+        )
+    raise KeyError(
+        "transition_pdms has neither ordered root pair "
+        f"{direct_key!r} nor {reverse_key!r}"
+    )
+
+
+def _injected_model_overlap(model_overlap, roots, *, atol, rtol):
+    """Validate a complete injected overlap before any transition NPDM work."""
+
+    if model_overlap is None:
+        return None
+    nmodel = len(roots)
+    if isinstance(model_overlap, Mapping):
+        matrix = np.eye(nmodel, dtype=complex)
+        for irow, root_i in enumerate(roots):
+            diagonal_key = (root_i, root_i)
+            if diagonal_key in model_overlap:
+                matrix[irow, irow] = _complex_scalar(
+                    model_overlap[diagonal_key],
+                    name="injected model overlap",
+                )
+            for jcol in range(irow + 1, nmodel):
+                root_j = roots[jcol]
+                direct_key = (root_i, root_j)
+                reverse_key = (root_j, root_i)
+                has_direct = direct_key in model_overlap
+                has_reverse = reverse_key in model_overlap
+                if not has_direct and not has_reverse:
+                    raise KeyError(
+                        "model_overlap has neither ordered root pair "
+                        f"{direct_key!r} nor {reverse_key!r}"
+                    )
+                direct = (
+                    _complex_scalar(
+                        model_overlap[direct_key],
+                        name="injected model overlap",
+                    )
+                    if has_direct
+                    else None
+                )
+                reverse = (
+                    _complex_scalar(
+                        model_overlap[reverse_key],
+                        name="injected model overlap",
+                    )
+                    if has_reverse
+                    else None
+                )
+                if direct is not None and reverse is not None:
+                    limit = atol + rtol * max(1.0, abs(direct), abs(reverse))
+                    if abs(direct - reverse.conjugate()) > limit:
+                        raise ValueError(
+                            "injected forward/reverse model overlaps are not "
+                            f"adjoints for roots ({root_i}, {root_j})"
+                        )
+                if direct is None:
+                    direct = reverse.conjugate()
+                if reverse is None:
+                    reverse = direct.conjugate()
+                matrix[irow, jcol] = direct
+                matrix[jcol, irow] = reverse
+    else:
+        matrix = np.asarray(model_overlap, dtype=complex)
+    expected = (nmodel, nmodel)
+    if matrix.shape != expected:
+        raise ValueError(
+            f"model_overlap must have shape {expected}, got {matrix.shape}"
+        )
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("model_overlap contains non-finite values")
+    scale = max(1.0, float(np.max(np.abs(matrix), initial=0.0)))
+    limit = atol + rtol * scale
+    adjoint_error = float(
+        np.max(np.abs(matrix - matrix.conj().T), initial=0.0)
+    )
+    if adjoint_error > limit:
+        raise ValueError(
+            "injected model_overlap is not Hermitian: maximum error="
+            f"{adjoint_error:.3e}"
+        )
+    identity_error = float(
+        np.max(np.abs(matrix - np.eye(nmodel)), initial=0.0)
+    )
+    if identity_error > atol + rtol:
+        raise ValueError(
+            "injected model states are not orthonormal: maximum overlap "
+            f"error={identity_error:.3e}"
+        )
+    return np.array(matrix, dtype=complex, copy=True)
+
+
+def _phase_gauge_eigenvectors(left, right):
+    left = np.array(left, dtype=complex, copy=True)
+    right = np.array(right, dtype=complex, copy=True)
+    for column in range(right.shape[1]):
+        pivot = int(np.argmax(np.abs(right[:, column])))
+        value = right[pivot, column]
+        if abs(value) == 0.0:
+            continue
+        phase = np.exp(-1j * np.angle(value))
+        # SciPy stores left eigenvectors as columns.  Applying the same phase
+        # to both columns preserves L^dagger R and both eigen-equations.
+        right[:, column] *= phase
+        left[:, column] *= phase
+    return left, right
+
+
+def _solve_bloch_eigensystem(matrix):
+    eigenvalues, left, right = eig(matrix, left=True, right=True)
+    order = np.lexsort((eigenvalues.imag, eigenvalues.real))
+    eigenvalues = eigenvalues[order]
+    left = left[:, order]
+    right = right[:, order]
+    left, right = _phase_gauge_eigenvectors(left, right)
+    right_residual = matrix @ right - right * eigenvalues[np.newaxis, :]
+    left_rows = left.conj().T
+    left_residual = left_rows @ matrix - eigenvalues[:, np.newaxis] * left_rows
+    scale = max(1.0, float(np.linalg.norm(matrix)))
+    diagnostics = {
+        "right_residual_norm": float(np.linalg.norm(right_residual)),
+        "left_residual_norm": float(np.linalg.norm(left_residual)),
+        "right_relative_residual_norm": float(
+            np.linalg.norm(right_residual) / scale
+        ),
+        "left_relative_residual_norm": float(
+            np.linalg.norm(left_residual) / scale
+        ),
+        "biorthogonality": left.conj().T @ right,
+        "right_eigenvector_condition_number": float(np.linalg.cond(right)),
+        "maximum_nonhermiticity": float(
+            np.max(np.abs(matrix - matrix.conj().T), initial=0.0)
+        ),
+        "maximum_eigenvalue_imaginary_part": float(
+            np.max(np.abs(eigenvalues.imag), initial=0.0)
+        ),
+    }
+    return eigenvalues, left, right, diagnostics
+
+
+class WickX2CQDBlochSCNEVPT2(lib.StreamObject):
+    """Dense classical multipartitioning QD_Bloch-SC-NEVPT2 driver."""
+
+    def __init__(self, mc, frozen=0):
+        if _ss._has_frozen_orbitals(frozen) or _ss._has_frozen_orbitals(
+            getattr(mc, "frozen", None)
+        ):
+            raise NotImplementedError("nonzero frozen spinors are outside dense v1")
+        self._mc = mc
+        self._scf = mc._scf
+        self.mol = self._scf.mol
+        self.verbose = getattr(mc, "verbose", self.mol.verbose)
+        self.stdout = getattr(mc, "stdout", self.mol.stdout)
+        self.mo_coeff = getattr(mc, "mo_coeff", None)
+        self.mo_energy = None
+        self.canonicalized = False
+        self.denominator_mode = "strict_si"
+        self.contraction_backend = _ss._DEFAULT_CONTRACTION_BACKEND
+        self.integral_roundoff_factor = _ss._DEFAULT_AO2MO_ROUNDOFF_FACTOR
+        self.scalar_atol = 1.0e-10
+        self.scalar_rtol = 1.0e-9
+        self.rdm_atol = 1.0e-9
+        self.rdm_rtol = 1.0e-8
+        self.rdm_work_memory = 512 * 2**20
+        self.norm_tol = 1.0e-14
+        self.denominator_tol = 1.0e-12
+        self.si_gap_imag_atol = 1.0e-10
+        self.si_gap_imag_rtol = 1.0e-9
+        self.si_numerator_noise_allowance = 1.0e-12
+        self.si_energy_imag_l1_tol = 1.0e-10
+        self.si_projection_shift_l1_tol = 1.0e-12
+        self.model_overlap_atol = 1.0e-8
+        self.model_overlap_rtol = 1.0e-8
+        self.zero_norm_coupling_atol = 1.0e-10
+        self.zero_norm_coupling_rtol = 1.0e-9
+        self.eigen_residual_tol = 1.0e-10
+        self.eigenvalue_imag_warn = 1.0e-10
+        self.eigenvalue_imag_error = None
+        self.validate_reverse_transition = False
+        self.frozen = 0
+
+        self.roots = ()
+        self.reference_energies = None
+        self.row_data = {}
+        self.h2_by_subspace = {}
+        self.h2_bloch = None
+        self.h_eff_bloch = None
+        self.e_qd = None
+        self.left_eigenvectors = None
+        self.right_eigenvectors = None
+        self.model_overlap = None
+        self.diagnostics = {}
+        self.result = None
+        self._keys = set(self.__dict__)
+
+    @property
+    def e_tot(self):
+        """Alias for the complete QD eigenvalue array."""
+
+        return self.e_qd
+
+    def _clear_results(self):
+        """Drop a previous calculation before starting a transactional run."""
+
+        self.roots = ()
+        self.reference_energies = None
+        self.row_data = {}
+        self.h2_by_subspace = {}
+        self.h2_bloch = None
+        self.h_eff_bloch = None
+        self.e_qd = None
+        self.left_eigenvectors = None
+        self.right_eigenvectors = None
+        self.model_overlap = None
+        self.diagnostics = {}
+        self.result = None
+
+    def _new_ss_adapter(self, mc, root):
+        adapter = _ss.WickX2CSCNEVPT2(mc)
+        adapter.verbose = self.verbose
+        adapter.stdout = self.stdout
+        adapter.canonicalized = bool(self.canonicalized)
+        if isinstance(self.mo_energy, Mapping):
+            adapter.mo_energy = np.asarray(self.mo_energy[root])
+        else:
+            adapter.mo_energy = self.mo_energy
+        for name in _SS_SETTING_NAMES:
+            setattr(adapter, name, getattr(self, name))
+        adapter.denominator_mode = "strict_si"
+        adapter.contraction_backend = self.contraction_backend
+        return adapter
+
+    def _prepare_row(
+        self,
+        mc,
+        root,
+        *,
+        mo_coeff,
+        pdms,
+        eris,
+        eris_basis,
+    ):
+        adapter = self._new_ss_adapter(mc, root)
+        return adapter._prepare_sc_root(
+            mc,
+            mo_coeff=mo_coeff,
+            pdms=pdms,
+            eris=eris,
+            eris_basis=eris_basis,
+            root=root,
+            denominator_mode="strict_si",
+            contraction_backend=self.contraction_backend,
+            return_arrays=True,
+            compact_eris=True,
+            retain_pdms123=True,
+        )
+
+    def kernel(
+        self,
+        mc=None,
+        roots=None,
+        *,
+        state_pdms=None,
+        transition_pdms=None,
+        model_overlap=None,
+        mo_coeff=None,
+        eris=None,
+        eris_basis="input_mo",
+        denominator_mode=None,
+        contraction_backend=None,
+        validate_reverse_transition=None,
+        eigenvalue_imag_warn=None,
+        eigenvalue_imag_error=None,
+    ):
+        """Build and diagonalize the row-oriented non-Hermitian Bloch matrix."""
+
+        total_start = time.perf_counter()
+        self._clear_results()
+        gc.collect()
+        if mc is None:
+            mc = self._mc
+        if _ss._has_frozen_orbitals(getattr(mc, "frozen", None)):
+            raise NotImplementedError("nonzero frozen spinors are outside dense v1")
+        eris_basis = _ss._normalize_eris_basis(eris_basis)
+        if denominator_mode is None:
+            denominator_mode = self.denominator_mode
+        if denominator_mode != "strict_si":
+            raise ValueError(
+                "QD_Bloch Phase I requires denominator_mode='strict_si'"
+            )
+        self.denominator_mode = "strict_si"
+        if contraction_backend is None:
+            contraction_backend = self.contraction_backend
+        self.contraction_backend = _ss._normalize_contraction_backend(
+            contraction_backend
+        )
+        for name in (
+            "model_overlap_atol",
+            "model_overlap_rtol",
+            "zero_norm_coupling_atol",
+            "zero_norm_coupling_rtol",
+            "eigen_residual_tol",
+        ):
+            setattr(
+                self,
+                name,
+                _finite_nonnegative(getattr(self, name), name=name),
+            )
+        if validate_reverse_transition is None:
+            validate_reverse_transition = self.validate_reverse_transition
+        validate_reverse_transition = bool(validate_reverse_transition)
+        if eigenvalue_imag_warn is None:
+            eigenvalue_imag_warn = self.eigenvalue_imag_warn
+        if eigenvalue_imag_error is None:
+            eigenvalue_imag_error = self.eigenvalue_imag_error
+        if eigenvalue_imag_warn is not None:
+            eigenvalue_imag_warn = _finite_nonnegative(
+                eigenvalue_imag_warn, name="eigenvalue_imag_warn"
+            )
+        if eigenvalue_imag_error is not None:
+            eigenvalue_imag_error = _finite_nonnegative(
+                eigenvalue_imag_error, name="eigenvalue_imag_error"
+            )
+
+        if roots is None:
+            nroots = int(getattr(mc.fcisolver, "nroots", 1))
+            roots = tuple(range(nroots))
+        else:
+            roots = tuple(int(root) for root in roots)
+        if not roots:
+            raise ValueError("roots must contain at least one model state")
+        if len(set(roots)) != len(roots) or min(roots) < 0:
+            raise ValueError("roots must be unique non-negative integers")
+        kets = getattr(mc.fcisolver, "kets", None)
+        if kets is not None and max(roots) >= len(kets):
+            raise IndexError("a requested QD root is unavailable in dmrgci.kets")
+        if mo_coeff is None:
+            mo_coeff = mc.mo_coeff
+        input_mo = np.asarray(mo_coeff)
+        nelec_source = getattr(mc.fcisolver, "nelecas", None)
+        if nelec_source is None:
+            nelec_source = mc.nelecas
+        nelec = _ss._total_nelec(nelec_source)
+
+        nmodel = len(roots)
+        h2_by_subspace = {
+            key: np.zeros((nmodel, nmodel), dtype=complex)
+            for key in _ss.SUBSPACE_ORDER
+        }
+        reference_energies = np.empty(nmodel, dtype=float)
+        row_data = {}
+        row_diagnostics = {}
+        shared_input_eris = eris
+        shared_eris_basis = eris_basis
+        shared_eris_generated = False
+        shared_eris_time = 0.0
+        if eris is None:
+            shared_start = time.perf_counter()
+            shared_input_eris = _ss._dense_eris_from_mc(
+                mc,
+                input_mo,
+                roundoff_factor=self.integral_roundoff_factor,
+            )
+            shared_eris_time = time.perf_counter() - shared_start
+            shared_eris_basis = "input_mo"
+            shared_eris_generated = True
+        shared_eris_bytes = (
+            _dense_eris_nbytes(shared_input_eris)
+            if isinstance(shared_input_eris, _ss.spinor_helper._SpinorERIs)
+            else None
+        )
+        for irow, root in enumerate(roots):
+            pdms_root = _mapping_item(state_pdms, root, name="state_pdms")
+            if isinstance(shared_input_eris, Mapping):
+                eris_root = _mapping_item(
+                    shared_input_eris, root, name="eris"
+                )
+            else:
+                eris_root = shared_input_eris
+            row_start = time.perf_counter()
+            row = self._prepare_row(
+                mc,
+                root,
+                mo_coeff=input_mo,
+                pdms=pdms_root,
+                eris=eris_root,
+                eris_basis=shared_eris_basis,
+            )
+            if row.subspace_arrays is None:
+                raise RuntimeError("QD row preparation omitted subspace arrays")
+            if not row.strict_si_compatible:
+                raise FloatingPointError(
+                    f"root {root} is incompatible with strict-SI denominators"
+                )
+            compact_eris = row.eris
+            if not isinstance(compact_eris, _ss._WickERIBlocks):
+                compact_eris = _ss._compact_wick_eris(compact_eris)
+            retained_arrays = _retain_qd_row_arrays(row.subspace_arrays)
+            row = replace(
+                row,
+                eris=compact_eris,
+                subspace_arrays=retained_arrays,
+            )
+            source_eris_nbytes = (
+                _dense_eris_nbytes(eris_root)
+                if isinstance(eris_root, _ss.spinor_helper._SpinorERIs)
+                else None
+            )
+            row_data[root] = row
+            reference_energies[irow] = row.reference_energy
+            for key in _ss.SUBSPACE_ORDER:
+                h2_by_subspace[key][irow, irow] = row.subspace_energies[key]
+            row_diagnostics[str(root)] = {
+                "preparation_time": time.perf_counter() - row_start,
+                "reference_energy": row.reference_energy,
+                "e_corr_state_specific": row.e_corr,
+                "strict_si_compatible": row.strict_si_compatible,
+                "source_full_eris_bytes": source_eris_nbytes,
+                "retained_wick_eris_bytes": compact_eris.nbytes,
+                "retained_row_array_bytes": _nested_array_nbytes(
+                    retained_arrays
+                ),
+                "temporary_state_pdm123_bytes": int(
+                    sum(np.asarray(dm).nbytes for dm in row.pdms123)
+                ),
+                "subspace_energies": dict(row.subspace_energies),
+                "subspace_gaps": {
+                    key: list(row.subspace_gaps[key])
+                    for key in _ss.SUBSPACE_ORDER
+                },
+            }
+            logger.note(
+                self,
+                "QD_Bloch row root %d: E0=%.16g  E_SS^(2)=%.16g",
+                root,
+                row.reference_energy,
+                row.e_corr,
+            )
+            del pdms_root, eris_root
+            gc.collect()
+
+        if shared_eris_generated:
+            del shared_input_eris
+            gc.collect()
+
+        injected_overlap = _injected_model_overlap(
+            model_overlap,
+            roots,
+            atol=self.model_overlap_atol,
+            rtol=self.model_overlap_rtol,
+        )
+        cached_overlap = None
+        if injected_overlap is None:
+            raw_cached_overlap = getattr(mc.fcisolver, "root_overlap", None)
+            if raw_cached_overlap is not None:
+                raw_cached_overlap = np.asarray(raw_cached_overlap)
+                if (
+                    raw_cached_overlap.ndim != 2
+                    or raw_cached_overlap.shape[0]
+                    != raw_cached_overlap.shape[1]
+                    or max(roots) >= raw_cached_overlap.shape[0]
+                ):
+                    raise ValueError(
+                        "fcisolver.root_overlap does not cover the requested roots"
+                    )
+                cached_overlap = _injected_model_overlap(
+                    raw_cached_overlap[np.ix_(roots, roots)],
+                    roots,
+                    atol=self.model_overlap_atol,
+                    rtol=self.model_overlap_rtol,
+                )
+        available_overlap = (
+            injected_overlap
+            if injected_overlap is not None
+            else cached_overlap
+        )
+        available_overlap_source = (
+            "injected" if injected_overlap is not None else "solver_cached"
+        )
+        overlap_matrix = (
+            np.eye(nmodel, dtype=complex)
+            if available_overlap is None
+            else available_overlap.copy()
+        )
+        overlap_sources = {}
+        has_open_mps = (
+            getattr(mc.fcisolver, "driver", None) is not None
+            and getattr(mc.fcisolver, "kets", None) is not None
+        )
+        for irow, root in enumerate(roots):
+            if available_overlap is not None:
+                overlap_sources[f"{root},{root}"] = available_overlap_source
+            elif has_open_mps:
+                value, source = _make_transition_overlap(
+                    mc.fcisolver, root, root
+                )
+                overlap_matrix[irow, irow] = value
+                overlap_sources[f"{root},{root}"] = source
+
+        pair_diagnostics = {}
+        for irow in range(nmodel):
+            root_i = roots[irow]
+            row_i = row_data[root_i]
+            if row_i.pdms123 is None:
+                raise RuntimeError(
+                    f"QD row root {root_i} omitted ordinary PDM ranks 1--3"
+                )
+            masks_i = {
+                key: row_i.subspace_arrays[key]["nonzero"]
+                for key in _ss.SUBSPACE_ORDER
+            }
+            norms_i = {
+                key: row_i.subspace_arrays[key]["norm"]
+                for key in _ss.SUBSPACE_ORDER
+            }
+            for jcol in range(irow + 1, nmodel):
+                root_j = roots[jcol]
+                row_j = row_data[root_j]
+                if row_j.pdms123 is None:
+                    raise RuntimeError(
+                        f"QD row root {root_j} omitted ordinary PDM ranks 1--3"
+                    )
+                pair_start = time.perf_counter()
+                if available_overlap is not None:
+                    overlap_ij = available_overlap[irow, jcol]
+                    overlap_source = available_overlap_source
+                elif has_open_mps:
+                    overlap_ij, overlap_source = _make_transition_overlap(
+                        mc.fcisolver, root_i, root_j
+                    )
+                else:
+                    overlap_ij = None
+                    overlap_source = "dm1_trace_fallback"
+
+                if overlap_ij is not None:
+                    overlap_limit = self.model_overlap_atol + self.model_overlap_rtol
+                    if abs(overlap_ij) > overlap_limit:
+                        raise ValueError(
+                            f"model roots {root_i} and {root_j} are not "
+                            f"orthogonal: |overlap|={abs(overlap_ij):.3e}"
+                        )
+
+                pdms_ij, transition_source = _transition_mapping_item(
+                    transition_pdms, root_i, root_j, max_rank=3
+                )
+                if pdms_ij is None:
+                    pdms_ij = _make_transition_dm123(
+                        mc.fcisolver, root_i, root_j
+                    )
+                    transition_source = "block2"
+                if overlap_ij is None:
+                    if nelec == 0:
+                        raise RuntimeError(
+                            "zero-electron injected transitions require model_overlap"
+                        )
+                    overlap_ij = _complex_scalar(
+                        np.trace(np.asarray(pdms_ij[0])) / nelec,
+                        name="dm1-derived overlap",
+                    )
+                    overlap_limit = self.model_overlap_atol + self.model_overlap_rtol
+                    if abs(overlap_ij) > overlap_limit:
+                        raise ValueError(
+                            f"model roots {root_i} and {root_j} are not "
+                            f"orthogonal: |overlap|={abs(overlap_ij):.3e}"
+                        )
+
+                reverse_debug = None
+                has_injected_forward_and_reverse = bool(
+                    isinstance(transition_pdms, Mapping)
+                    and (root_i, root_j) in transition_pdms
+                    and (root_j, root_i) in transition_pdms
+                )
+                if has_injected_forward_and_reverse:
+                    reverse_debug = transition_pdms[(root_j, root_i)]
+                elif validate_reverse_transition:
+                    has_injected_reverse = bool(
+                        isinstance(transition_pdms, Mapping)
+                        and (root_j, root_i) in transition_pdms
+                    )
+                    if has_injected_reverse:
+                        reverse_debug = transition_pdms[(root_j, root_i)]
+                    elif has_open_mps:
+                        reverse_debug = _make_transition_dm123(
+                            mc.fcisolver, root_j, root_i
+                        )
+                    else:
+                        raise RuntimeError(
+                            "reverse transition validation needs reverse injected "
+                            "PDMs or an open Block2 driver"
+                        )
+                if reverse_debug is not None and len(reverse_debug) == 4:
+                    reverse_debug = tuple(reverse_debug[:3])
+                pdms_ij, transition_validation = validate_transition_pdms(
+                    pdms_ij,
+                    int(mc.ncas),
+                    nelec,
+                    overlap_ij=overlap_ij,
+                    pdms_ji=reverse_debug,
+                    atol=self.rdm_atol,
+                    rtol=self.rdm_rtol,
+                    work_memory=self.rdm_work_memory,
+                )
+                pdms_ij = _transition_contraction_pdms(pdms_ij)
+                pdms_ji = tuple(
+                    adjoint_transition_pdm(density) for density in pdms_ij
+                )
+                overlap_ji = overlap_ij.conjugate()
+                overlap_matrix[irow, jcol] = overlap_ij
+                overlap_matrix[jcol, irow] = overlap_ji
+                overlap_sources[f"{root_i},{root_j}"] = overlap_source
+                overlap_sources[f"{root_j},{root_i}"] = "adjoint"
+
+                partner_norms_ij, partner_norm_diagnostics_ij = (
+                    _evaluate_row_basis_partner_norms(
+                        row_i.eris,
+                        row_j.pdms123,
+                        row_root=root_i,
+                        partner_root=root_j,
+                        scalar_atol=self.scalar_atol,
+                        scalar_rtol=self.scalar_rtol,
+                        norm_tol=self.norm_tol,
+                        contraction_backend=self.contraction_backend,
+                        return_diagnostics=True,
+                    )
+                )
+                couplings_ij, coupling_diagnostics_ij = (
+                    _evaluate_transition_perturber_couplings(
+                        row_i.eris,
+                        pdms_ij,
+                        overlap_ij,
+                        row_root=root_i,
+                        column_root=root_j,
+                        row_nonzero=masks_i,
+                        row_norm=norms_i,
+                        partner_norm=partner_norms_ij,
+                        norm_tol=self.norm_tol,
+                        zero_norm_atol=self.zero_norm_coupling_atol,
+                        zero_norm_rtol=self.zero_norm_coupling_rtol,
+                        contraction_backend=self.contraction_backend,
+                        return_diagnostics=True,
+                    )
+                )
+                masks_j = {
+                    key: row_j.subspace_arrays[key]["nonzero"]
+                    for key in _ss.SUBSPACE_ORDER
+                }
+                norms_j = {
+                    key: row_j.subspace_arrays[key]["norm"]
+                    for key in _ss.SUBSPACE_ORDER
+                }
+                partner_norms_ji, partner_norm_diagnostics_ji = (
+                    _evaluate_row_basis_partner_norms(
+                        row_j.eris,
+                        row_i.pdms123,
+                        row_root=root_j,
+                        partner_root=root_i,
+                        scalar_atol=self.scalar_atol,
+                        scalar_rtol=self.scalar_rtol,
+                        norm_tol=self.norm_tol,
+                        contraction_backend=self.contraction_backend,
+                        return_diagnostics=True,
+                    )
+                )
+                couplings_ji, coupling_diagnostics_ji = (
+                    _evaluate_transition_perturber_couplings(
+                        row_j.eris,
+                        pdms_ji,
+                        overlap_ji,
+                        row_root=root_j,
+                        column_root=root_i,
+                        row_nonzero=masks_j,
+                        row_norm=norms_j,
+                        partner_norm=partner_norms_ji,
+                        norm_tol=self.norm_tol,
+                        zero_norm_atol=self.zero_norm_coupling_atol,
+                        zero_norm_rtol=self.zero_norm_coupling_rtol,
+                        contraction_backend=self.contraction_backend,
+                        return_diagnostics=True,
+                    )
+                )
+                class_corrections_ij = {}
+                class_corrections_ji = {}
+                for key in _ss.SUBSPACE_ORDER:
+                    denominator_i = row_i.subspace_arrays[key]["denominator"]
+                    denominator_j = row_j.subspace_arrays[key]["denominator"]
+                    value_ij = -np.sum(
+                        couplings_ij[key][masks_i[key]]
+                        / denominator_i[masks_i[key]]
+                    )
+                    value_ji = -np.sum(
+                        couplings_ji[key][masks_j[key]]
+                        / denominator_j[masks_j[key]]
+                    )
+                    h2_by_subspace[key][irow, jcol] = value_ij
+                    h2_by_subspace[key][jcol, irow] = value_ji
+                    class_corrections_ij[key] = _complex_pair(value_ij)
+                    class_corrections_ji[key] = _complex_pair(value_ji)
+                pair_diagnostics[f"{root_i},{root_j}"] = {
+                    "overlap": _complex_pair(overlap_ij),
+                    "overlap_source": overlap_source,
+                    "transition_source": transition_source,
+                    "transition_validation": transition_validation,
+                    "row_i_partner_norms": partner_norm_diagnostics_ij,
+                    "row_j_partner_norms": partner_norm_diagnostics_ji,
+                    "row_i_couplings": coupling_diagnostics_ij,
+                    "row_j_couplings": coupling_diagnostics_ji,
+                    "class_corrections_ij": class_corrections_ij,
+                    "class_corrections_ji": class_corrections_ji,
+                    "elapsed_time": time.perf_counter() - pair_start,
+                }
+                del reverse_debug
+                del pdms_ij, pdms_ji
+                del partner_norms_ij, partner_norms_ji
+                del couplings_ij, couplings_ji
+                gc.collect()
+
+        # Ordinary state PDMs are required only for the pairwise Cauchy audit.
+        # Do not retain them in the public result or duplicate their lifetime
+        # with a subsequent calculation.
+        for root in roots:
+            row_data[root] = replace(row_data[root], pdms123=None)
+        row = None
+        row_i = None
+        row_j = None
+        gc.collect()
+
+        identity = np.eye(nmodel, dtype=complex)
+        overlap_error = float(
+            np.max(np.abs(overlap_matrix - identity), initial=0.0)
+        )
+        overlap_limit = self.model_overlap_atol + self.model_overlap_rtol
+        if overlap_error > overlap_limit:
+            raise ValueError(
+                "model-state overlap is not the identity within tolerance: "
+                f"maximum error={overlap_error:.3e}"
+            )
+        overlap_adjoint_error = float(
+            np.max(
+                np.abs(overlap_matrix - overlap_matrix.conj().T), initial=0.0
+            )
+        )
+        if overlap_adjoint_error > overlap_limit:
+            raise ValueError(
+                "model-state overlap is not Hermitian: maximum error="
+                f"{overlap_adjoint_error:.3e}"
+            )
+
+        h2_bloch = np.zeros((nmodel, nmodel), dtype=complex)
+        for key in _ss.SUBSPACE_ORDER:
+            h2_bloch += h2_by_subspace[key]
+        h_eff_bloch = np.diag(reference_energies.astype(complex)) + h2_bloch
+        diagonal_reduction_error = 0.0
+        for irow, root in enumerate(roots):
+            row = row_data[root]
+            for key in _ss.SUBSPACE_ORDER:
+                diagonal_reduction_error = max(
+                    diagonal_reduction_error,
+                    abs(
+                        h2_by_subspace[key][irow, irow]
+                        - row.subspace_energies[key]
+                    ),
+                )
+            diagonal_reduction_error = max(
+                diagonal_reduction_error,
+                abs(
+                    h_eff_bloch[irow, irow]
+                    - (row.reference_energy + row.e_corr)
+                ),
+            )
+
+        eigenvalues, left, right, eig_diagnostics = _solve_bloch_eigensystem(
+            h_eff_bloch
+        )
+        if max(
+            eig_diagnostics["right_relative_residual_norm"],
+            eig_diagnostics["left_relative_residual_norm"],
+        ) > self.eigen_residual_tol:
+            raise FloatingPointError(
+                "general Bloch eigensolver residual exceeds tolerance"
+            )
+        maximum_eigen_imag = eig_diagnostics[
+            "maximum_eigenvalue_imaginary_part"
+        ]
+        if (
+            eigenvalue_imag_warn is not None
+            and maximum_eigen_imag > eigenvalue_imag_warn
+        ):
+            logger.warn(
+                self,
+                "QD_Bloch eigenvalues have imaginary components up to %.3e",
+                maximum_eigen_imag,
+            )
+        if (
+            eigenvalue_imag_error is not None
+            and maximum_eigen_imag > eigenvalue_imag_error
+        ):
+            raise FloatingPointError(
+                "QD_Bloch eigenvalue imaginary component exceeds configured "
+                f"error threshold: {maximum_eigen_imag:.3e}"
+            )
+
+        diagnostics = {
+            "method": "classical_2004_multipartitioning_QD_Bloch_SC_NEVPT2",
+            "matrix_convention": (
+                "H[I,J] uses bra I, ket J, row-I ERIs/perturbers/strict-SI gaps"
+            ),
+            "denominator_mode": "strict_si",
+            "contraction_backend": self.contraction_backend,
+            "shared_input_eris_generated": shared_eris_generated,
+            "shared_input_eris_generation_time": shared_eris_time,
+            "shared_input_eris_bytes": shared_eris_bytes,
+            "row_diagnostics": row_diagnostics,
+            "pair_diagnostics": pair_diagnostics,
+            "model_overlap_sources": overlap_sources,
+            "model_overlap_maximum_identity_error": overlap_error,
+            "model_overlap_maximum_adjoint_error": overlap_adjoint_error,
+            "diagonal_reduction_maximum_error": float(
+                diagonal_reduction_error
+            ),
+            "eigensystem": eig_diagnostics,
+            "total_time": time.perf_counter() - total_start,
+        }
+
+        self.roots = roots
+        self.reference_energies = reference_energies
+        self.row_data = row_data
+        self.h2_by_subspace = h2_by_subspace
+        self.h2_bloch = h2_bloch
+        self.h_eff_bloch = h_eff_bloch
+        self.e_qd = eigenvalues
+        self.left_eigenvectors = left
+        self.right_eigenvectors = right
+        self.model_overlap = overlap_matrix
+        self.diagnostics = diagnostics
+        self.result = QDBlochSCNEVPT2Result(
+            roots=roots,
+            reference_energies=reference_energies,
+            h2_by_subspace=h2_by_subspace,
+            h2_bloch=h2_bloch,
+            h_eff_bloch=h_eff_bloch,
+            eigenvalues=eigenvalues,
+            left_eigenvectors=left,
+            right_eigenvectors=right,
+            diagnostics=diagnostics,
+        )
+        logger.note(self, "QD_Bloch effective Hamiltonian:\n%s", h_eff_bloch)
+        logger.note(self, "QD_Bloch eigenvalues: %s", eigenvalues)
+        logger.info(
+            self,
+            "QD_Bloch non-Hermiticity=%.3e  right residual=%.3e  "
+            "left residual=%.3e  cond(R)=%.3e",
+            eig_diagnostics["maximum_nonhermiticity"],
+            eig_diagnostics["right_residual_norm"],
+            eig_diagnostics["left_residual_norm"],
+            eig_diagnostics["right_eigenvector_condition_number"],
+        )
+        return self.e_qd
+
+
+X2CQDBlochSCNEVPT2 = WickX2CQDBlochSCNEVPT2
