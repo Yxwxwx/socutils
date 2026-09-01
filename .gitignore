@@ -108,5 +108,8 @@ dmrg_checkpoint/
 # Shelved MRPT prototype and its validation artifacts
 /mrpt/temp/
 
-tests/
+# Keep newly generated test artifacts ignored while retaining the focused
+# dense spinor SC-NEVPT2 regression and Slurm acceptance sources.
+/tests/*
+
 .pytest_cache/

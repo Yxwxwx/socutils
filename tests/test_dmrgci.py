@@ -463,6 +463,196 @@ def test_multiroot_checkpoint_resume_and_fingerprint_gate(tmp_path):
     mismatched.close()
 
 
+def test_multiroot_checkpoint_only_restore_runs_no_sweeps_and_preserves_state(
+    tmp_path,
+    monkeypatch,
+):
+    """A completed MultiMPS can be reopened for NPDMs without optimization."""
+    from pyblock2.driver.core import DMRGDriver
+
+    h1 = np.array(
+        [
+            [-1.30, 0.08 + 0.03j, -0.02j],
+            [0.08 - 0.03j, -0.40, 0.05 + 0.01j],
+            [0.02j, 0.05 - 0.01j, 0.80],
+        ],
+        dtype=complex,
+    )
+    eri = np.zeros((3,) * 4, dtype=complex)
+    ecore = -4.25
+    reorder_idx = np.array([2, 0, 1])
+    checkpoint = tmp_path / "checkpoint"
+
+    def fixed_reordering(driver, h1e, g2e, method="fiedler", **kwargs):
+        assert method == "fiedler"
+        return reorder_idx.copy()
+
+    monkeypatch.setattr(
+        DMRGDriver,
+        "orbital_reordering",
+        fixed_reordering,
+    )
+    first = DMRGCI().init(
+        ncas=3,
+        nelecas=1,
+        nroots=2,
+        bond_dims=[8] * 8,
+        noises=[0.0] * 8,
+        thrds=[1e-14] * 8,
+        n_sweeps=8,
+        tol=1e-12,
+        scratch=tmp_path / "scratch-first",
+        checkpoint_dir=checkpoint,
+        n_threads=1,
+        stack_memory=256,
+        random_seed=2468,
+        npdm_site_type=2,
+    )
+    energy0, _ = first.kernel(h1, eri, 3, 1, ecore=ecore, verbose=0)
+    dm1_reference = [first.make_rdm1(root, 3, 1) for root in range(2)]
+    hamiltonian = first.checkpoint_hamiltonian
+    assert hamiltonian is not None
+    assert hamiltonian["format"] == "socutils.dmrgci.hamiltonian-snapshot"
+    assert hamiltonian["version"] == 1
+    assert hamiltonian["norb"] == 3
+    assert hamiltonian["nelec"] == 1
+    assert hamiltonian["nroots"] == 2
+    assert hamiltonian["ecore"] == ecore
+    assert hamiltonian["h1e"].flags.c_contiguous
+    assert hamiltonian["eri"].flags.c_contiguous
+    assert hamiltonian["hamiltonian_sha256"] == first.convergence_info[
+        "checkpoint_fingerprint"
+    ]
+
+    # The public snapshot must not expose the solver's retained arrays.
+    modified_snapshot = first.checkpoint_hamiltonian
+    modified_snapshot["h1e"][0, 0] += 1.0
+    assert first.checkpoint_hamiltonian["h1e"][0, 0] == hamiltonian["h1e"][0, 0]
+    first.close()
+
+    def checkpoint_tree():
+        return {
+            str(path.relative_to(checkpoint)): path.read_bytes()
+            for path in sorted(checkpoint.rglob("*"))
+            if path.is_file()
+        }
+
+    checkpoint_before = checkpoint_tree()
+    assert checkpoint_before
+
+    def forbidden_dmrg(*args, **kwargs):
+        raise AssertionError("checkpoint-only restore must not run DMRG sweeps")
+
+    monkeypatch.setattr(DMRGDriver, "dmrg", forbidden_dmrg)
+    restored = DMRGCI().init(
+        ncas=3,
+        nelecas=1,
+        nroots=2,
+        bond_dims=[8] * 8,
+        noises=[0.0] * 8,
+        thrds=[1e-14] * 8,
+        n_sweeps=8,
+        tol=1e-12,
+        scratch=tmp_path / "scratch-restored",
+        checkpoint_dir=checkpoint,
+        n_threads=1,
+        stack_memory=256,
+        random_seed=999,
+        npdm_site_type=2,
+    )
+    energy1, states = restored.restore_checkpoint(
+        hamiltonian["h1e"],
+        hamiltonian["eri"],
+        hamiltonian["norb"],
+        hamiltonian["nelec"],
+        ecore=hamiltonian["ecore"],
+        nroots=hamiltonian["nroots"],
+        verbose=0,
+    )
+    restore_scratch = Path(restored._scratch)
+
+    assert np.max(abs(np.asarray(energy1) - np.asarray(energy0))) <= ENERGY_TOL
+    assert restored.converged
+    assert restored.convergence_info["run_mode"] == "checkpoint-only-restore"
+    assert restored.convergence_info["sweeps"] == 0
+    assert restored.convergence_info["restart_transport"] == (
+        "fresh-driver-mps-reload-no-sweeps"
+    )
+    assert np.array_equal(restored.driver.reorder_idx, reorder_idx)
+    assert restored.convergence_info["orbital_reordering"] == reorder_idx.tolist()
+    assert len(states) == 2
+    assert restore_scratch.is_dir()
+    assert checkpoint not in restore_scratch.parents
+    for root in range(2):
+        dm1 = restored.make_rdm1(root, 3, 1)
+        assert np.max(abs(dm1 - dm1_reference[root])) <= RDM_TOL
+    assert checkpoint_tree() == checkpoint_before
+
+    restored.close()
+    assert not restore_scratch.exists()
+    assert checkpoint_tree() == checkpoint_before
+
+
+def test_checkpoint_only_restore_rejects_a_corrupt_manifest_before_scratch(
+    tmp_path,
+):
+    h1 = np.diag([-1.3, -0.4, 0.8]).astype(complex)
+    eri = np.zeros((3,) * 4, dtype=complex)
+    checkpoint = tmp_path / "checkpoint"
+    first = DMRGCI().init(
+        ncas=3,
+        nelecas=1,
+        nroots=2,
+        bond_dims=[8] * 8,
+        noises=[0.0] * 8,
+        thrds=[1e-14] * 8,
+        n_sweeps=8,
+        tol=1e-12,
+        scratch=tmp_path / "scratch-first",
+        checkpoint_dir=checkpoint,
+        n_threads=1,
+        stack_memory=256,
+        random_seed=2468,
+    )
+    first.kernel(h1, eri, 3, 1, verbose=0)
+    hamiltonian = first.checkpoint_hamiltonian
+    first.close()
+
+    manifest_path = checkpoint / "dmrgci-checkpoint.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["problem"]["hamiltonian_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest))
+    restore_parent = tmp_path / "scratch-restored"
+    restored = DMRGCI().init(
+        ncas=3,
+        nelecas=1,
+        nroots=2,
+        bond_dims=[8] * 8,
+        noises=[0.0] * 8,
+        thrds=[1e-14] * 8,
+        n_sweeps=8,
+        tol=1e-12,
+        scratch=restore_parent,
+        checkpoint_dir=checkpoint,
+        n_threads=1,
+        stack_memory=256,
+    )
+    with np.testing.assert_raises_regex(ValueError, "fingerprint"):
+        restored.restore_checkpoint(
+            hamiltonian["h1e"],
+            hamiltonian["eri"],
+            hamiltonian["norb"],
+            hamiltonian["nelec"],
+            ecore=hamiltonian["ecore"],
+            nroots=hamiltonian["nroots"],
+            verbose=0,
+        )
+    assert restored.driver is None
+    assert restored._scratch is None
+    assert not restore_parent.exists()
+    restored.close()
+
+
 def test_legacy_twosite_checkpoint_is_converted_before_restart(
     tmp_path,
     monkeypatch,

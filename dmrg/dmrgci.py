@@ -429,6 +429,7 @@ class DMRGCI(StreamObject):
         self.kets = None
         self._multi_mps = None
         self._scratch = None
+        self._checkpoint_hamiltonian = None
         self._rdm1_cache = {}
         self._rdm_cache = {}
         self._mps_signature = None
@@ -809,21 +810,34 @@ class DMRGCI(StreamObject):
         self._active_mpo = None
         self._multi_mps = None
         self._mps_signature = None
+        self._checkpoint_hamiltonian = None
         gc.collect()
 
     def _release_run(self, remove_scratch=True):
         run_scratch = self._scratch
+        driver = self.driver
         self._clear_results()
-        self.driver = None
-        self._scratch = None
-        gc.collect()
-        if (
-            remove_scratch
-            and not self.keep_scratch
-            and run_scratch is not None
-            and os.path.isdir(run_scratch)
-        ):
-            shutil.rmtree(run_scratch)
+        try:
+            # Block2's frame is process-global and DMRGDriver has no __del__.
+            # Finalize only when this driver still owns the active frame, so a
+            # delayed/idempotent close can never tear down a newer driver.
+            if (
+                driver is not None
+                and getattr(driver, "frame", None) is driver.bw.b.Global.frame
+            ):
+                driver.finalize()
+        finally:
+            self.driver = None
+            self._scratch = None
+            driver = None
+            gc.collect()
+            if (
+                remove_scratch
+                and not self.keep_scratch
+                and run_scratch is not None
+                and os.path.isdir(run_scratch)
+            ):
+                shutil.rmtree(run_scratch)
 
     def cleanup(self):
         """Release the current MPS/driver and remove owned scratch data."""
@@ -831,6 +845,33 @@ class DMRGCI(StreamObject):
         return self
 
     close = cleanup
+
+    @property
+    def checkpoint_hamiltonian(self):
+        """Return a copy of the Hamiltonian bound to the current checkpoint.
+
+        Re-transforming a saved MO basis in a later process is not guaranteed
+        to reproduce the active integrals or core energy byte for byte.  This
+        snapshot contains the exact, unreordered arrays used to construct the
+        successful kernel's checkpoint fingerprint, so a workflow can persist
+        them atomically with its optimized MOs and pass them back to
+        :meth:`restore_checkpoint`.
+        """
+        snapshot = self._checkpoint_hamiltonian
+        if snapshot is None:
+            return None
+        return {
+            "format": snapshot["format"],
+            "version": snapshot["version"],
+            "h1e": numpy.array(snapshot["h1e"], order="C", copy=True),
+            "eri": numpy.array(snapshot["eri"], order="C", copy=True),
+            "ecore": float(snapshot["ecore"]),
+            "weights": numpy.array(snapshot["weights"], dtype=float, copy=True),
+            "norb": int(snapshot["norb"]),
+            "nelec": int(snapshot["nelec"]),
+            "nroots": int(snapshot["nroots"]),
+            "hamiltonian_sha256": snapshot["hamiltonian_sha256"],
+        }
 
     def __del__(self):
         try:
@@ -1178,6 +1219,12 @@ class DMRGCI(StreamObject):
             weights,
             ecore_value,
         )
+        # Keep references to the exact unreordered arrays used above.  The
+        # working variables are replaced by reordered copies before MPO
+        # construction, and a defensive public snapshot is installed only
+        # after this kernel and its checkpoint complete successfully.
+        checkpoint_h1e = h1_block2
+        checkpoint_eri = eri_block2
 
         resume_checkpoint = bool(self.resume)
         resume_manifest = None
@@ -1542,12 +1589,366 @@ class DMRGCI(StreamObject):
                     root_eigen_equation_error
                 )
             self._complete_checkpoint(schedule, run_mode)
+            self._checkpoint_hamiltonian = {
+                "format": "socutils.dmrgci.hamiltonian-snapshot",
+                "version": 1,
+                "h1e": numpy.array(checkpoint_h1e, order="C", copy=True),
+                "eri": numpy.array(checkpoint_eri, order="C", copy=True),
+                "ecore": ecore_value,
+                "weights": weights.copy(),
+                "norb": int(norb),
+                "nelec": nelec,
+                "nroots": nroots,
+                "hamiltonian_sha256": checkpoint_problem[
+                    "hamiltonian_sha256"
+                ],
+            }
             if self.restart:
                 self.restart = False
             if self.resume:
                 self.resume = False
             return self.e_tot, self.ci
         except Exception:
+            self._release_run(remove_scratch=True)
+            raise
+
+    def restore_checkpoint(
+        self,
+        h1e,
+        eri,
+        norb,
+        nelec,
+        verbose=None,
+        max_memory=None,
+        ecore=0.0,
+        nroots=None,
+    ):
+        """Restore a completed checkpoint without running any DMRG sweeps.
+
+        This is deliberately separate from ``resume=True`` in :meth:`kernel`.
+        The latter resumes optimization with the configured restart schedule;
+        this method only reconstructs the Block2 driver, MPO, state-averaged
+        ``MultiMPS``, and root-resolved MPS objects needed for NPDMs and
+        post-CASSCF methods.
+
+        ``h1e``, ``eri``, and ``ecore`` must be the exact active-space
+        Hamiltonian used to write the checkpoint.  The bytewise Hamiltonian
+        fingerprint is checked before any persistent MPS data are copied.
+        Completed checkpoint data are never used as Block2 scratch directly:
+        the MPS image is copied into a fresh solver-owned scratch directory so
+        root splitting and NPDM generation cannot modify the persistent copy.
+        """
+        from pyblock2.driver.core import DMRGDriver, SymmetryTypes
+
+        if nroots is None:
+            nroots = self.nroots
+        nroots = int(nroots)
+        nelec = self._validate_problem(norb, nelec, nroots)
+        weights = self._state_average_weights(nroots)
+        wavefunction_problem = self._wavefunction_problem(
+            norb, nelec, nroots, weights
+        )
+        h1_block2, eri_block2 = block2_integrals(h1e, eri, norb)
+        ecore_value = _real_energy(ecore)
+        if numpy.asarray(ecore_value).ndim != 0:
+            raise ValueError("ecore must be a scalar")
+        ecore_value = float(ecore_value)
+        checkpoint_problem = self._checkpoint_problem(
+            h1_block2,
+            eri_block2,
+            norb,
+            nelec,
+            nroots,
+            weights,
+            ecore_value,
+        )
+        manifest = self._load_checkpoint(checkpoint_problem, required=True)
+
+        if manifest.get("status") != "complete":
+            raise ValueError("checkpoint-only restore requires status=complete")
+        if manifest.get("converged") is not True:
+            raise ValueError("checkpoint-only restore requires a converged checkpoint")
+        mps_tag = manifest.get("mps_tag")
+        if mps_tag != "GS":
+            raise ValueError("checkpoint-only restore requires the GS MPS tag")
+        stored_problem = manifest.get("problem")
+        if not isinstance(stored_problem, dict):
+            raise ValueError("checkpoint manifest has no valid problem record")
+        if stored_problem.get("structural") != checkpoint_problem["structural"]:
+            raise ValueError("checkpoint structural problem does not match")
+        if stored_problem.get("controls") != checkpoint_problem["controls"]:
+            raise ValueError("checkpoint Hamiltonian controls do not match")
+        if (
+            stored_problem.get("hamiltonian_sha256")
+            != checkpoint_problem["hamiltonian_sha256"]
+        ):
+            raise ValueError("checkpoint Hamiltonian fingerprint does not match")
+
+        stored_reordering = manifest.get("orbital_reordering")
+        reordering_array = numpy.asarray(stored_reordering)
+        expected_indices = numpy.arange(int(norb))
+        if (
+            reordering_array.shape != (int(norb),)
+            or reordering_array.dtype.kind not in "iu"
+        ):
+            raise ValueError("checkpoint orbital reordering is not an integer vector")
+        reorder_idx = numpy.asarray(reordering_array, dtype=int)
+        if not numpy.array_equal(numpy.sort(reorder_idx), expected_indices):
+            raise ValueError("checkpoint orbital reordering is not a permutation")
+
+        stored_energies = _real_energy(manifest.get("energies"))
+        energy_array = numpy.asarray(stored_energies, dtype=float)
+        if nroots == 1 and energy_array.ndim == 0:
+            energy_array = energy_array.reshape(1)
+        if energy_array.shape != (nroots,) or not numpy.all(
+            numpy.isfinite(energy_array)
+        ):
+            raise ValueError("checkpoint has the wrong number of finite root energies")
+
+        stored_schedule = manifest.get("schedule")
+        if not isinstance(stored_schedule, dict):
+            raise ValueError("completed checkpoint has no sweep schedule")
+        try:
+            stored_thresholds = numpy.asarray(stored_schedule["thrds"], dtype=float)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("checkpoint sweep thresholds are invalid") from error
+        if (
+            stored_thresholds.ndim != 1
+            or stored_thresholds.size == 0
+            or not numpy.all(numpy.isfinite(stored_thresholds))
+            or numpy.any(stored_thresholds <= 0.0)
+        ):
+            raise ValueError("checkpoint sweep thresholds are invalid")
+
+        # Never let Block2 write root-splitting or NPDM intermediates into the
+        # persistent checkpoint.  Release a prior run first, then work only in
+        # a new owned copy of its final MPS image.
+        self._release_run(remove_scratch=True)
+        os.makedirs(self.scratch, exist_ok=True)
+        run_scratch = tempfile.mkdtemp(prefix="dmrgci_restore_", dir=self.scratch)
+        self._scratch = run_scratch
+        _, checkpoint_mps, _ = self._checkpoint_paths()
+        try:
+            self._copy_internal_mps(checkpoint_mps, run_scratch, tag=mps_tag)
+        except Exception:
+            self._release_run(remove_scratch=True)
+            raise
+
+        driver = None
+        ket = None
+        mpo = None
+        kets = None
+        ci = None
+        identity_mpo = None
+        try:
+            iprint = (
+                1
+                if logger.new_logger(self, verbose).verbose >= logger.NOTE
+                else 0
+            )
+            driver = DMRGDriver(
+                stack_mem=self._stack_bytes(max_memory),
+                scratch=run_scratch,
+                clean_scratch=True,
+                symm_type=SymmetryTypes.SGFCPX,
+                n_threads=self.n_threads,
+            )
+            driver.bw.b.Random.rand_seed(self.random_seed)
+            driver.initialize_system(
+                n_sites=int(norb),
+                n_elec=nelec,
+                orb_sym=[0] * int(norb),
+            )
+            ket = driver.load_mps(mps_tag, nroots=nroots)
+            if int(ket.dot) != 1:
+                raise RuntimeError(
+                    "checkpoint-only restore requires a final one-site MPS; "
+                    "use kernel(resume=True) to convert an older two-site checkpoint"
+                )
+            if int(ket.n_sites) != int(norb):
+                raise RuntimeError("checkpoint MPS site count does not match")
+            if nroots > 1 and int(ket.nroots) != nroots:
+                raise RuntimeError("checkpoint MultiMPS root count does not match")
+            if nroots > 1:
+                loaded_weights = numpy.asarray(list(ket.weights), dtype=float)
+                if (
+                    loaded_weights.shape != (nroots,)
+                    or not numpy.all(numpy.isfinite(loaded_weights))
+                    or not numpy.allclose(
+                        loaded_weights, weights, atol=1e-15, rtol=0.0
+                    )
+                ):
+                    raise RuntimeError(
+                        "checkpoint MultiMPS weights do not match the manifest"
+                    )
+                ket.weights = driver.bw.VectorFP(weights.tolist())
+
+            reordered_h1 = numpy.ascontiguousarray(
+                h1_block2[numpy.ix_(reorder_idx, reorder_idx)]
+            )
+            reordered_eri = numpy.ascontiguousarray(
+                eri_block2[
+                    numpy.ix_(
+                        reorder_idx,
+                        reorder_idx,
+                        reorder_idx,
+                        reorder_idx,
+                    )
+                ]
+            )
+            mpo = driver.get_qc_mpo(
+                h1e=reordered_h1,
+                g2e=reordered_eri,
+                ecore=0.0,
+                cutoff=self.cutoff,
+                integral_cutoff=self.integral_cutoff,
+                iprint=iprint,
+            )
+            if nroots > 1:
+                kets = [
+                    driver.split_mps(ket, root, tag="KET-%d" % root)
+                    for root in range(nroots)
+                ]
+                ci = kets
+            else:
+                kets = [ket]
+                ci = ket
+
+            # The MPO and MPS both use the explicitly reordered site basis.
+            # Register the mapping only after loading/splitting, so subsequent
+            # NPDMs are returned in the caller's original active-orbital order.
+            driver.reorder_idx = numpy.array(reorder_idx, dtype=int, copy=True)
+
+            identity_mpo = driver.get_identity_mpo()
+            root_overlap = numpy.empty(
+                (nroots, nroots), dtype=numpy.complex128
+            )
+            projected_hamiltonian = numpy.empty_like(root_overlap)
+            for i in range(nroots):
+                for j in range(i, nroots):
+                    overlap_ij = driver.expectation(
+                        kets[i], identity_mpo, kets[j]
+                    )
+                    active_hamiltonian_ij = driver.expectation(
+                        kets[i], mpo, kets[j]
+                    )
+                    hamiltonian_ij = (
+                        active_hamiltonian_ij + ecore_value * overlap_ij
+                    )
+                    root_overlap[i, j] = overlap_ij
+                    projected_hamiltonian[i, j] = hamiltonian_ij
+                    if i != j:
+                        root_overlap[j, i] = numpy.conj(overlap_ij)
+                        projected_hamiltonian[j, i] = numpy.conj(hamiltonian_ij)
+
+            root_orthogonality_error = float(
+                numpy.max(abs(root_overlap - numpy.eye(nroots)))
+            )
+            root_eigen_equation_error = float(
+                numpy.max(
+                    abs(
+                        projected_hamiltonian
+                        - root_overlap * energy_array[None, :]
+                    )
+                )
+            )
+            root_validation_tolerance = max(
+                1e-7,
+                10.0 * math.sqrt(float(numpy.min(stored_thresholds))),
+                10.0 * self.tol,
+            )
+            if (
+                max(root_orthogonality_error, root_eigen_equation_error)
+                > root_validation_tolerance
+            ):
+                raise RuntimeError(
+                    "restored checkpoint roots are inconsistent with the saved "
+                    "energies (S-I %.3e, H-SE %.3e)"
+                    % (root_orthogonality_error, root_eigen_equation_error)
+                )
+
+            self.driver = driver
+            self._active_mpo = mpo
+            self._multi_mps = ket
+            self.kets = kets
+            self.ci = ci
+            self.root_overlap = root_overlap
+            self.projected_hamiltonian = projected_hamiltonian
+            self._mps_signature = wavefunction_problem
+            self.nroots = nroots
+            self.ncas = int(norb)
+            self.nelecas = nelec
+            self.e_tot = (
+                float(energy_array[0]) if nroots == 1 else energy_array.copy()
+            )
+            self.e_cas = self.e_tot - ecore_value
+            self.converged = True
+            final_threshold = float(stored_thresholds[-1])
+            self.convergence_info = {
+                "converged": True,
+                "sweeps": 0,
+                "run_mode": "checkpoint-only-restore",
+                "restart_transport": "fresh-driver-mps-reload-no-sweeps",
+                "constant_energy_shift": ecore_value,
+                "sweep_energy_origin": "active-space Hamiltonian without ecore",
+                "checkpoint_dir": self.checkpoint_dir,
+                "checkpoint_fingerprint": checkpoint_problem[
+                    "hamiltonian_sha256"
+                ],
+                "checkpoint_manifest_run_mode": manifest.get("run_mode"),
+                "orbital_reordering": reorder_idx.tolist(),
+                "state_average_weights": weights.copy(),
+                "local_squared_residual_threshold": final_threshold,
+                "local_residual_bound": math.sqrt(final_threshold),
+                "bond_dimension": max(item.info.bond_dim for item in kets),
+                "canonical_forms": [item.canonical_form for item in kets],
+                "npdm_site_type": self.npdm_site_type,
+                "npdm_cutoff": self.npdm_cutoff,
+                "scratch": self._scratch,
+                "root_strategy": (
+                    "restored-state-averaged-multimps"
+                    if nroots > 1
+                    else "restored-state-averaged"
+                ),
+                "root_orthogonality_error": root_orthogonality_error,
+                "root_eigen_equation_error": root_eigen_equation_error,
+                "root_validation_tolerance": root_validation_tolerance,
+                "source_schedule": stored_schedule,
+            }
+            self._checkpoint_hamiltonian = {
+                "format": "socutils.dmrgci.hamiltonian-snapshot",
+                "version": 1,
+                "h1e": numpy.array(h1_block2, order="C", copy=True),
+                "eri": numpy.array(eri_block2, order="C", copy=True),
+                "ecore": ecore_value,
+                "weights": weights.copy(),
+                "norb": int(norb),
+                "nelec": nelec,
+                "nroots": nroots,
+                "hamiltonian_sha256": checkpoint_problem[
+                    "hamiltonian_sha256"
+                ],
+            }
+            self.resume = False
+            self.restart = False
+            self._restart = False
+            return self.e_tot, self.ci
+        except Exception:
+            # Local Block2 objects are not yet necessarily installed on self;
+            # release them explicitly before deleting the owned scratch copy.
+            self._clear_results()
+            ci = None
+            kets = None
+            ket = None
+            mpo = None
+            identity_mpo = None
+            if driver is not None:
+                try:
+                    driver.finalize()
+                except Exception:
+                    pass
+            driver = None
+            self.driver = None
             self._release_run(remove_scratch=True)
             raise
 
