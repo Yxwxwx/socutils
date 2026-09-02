@@ -1,4 +1,4 @@
-"""Dense relativistic strongly-contracted perturbation theory."""
+"""Dense relativistic multireference perturbation theory."""
 
 from .spinor_helper import (
     _SpinorERIs,
@@ -9,6 +9,14 @@ from .x2cscnevpt2 import (
     MRPTNumericalWarning,
     WickX2CSCNEVPT2,
     X2CSCNEVPT2,
+)
+from .x2cficnevpt2 import (
+    WickX2CFICNEVPT2,
+    WickX2CICNEVPT2,
+    WickX2CPCNEVPT2,
+    X2CFICNEVPT2,
+    X2CICNEVPT2,
+    X2CPCNEVPT2,
 )
 from .x2cqdscnevpt2 import (
     QDBlochSCNEVPT2Result,
@@ -26,6 +34,12 @@ __all__ = [
     "MRPTNumericalWarning",
     "WickX2CSCNEVPT2",
     "X2CSCNEVPT2",
+    "WickX2CFICNEVPT2",
+    "X2CFICNEVPT2",
+    "WickX2CICNEVPT2",
+    "X2CICNEVPT2",
+    "WickX2CPCNEVPT2",
+    "X2CPCNEVPT2",
     "QDSCNEVPT2Result",
     "QDBlochSCNEVPT2Result",
     "WickX2CQDSCNEVPT2",

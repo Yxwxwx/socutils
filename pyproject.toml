@@ -63,4 +63,5 @@ testpaths = ["tests"]
 markers = [
     "integration: molecular/native integration tests",
     "expensive: tests unsuitable for the regular development subset",
+    "slow: long-running external-solver and high-rank-RDM tests",
 ]
