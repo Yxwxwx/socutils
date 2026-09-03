@@ -23,6 +23,9 @@ They use the canonical `.x2camf()` / `.x2cmp()` driver API.
 | `17-cl_cas16_diis.py` | Cl CAS(7,16), six-root DMRG Super-CIPT/Super-CI DIIS comparison, with optional Kramers restriction |
 | `18-x2c_dmrg_sc_nevpt2.py` | BH CAS(4,6) no-Kramers dense X2C-DMRG-SCF to strict-SI Wick SC-NEVPT2 (needs Block2) |
 | `19-x2c_dmrg_qd_sc_nevpt2.py` | neutral Cl CAS(5,12), six-root SA-X2C-DMRG-SCF to Bloch/canonical Van Vleck QD-SC-NEVPT2 (needs Block2) |
+| `20-h2o_scalar_sc_spatial.py` | minimal H2O scalar SC regression with alpha/beta partners contracted spatially |
+| `21-h2o_scalar_sc_spinor.py` | minimal H2O scalar SC calculation with independent spinor channels |
+| `22-h2o_scalar_fic.py` | minimal H2O scalar FIC regression without strong-contraction grouping |
 
 The `fci/` subfolder has examples for the spinor CI module (`socutils.fci`):
 
