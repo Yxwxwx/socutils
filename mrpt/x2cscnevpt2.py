@@ -16,10 +16,15 @@ with unantisymmetrized integrals
    w_{pqrs} = \mathrm{eri}_{prqs}, \qquad
    \mathrm{eri}_{pqrs} = (pq|rs).
 
-All indices label individual complex spinors.  There is no spin summation,
-Kramers compression, ``E1/E2`` spin-free operator, or spatial ``gamma``
-factor.  The eight strongly-contracted spaces follow Sections I.E--I.L of
-the Supporting Information to Shiozaki and Mizukami, JCTC 2015:
+All indices label individual complex spinors.  There is no implicit spin
+summation, Kramers compression, ``E1/E2`` spin-free operator, or spatial
+``gamma`` factor.  An explicit ``strong_contraction_groups`` label vector can
+nevertheless request that symmetry-partner core/external channels be summed
+before their strongly-contracted denominator is formed.  This recovers, for
+example, the spin-free scalar limit without guessing partners from accidental
+orbital-energy degeneracies.  The eight strongly-contracted spaces follow
+Sections I.E--I.L of the Supporting Information to Shiozaki and Mizukami,
+JCTC 2015:
 
 ``ijrs`` (E, Eqs. 13--14), ``ijr`` (F, Eqs. 15--17), ``ij`` (G,
 Eqs. 18--20), ``rsi`` (H, Eqs. 21--23), ``ir`` (I, Eqs. 24--27), ``i``
@@ -721,6 +726,188 @@ def _strict_pair_mask(key: str, shape):
     return mask
 
 
+def _normalize_strong_contraction_groups(
+    groups,
+    eris,
+    core_energy,
+    virtual_energy,
+    *,
+    atol,
+    rtol,
+):
+    """Validate and normalize explicit core/external contraction labels.
+
+    Labels are indexed by the full semicanonical spinor-MO order.  Their
+    numerical values have no meaning: equal labels within a core or virtual
+    partition identify channels that belong to one strongly-contracted
+    orbital.  Active labels are retained only so the public input has one
+    unambiguous full-MO shape.
+    """
+
+    for name, value in (("atol", atol), ("rtol", rtol)):
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"strong-contraction group {name} must be finite and "
+                "non-negative"
+            )
+    labels = np.asarray(groups)
+    if labels.shape != (eris.nmo,):
+        raise ValueError(
+            "strong_contraction_groups must have shape "
+            f"({eris.nmo},), got {labels.shape}"
+        )
+    if labels.dtype.kind not in "iufc":
+        raise TypeError("strong_contraction_groups must contain integer labels")
+    if labels.dtype.kind in "iu":
+        integral_labels = labels
+    else:
+        if labels.dtype.kind == "c" and np.any(labels.imag != 0.0):
+            raise ValueError("strong_contraction_groups contains complex labels")
+        numeric = np.asarray(labels.real, dtype=float)
+        if not np.all(np.isfinite(numeric)):
+            raise ValueError(
+                "strong_contraction_groups contains non-finite labels"
+            )
+        integral_labels = np.rint(numeric)
+        if np.any(numeric != integral_labels):
+            raise ValueError(
+                "strong_contraction_groups must contain integer labels"
+            )
+
+    ncore = int(eris.ncore)
+    nocc = int(eris.nocc)
+    if np.asarray(core_energy).shape != (ncore,):
+        raise ValueError("core_energy has the wrong shape")
+    if np.asarray(virtual_energy).shape != (eris.nmo - nocc,):
+        raise ValueError("virtual_energy has the wrong shape")
+    normalized = np.empty(eris.nmo, dtype=np.int64)
+    partitions = ((0, ncore), (ncore, nocc), (nocc, eris.nmo))
+    for start, stop in partitions:
+        if start == stop:
+            continue
+        _unique, inverse = np.unique(
+            integral_labels[start:stop],
+            return_inverse=True,
+        )
+        normalized[start:stop] = inverse
+
+    def validate_partition(partition_labels, energies, name):
+        energies = np.asarray(energies, dtype=float)
+        for group in np.unique(partition_labels):
+            selected = energies[partition_labels == group]
+            spread = float(np.ptp(selected)) if selected.size else 0.0
+            scale = max(1.0, float(np.max(np.abs(selected), initial=0.0)))
+            tolerance = float(atol + rtol * scale)
+            if spread > tolerance:
+                raise ValueError(
+                    f"strong-contraction {name} group {int(group)} spans "
+                    f"nondegenerate semicanonical energies: spread={spread:.3e}, "
+                    f"tolerance={tolerance:.3e}"
+                )
+
+    validate_partition(normalized[:ncore], core_energy, "core")
+    validate_partition(normalized[nocc:], virtual_energy, "virtual")
+    return normalized
+
+
+def _group_strong_contraction_arrays(
+    key,
+    arrays,
+    orbital_gap,
+    ordered,
+    groups,
+    eris,
+    *,
+    atol,
+    rtol,
+):
+    """Sum symmetry-partner channels before forming an SC denominator."""
+
+    ordered = np.asarray(ordered, dtype=bool)
+    arrays = tuple(np.asarray(array) for array in arrays)
+    orbital_gap = np.asarray(orbital_gap, dtype=float)
+    if any(array.shape != ordered.shape for array in arrays):
+        raise ValueError("strong-contraction arrays and mask have different shapes")
+    if orbital_gap.shape != ordered.shape:
+        raise ValueError("strong-contraction orbital gap has the wrong shape")
+
+    selected_coordinates = np.column_stack(np.nonzero(ordered))
+    raw_dimension = int(selected_coordinates.shape[0])
+    if raw_dimension == 0:
+        empty_arrays = tuple(
+            np.zeros(0, dtype=array.dtype) for array in arrays
+        )
+        diagnostics = {
+            "enabled": True,
+            "raw_ordered_dimension": 0,
+            "contracted_group_dimension": 0,
+            "maximum_orbital_gap_spread": 0.0,
+            "orbital_gap_tolerance_at_maximum": float(atol + rtol),
+        }
+        return empty_arrays, np.zeros(0, dtype=float), diagnostics
+
+    nocc = int(eris.nocc)
+    group_columns = []
+    for axis, char in enumerate(key):
+        if char in "ij":
+            partition_groups = groups[: eris.ncore]
+        else:
+            partition_groups = groups[nocc:]
+        group_columns.append(
+            partition_groups[selected_coordinates[:, axis]]
+        )
+    group_keys = np.column_stack(group_columns)
+    # A restricted raw pair is ordered by spinor index.  For non-contiguous
+    # or otherwise arbitrarily labelled partner groups, canonicalize the
+    # corresponding group pair as well so its members cannot split across two
+    # denominators merely because of their column order.
+    for left, right in _PAIR_RESTRICTIONS[key]:
+        low = np.minimum(group_keys[:, left], group_keys[:, right])
+        high = np.maximum(group_keys[:, left], group_keys[:, right])
+        group_keys[:, left] = low
+        group_keys[:, right] = high
+
+    _unique_keys, inverse = np.unique(
+        group_keys, axis=0, return_inverse=True
+    )
+    group_count = int(np.max(inverse)) + 1
+    grouped_arrays = []
+    for array in arrays:
+        grouped = np.zeros(group_count, dtype=array.dtype)
+        np.add.at(grouped, inverse, array[ordered])
+        grouped_arrays.append(grouped)
+
+    selected_gap = orbital_gap[ordered]
+    gap_min = np.full(group_count, np.inf, dtype=float)
+    gap_max = np.full(group_count, -np.inf, dtype=float)
+    gap_sum = np.zeros(group_count, dtype=float)
+    group_size = np.zeros(group_count, dtype=np.int64)
+    np.minimum.at(gap_min, inverse, selected_gap)
+    np.maximum.at(gap_max, inverse, selected_gap)
+    np.add.at(gap_sum, inverse, selected_gap)
+    np.add.at(group_size, inverse, 1)
+    spreads = gap_max - gap_min
+    scales = np.maximum(1.0, np.maximum(np.abs(gap_min), np.abs(gap_max)))
+    limits = atol + rtol * scales
+    maximum_index = int(np.argmax(spreads))
+    if np.any(spreads > limits):
+        failed = int(np.argmax(spreads - limits))
+        raise ValueError(
+            f"subspace {key}: one strong-contraction group spans unequal "
+            f"orbital gaps: spread={spreads[failed]:.3e}, "
+            f"tolerance={limits[failed]:.3e}"
+        )
+    grouped_gap = gap_sum / group_size
+    diagnostics = {
+        "enabled": True,
+        "raw_ordered_dimension": raw_dimension,
+        "contracted_group_dimension": group_count,
+        "maximum_orbital_gap_spread": float(spreads[maximum_index]),
+        "orbital_gap_tolerance_at_maximum": float(limits[maximum_index]),
+    }
+    return tuple(grouped_arrays), grouped_gap, diagnostics
+
+
 def _require_real(values, *, root, subspace, quantity, atol, rtol):
     values = np.asarray(values)
     if not np.all(np.isfinite(values)):
@@ -1147,6 +1334,9 @@ def _evaluate_wick_subspaces(
     si_energy_imag_l1_tol=1.0e-10,
     si_projection_shift_l1_tol=1.0e-12,
     contraction_backend=_DEFAULT_CONTRACTION_BACKEND,
+    strong_contraction_groups=None,
+    strong_contraction_group_atol=1.0e-10,
+    strong_contraction_group_rtol=1.0e-9,
     return_arrays=False,
     return_timings=False,
     return_diagnostics=False,
@@ -1155,6 +1345,21 @@ def _evaluate_wick_subspaces(
 
     denominator_mode = _normalize_denominator_mode(denominator_mode)
     contraction_backend = _normalize_contraction_backend(contraction_backend)
+    if strong_contraction_groups is not None and return_arrays:
+        raise NotImplementedError(
+            "return_arrays=True is not yet available with explicit "
+            "strong-contraction groups"
+        )
+    normalized_groups = None
+    if strong_contraction_groups is not None:
+        normalized_groups = _normalize_strong_contraction_groups(
+            strong_contraction_groups,
+            eris,
+            core_energy,
+            virtual_energy,
+            atol=strong_contraction_group_atol,
+            rtol=strong_contraction_group_rtol,
+        )
     if contraction_backend == "pytblis":
         _validate_tblis_operand_dtypes(
             [(f"h{key}", eris.get_h1eff(key)) for key in _H1_KEYS]
@@ -1204,15 +1409,6 @@ def _evaluate_wick_subspaces(
             wick_globals,
             local_context,
         )
-        # This reconciles two independently contracted representations of the
-        # *same one-sided* scalar.  In exact arithmetic left.conj() == right,
-        # so unlike the Hermitian half-sum below it does not remove a physical
-        # one-sided imaginary residual.
-        si_right_commutator = 0.5 * (
-            right_commutator + left_commutator.conj()
-        )
-        commutator = 0.5 * (right_commutator + left_commutator)
-
         ordered = _strict_pair_mask(key, shape)
         branch_diagnostics = _require_adjoint_pair(
             left_commutator,
@@ -1223,6 +1419,48 @@ def _evaluate_wick_subspaces(
             atol=scalar_atol,
             rtol=scalar_rtol,
         )
+        orbital_gap = _orbital_gap(key, core_energy, virtual_energy)
+        raw_ordered_dimension = int(np.count_nonzero(ordered))
+        if normalized_groups is None:
+            grouping_diagnostics = {
+                "enabled": False,
+                "raw_ordered_dimension": raw_ordered_dimension,
+                "contracted_group_dimension": raw_ordered_dimension,
+                "maximum_orbital_gap_spread": 0.0,
+                "orbital_gap_tolerance_at_maximum": float(
+                    strong_contraction_group_atol
+                    + strong_contraction_group_rtol
+                ),
+            }
+        else:
+            grouped, orbital_gap, grouping_diagnostics = (
+                _group_strong_contraction_arrays(
+                    key,
+                    (norm, right_commutator, left_commutator),
+                    orbital_gap,
+                    ordered,
+                    normalized_groups,
+                    eris,
+                    atol=strong_contraction_group_atol,
+                    rtol=strong_contraction_group_rtol,
+                )
+            )
+            norm, right_commutator, left_commutator = grouped
+            shape = norm.shape
+            ordered = np.ones(shape, dtype=bool)
+        orbital_gap = orbital_gap.astype(dtype, copy=False)
+
+        # This reconciles two independently contracted representations of the
+        # *same one-sided* scalar.  In exact arithmetic left.conj() == right,
+        # so unlike the Hermitian half-sum below it does not remove a physical
+        # one-sided imaginary residual.  Explicit symmetry-partner channels,
+        # when requested, have already been summed above: the nonlinear SC
+        # denominator must be formed only after that sum.
+        si_right_commutator = 0.5 * (
+            right_commutator + left_commutator.conj()
+        )
+        commutator = 0.5 * (right_commutator + left_commutator)
+
         selected_norm = norm[ordered]
         selected_norm = _require_real(
             selected_norm,
@@ -1273,9 +1511,6 @@ def _evaluate_wick_subspaces(
             subspace=key,
             atol=scalar_atol,
             rtol=scalar_rtol,
-        )
-        orbital_gap = _orbital_gap(key, core_energy, virtual_energy).astype(
-            dtype, copy=False
         )
         one_sided_gap = orbital_gap.copy()
         hermitianized_gap = orbital_gap.copy()
@@ -1379,12 +1614,14 @@ def _evaluate_wick_subspaces(
             "zero_norm_hermitian_commutator": zero_norm_diagnostics,
             "zero_norm_right_commutator": right_zero_norm_diagnostics,
             "zero_norm_left_commutator": left_zero_norm_diagnostics,
+            "strong_contraction_grouping": grouping_diagnostics,
             "minimum_retained_norm": (
                 float(np.min(selected_norm[nonzero_flat]))
                 if np.any(nonzero_flat)
                 else None
             ),
             "ordered_dimension": int(np.count_nonzero(ordered)),
+            "raw_ordered_dimension": raw_ordered_dimension,
             "retained_dimension": int(np.count_nonzero(nonzero_flat)),
             "discarded_zero_norm_dimension": int(np.count_nonzero(zero_norm)),
         }
@@ -1811,6 +2048,8 @@ _SC_NUMERICAL_DEFAULTS = (
     ("si_numerator_noise_allowance", 1.0e-12),
     ("si_energy_imag_l1_tol", 1.0e-10),
     ("si_projection_shift_l1_tol", 1.0e-12),
+    ("strong_contraction_group_atol", 1.0e-10),
+    ("strong_contraction_group_rtol", 1.0e-9),
 )
 
 
@@ -2239,6 +2478,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             setattr(self, name, value)
         self.denominator_mode = "strict_si"
         self.contraction_backend = _DEFAULT_CONTRACTION_BACKEND
+        self.strong_contraction_groups = None
         self.strict_si_compatible = None
         self.scalar_tolerance = None
         self.reference_residual_bound = None
@@ -2307,6 +2547,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         root,
         denominator_mode,
         contraction_backend,
+        strong_contraction_groups=None,
         return_arrays=False,
         compact_eris=False,
         retain_pdms123=False,
@@ -2415,6 +2656,13 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             si_energy_imag_l1_tol=self.si_energy_imag_l1_tol,
             si_projection_shift_l1_tol=self.si_projection_shift_l1_tol,
             contraction_backend=contraction_backend,
+            strong_contraction_groups=strong_contraction_groups,
+            strong_contraction_group_atol=(
+                self.strong_contraction_group_atol
+            ),
+            strong_contraction_group_rtol=(
+                self.strong_contraction_group_rtol
+            ),
             return_arrays=return_arrays,
             return_timings=True,
             return_diagnostics=True,
@@ -2477,12 +2725,19 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         denominator_mode=None,
         root=None,
         contraction_backend=None,
+        strong_contraction_groups=None,
         compact_eris=False,
     ):
         """Compute one root-specific SC-NEVPT2 correction.
 
         ``contraction_backend`` selects ``"pytblis"`` (the default) or the
         NumPy reference implementation for the Block2-generated contractions.
+        ``strong_contraction_groups`` is an optional integer label for every
+        semicanonical spinor MO.  Equal core or virtual labels are summed
+        before forming a denominator; this is required to reproduce a
+        spin-free SC contraction from explicit alpha/beta spinors.  Because
+        labels describe the final MO columns, this option requires
+        ``canonicalized=True``.
         With a dense input-basis ``eris``, ``compact_eris=True`` rotates and
         retains only the blocks used by Wick; the default preserves the
         historical full-ERI result object.
@@ -2503,6 +2758,18 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             contraction_backend
         )
         self.contraction_backend = contraction_backend
+        if strong_contraction_groups is None:
+            strong_contraction_groups = self.strong_contraction_groups
+        else:
+            strong_contraction_groups = np.asarray(
+                strong_contraction_groups
+            ).copy()
+            self.strong_contraction_groups = strong_contraction_groups
+        if strong_contraction_groups is not None and not self.canonicalized:
+            raise ValueError(
+                "strong_contraction_groups describes semicanonical MO columns; "
+                "set canonicalized=True and supply matching mo_energy"
+            )
         if root is None:
             root = self.root
         root = int(root)
@@ -2521,6 +2788,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             root=root,
             denominator_mode=denominator_mode,
             contraction_backend=contraction_backend,
+            strong_contraction_groups=strong_contraction_groups,
             return_arrays=False,
             compact_eris=bool(compact_eris),
         )
