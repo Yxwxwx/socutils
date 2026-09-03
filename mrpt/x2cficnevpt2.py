@@ -41,7 +41,7 @@ corresponding first-order interacting subspace. The contracted basis is
 
    |\Phi_{\eta\mu}\rangle = O_{\eta\mu}|\Psi_0\rangle.
 
-The projected source is taken from the independently audited SC implementation,
+The projected source uses the shared, independently audited NEVPT2 definition,
 
 .. math::
 
@@ -93,16 +93,17 @@ from functools import lru_cache
 import gc
 import itertools
 import time
-from typing import Any
 
 import numpy as np
 from pyscf import lib
 from pyscf.lib import logger
 
 try:
-    from . import x2cscnevpt2 as _ss
+    from . import nevpt2_utils as _utils
+    from . import spinor_helper
 except ImportError:  # pragma: no cover - permits running a repository snapshot
-    import x2cscnevpt2 as _ss
+    import nevpt2_utils as _utils
+    import spinor_helper
 
 
 __all__ = [
@@ -117,7 +118,7 @@ __all__ = [
 ]
 
 
-SUBSPACE_ORDER = tuple(_ss.SUBSPACE_ORDER)
+SUBSPACE_ORDER = _utils.SUBSPACE_ORDER
 
 
 @dataclass(frozen=True)
@@ -210,16 +211,7 @@ _IC_COMPONENTS: dict[str, tuple[_ICComponent, ...]] = {
 }
 
 
-_FREE_PAIRS: dict[str, tuple[tuple[int, int], ...]] = {
-    "ijrs": ((0, 1), (2, 3)),
-    "rsi": ((0, 1),),
-    "ijr": ((0, 1),),
-    "rs": ((0, 1),),
-    "ij": ((0, 1),),
-    "ir": (),
-    "r": (),
-    "i": (),
-}
+_FREE_PAIRS = _utils._PAIR_RESTRICTIONS
 
 
 @dataclass(frozen=True)
@@ -251,8 +243,8 @@ def _target(parse_tensor, name: str, labels: tuple[str, ...]):
 def _compile_fic_equations() -> _FICEquationBundle:
     """Generate all FIC RHS, metric, and Dyall-matrix contractions."""
 
-    types = _ss._block2_wick_types()
-    parse, parse_tensor = _ss._wick_parsers(types)
+    types = _utils._block2_wick_types()
+    parse, parse_tensor = _utils._wick_parsers(types)
 
     h_dyall_active = parse("SUM <ab> h[ab] C[a] D[b]")
     h_dyall_active += parse(
@@ -269,7 +261,7 @@ def _compile_fic_equations() -> _FICEquationBundle:
     left_text = {}
 
     for key in SUBSPACE_ORDER:
-        source = parse(_ss._PERTURBER_EXPRESSIONS[key])
+        source = parse(_utils._PERTURBER_EXPRESSIONS[key])
         components = _IC_COMPONENTS[key]
         ket_expressions = {
             component.name: parse(component.expression)
@@ -286,8 +278,8 @@ def _compile_fic_equations() -> _FICEquationBundle:
         free_labels = tuple(key)
         for bra_component in components:
             bra = bra_expressions[bra_component.name]
-            rhs = _ss._lower_active_operators(
-                _ss._vacuum_reduce(bra * source), types
+            rhs = _utils._lower_active_operators(
+                _utils._vacuum_reduce(bra * source), types
             )
             labels = free_labels + bra_component.bra_active
             rhs_code[(key, bra_component.name)] = rhs.to_einsum(
@@ -304,8 +296,8 @@ def _compile_fic_equations() -> _FICEquationBundle:
                     + ket_component.ket_active
                 )
 
-                metric = _ss._lower_active_operators(
-                    _ss._vacuum_reduce(bra * ket), types
+                metric = _utils._lower_active_operators(
+                    _utils._vacuum_reduce(bra * ket), types
                 )
 
                 # [one-/two-body H_D, one-/two-body O] is connected and
@@ -314,14 +306,14 @@ def _compile_fic_equations() -> _FICEquationBundle:
                 connected_right = (
                     (h_dyall_active ^ ket).expand(6).simplify()
                 )
-                right = _ss._lower_active_operators(
-                    _ss._vacuum_reduce(bra * connected_right), types
+                right = _utils._lower_active_operators(
+                    _utils._vacuum_reduce(bra * connected_right), types
                 )
                 connected_left = (
                     (bra ^ h_dyall_active).expand(6).simplify()
                 )
-                left = _ss._lower_active_operators(
-                    _ss._vacuum_reduce(connected_left * ket), types
+                left = _utils._lower_active_operators(
+                    _utils._vacuum_reduce(connected_left * ket), types
                 )
 
                 metric_code[pair] = metric.to_einsum(
@@ -355,7 +347,7 @@ def dump_fic_wick_equations(filename: str | None = None) -> str:
     equations = _compile_fic_equations()
     sections = []
     for key in SUBSPACE_ORDER:
-        sections.append(f"[{key}] source\n{_ss._PERTURBER_EXPRESSIONS[key]}")
+        sections.append(f"[{key}] source\n{_utils._PERTURBER_EXPRESSIONS[key]}")
         for component in _IC_COMPONENTS[key]:
             sections.extend(
                 (
@@ -393,25 +385,9 @@ def dump_fic_wick_equations(filename: str | None = None) -> str:
     return text
 
 
-def _warn_numerical(message: str) -> None:
-    warning = getattr(_ss, "_warn_numerical", None)
-    if callable(warning):
-        warning(message)
-    else:  # pragma: no cover
-        import warnings
-
-        warnings.warn(message, RuntimeWarning, stacklevel=2)
-
-
-def _maximum_abs(values) -> float:
-    return float(np.max(np.abs(np.asarray(values)), initial=0.0))
-
-
-def _finite_nonnegative(value, *, name: str) -> float:
-    value = float(value)
-    if not np.isfinite(value) or value < 0.0:
-        raise ValueError(f"{name} must be finite and non-negative")
-    return value
+_warn_numerical = _utils._warn_numerical
+_maximum_abs = _utils._maximum_abs
+_finite_nonnegative = _utils._finite_nonnegative
 
 
 def _label_dimension(label: str, eris) -> int:
@@ -896,8 +872,8 @@ def _evaluate_fic_subspaces(
     """Evaluate and solve all eight spinor FIC-NEVPT2 subspaces."""
 
     if contraction_backend is None:
-        contraction_backend = _ss._DEFAULT_CONTRACTION_BACKEND
-    contraction_backend = _ss._normalize_contraction_backend(
+        contraction_backend = _utils._DEFAULT_CONTRACTION_BACKEND
+    contraction_backend = _utils._normalize_contraction_backend(
         contraction_backend
     )
     for name, value in (
@@ -913,14 +889,14 @@ def _evaluate_fic_subspaces(
         _finite_nonnegative(value, name=name)
 
     if contraction_backend == "pytblis":
-        _ss._validate_tblis_operand_dtypes(
+        _utils._validate_tblis_operand_dtypes(
             [
                 (f"h{key}", eris.get_h1eff(key))
-                for key in _ss._H1_KEYS
+                for key in _utils._H1_KEYS
             ]
             + [
                 (f"w{key}", eris.get_phys(key))
-                for key in _ss._W_KEYS
+                for key in _utils._W_KEYS
             ]
             + [
                 (f"dm{rank}", density)
@@ -929,14 +905,14 @@ def _evaluate_fic_subspaces(
         )
 
     equations = _compile_fic_equations()
-    base_context = _ss._execution_context(eris, pdms)
+    base_context = _utils._execution_context(eris, pdms)
     wick_globals = {
-        "np": _ss._wick_einsum_namespace(contraction_backend),
+        "np": _utils._wick_einsum_namespace(contraction_backend),
     }
     dtype = np.result_type(
         np.complex128,
-        *(eris.get_h1eff(key).dtype for key in _ss._H1_KEYS),
-        *(eris.get_phys(key).dtype for key in _ss._W_KEYS),
+        *(eris.get_h1eff(key).dtype for key in _utils._H1_KEYS),
+        *(eris.get_phys(key).dtype for key in _utils._W_KEYS),
         *(np.asarray(density).dtype for density in pdms),
     )
     # Block2 emits singleton ``identN`` operands when a coefficient-free
@@ -1083,7 +1059,7 @@ class WickX2CFICNEVPT2(lib.StreamObject):
     """Single-state dense complex-spinor FIC/PC-NEVPT2 driver."""
 
     def __init__(self, mc, frozen=0):
-        if _ss._has_frozen_orbitals(frozen) or _ss._has_frozen_orbitals(
+        if _utils._has_frozen_orbitals(frozen) or _utils._has_frozen_orbitals(
             getattr(mc, "frozen", None)
         ):
             raise NotImplementedError(
@@ -1109,20 +1085,15 @@ class WickX2CFICNEVPT2(lib.StreamObject):
         self.rdm_diagnostics = None
         self.integral_symmetry_diagnostics = None
 
-        for name, value in getattr(_ss, "_SC_NUMERICAL_DEFAULTS", ()):
-            setattr(self, name, value)
-        if not hasattr(self, "integral_roundoff_factor"):
-            self.integral_roundoff_factor = (
-                _ss._DEFAULT_AO2MO_ROUNDOFF_FACTOR
-            )
-        if not hasattr(self, "rdm_atol"):
-            self.rdm_atol = 1.0e-9
-            self.rdm_rtol = 1.0e-8
-            self.rdm_work_memory = 512 * 2**20
-        if not hasattr(self, "denominator_tol"):
-            self.denominator_tol = 1.0e-12
+        self.integral_roundoff_factor = (
+            _utils._DEFAULT_AO2MO_ROUNDOFF_FACTOR
+        )
+        self.rdm_atol = _utils._DEFAULT_RDM_ATOL
+        self.rdm_rtol = _utils._DEFAULT_RDM_RTOL
+        self.rdm_work_memory = _utils._DEFAULT_RDM_WORK_MEMORY
+        self.denominator_tol = _utils._DEFAULT_DENOMINATOR_TOL
 
-        self.contraction_backend = _ss._DEFAULT_CONTRACTION_BACKEND
+        self.contraction_backend = _utils._DEFAULT_CONTRACTION_BACKEND
         self.metric_atol = 1.0e-12
         self.metric_rtol = 1.0e-10
         self.metric_rcond = 1.0e-11
@@ -1140,12 +1111,15 @@ class WickX2CFICNEVPT2(lib.StreamObject):
         return np.asarray(self.reference_energy) + np.asarray(self.e_corr)
 
     def _semicanonicalize(self, mc, mo_coeff, dm1, root):
-        adapter = _ss.WickX2CSCNEVPT2(mc)
-        adapter.verbose = self.verbose
-        adapter.stdout = self.stdout
-        adapter.canonicalized = bool(self.canonicalized)
-        adapter.mo_energy = self.mo_energy
-        return adapter._semicanonicalize(mc, mo_coeff, dm1, root)
+        return _utils.semicanonicalize(
+            mc,
+            mo_coeff,
+            dm1,
+            root,
+            canonicalized=self.canonicalized,
+            mo_energy=self.mo_energy,
+            verbose=self.verbose,
+        )
 
     def kernel(
         self,
@@ -1167,11 +1141,11 @@ class WickX2CFICNEVPT2(lib.StreamObject):
         total_start = time.perf_counter()
         if mc is None:
             mc = self._mc
-        if _ss._has_frozen_orbitals(getattr(mc, "frozen", None)):
+        if _utils._has_frozen_orbitals(getattr(mc, "frozen", None)):
             raise NotImplementedError(
                 "nonzero frozen spinors are outside dense FIC v1"
             )
-        eris_basis = _ss._normalize_eris_basis(eris_basis)
+        eris_basis = _utils._normalize_eris_basis(eris_basis)
         if root is None:
             root = self.root
         root = int(root)
@@ -1183,7 +1157,7 @@ class WickX2CFICNEVPT2(lib.StreamObject):
         input_mo = np.asarray(mo_coeff)
         if contraction_backend is None:
             contraction_backend = self.contraction_backend
-        contraction_backend = _ss._normalize_contraction_backend(
+        contraction_backend = _utils._normalize_contraction_backend(
             contraction_backend
         )
         self.contraction_backend = contraction_backend
@@ -1204,18 +1178,18 @@ class WickX2CFICNEVPT2(lib.StreamObject):
                 _finite_nonnegative(getattr(self, name), name=name),
             )
 
-        self.reference_energy = _ss._reference_energy(mc, root)
+        self.reference_energy = _utils._reference_energy(mc, root)
 
         pdm_start = time.perf_counter()
         if pdms is None:
-            pdms = _ss.make_dm1234(mc.fcisolver, root=root)
+            pdms = _utils.make_dm1234(mc.fcisolver, root=root)
         nelec_source = getattr(mc.fcisolver, "nelecas", None)
         if nelec_source is None:
             nelec_source = mc.nelecas
-        pdms, self.rdm_diagnostics = _ss.validate_pdms(
+        pdms, self.rdm_diagnostics = _utils.validate_pdms(
             pdms,
             int(mc.ncas),
-            _ss._total_nelec(nelec_source),
+            _utils._total_nelec(nelec_source),
             atol=self.rdm_atol,
             rtol=self.rdm_rtol,
             work_memory=self.rdm_work_memory,
@@ -1227,7 +1201,7 @@ class WickX2CFICNEVPT2(lib.StreamObject):
             mc, input_mo, pdms[0], root
         )
         if eris is None:
-            prepared_eris = _ss._dense_eris_from_mc(
+            prepared_eris = _utils._dense_eris_from_mc(
                 mc,
                 semicanonical_mo,
                 roundoff_factor=self.integral_roundoff_factor,
@@ -1236,9 +1210,9 @@ class WickX2CFICNEVPT2(lib.StreamObject):
                 prepared_eris, "symmetry_diagnostics", None
             )
             if compact_eris:
-                prepared_eris = _ss._compact_wick_eris(prepared_eris)
+                prepared_eris = _utils._compact_wick_eris(prepared_eris)
         else:
-            if not isinstance(eris, _ss.spinor_helper._SpinorERIs):
+            if not isinstance(eris, spinor_helper._SpinorERIs):
                 raise TypeError(
                     "eris must be a spinor_helper._SpinorERIs instance"
                 )
@@ -1263,12 +1237,12 @@ class WickX2CFICNEVPT2(lib.StreamObject):
                     input_mo.T.conj() @ overlap @ semicanonical_mo
                 )
                 prepared_eris = (
-                    _ss._rotate_wick_eris(eris, rotation)
+                    _utils._rotate_wick_eris(eris, rotation)
                     if compact_eris
-                    else _ss._rotate_eris(eris, rotation)
+                    else _utils._rotate_eris(eris, rotation)
                 )
             elif compact_eris:
-                prepared_eris = _ss._compact_wick_eris(eris)
+                prepared_eris = _utils._compact_wick_eris(eris)
         integral_time = time.perf_counter() - integral_start
 
         self.mo_coeff = semicanonical_mo

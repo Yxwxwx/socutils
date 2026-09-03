@@ -39,6 +39,8 @@ from pyscf import lib
 from pyscf.lib import logger
 from scipy.linalg import eig, eigh
 
+from . import nevpt2_utils as _utils
+from . import spinor_helper
 from . import x2cscnevpt2 as _ss
 
 
@@ -104,7 +106,7 @@ def _retain_qd_row_arrays(subspace_arrays):
     """Detach only audited row tensors needed after diagonal preparation."""
 
     retained = {}
-    for key in _ss.SUBSPACE_ORDER:
+    for key in _utils.SUBSPACE_ORDER:
         arrays = subspace_arrays[key]
         retained[key] = {
             "norm": np.array(np.asarray(arrays["norm"]).real, copy=True),
@@ -127,358 +129,24 @@ def _nested_array_nbytes(values):
     )
 
 
-def adjoint_transition_pdm(dm):
-    """Return the reverse raw-SGF transition PDM.
-
-    For axes ``p1,...,pk,qk,...,q1`` the adjoint relation reverses all
-    ``2*k`` axes and complex conjugates the tensor.
-    """
-
-    density = np.asarray(dm)
-    if density.ndim == 0 or density.ndim % 2:
-        raise ValueError("a transition PDM must have a positive even rank")
-    axes = tuple(range(density.ndim - 1, -1, -1))
-    return density.transpose(axes).conj()
-
-
-def _transition_root_kets(dmrgci, bra_root, ket_root):
-    bra_driver, bra = _ss._root_ket(dmrgci, bra_root)
-    ket_driver, ket = _ss._root_ket(dmrgci, ket_root)
-    if bra_driver is not ket_driver:
-        raise RuntimeError("transition MPS roots do not share one Block2 driver")
-    return bra_driver, bra, ket
-
-
-def _make_transition_rdm(dmrgci, bra_root, ket_root, rank):
-    bra_root = int(bra_root)
-    ket_root = int(ket_root)
-    rank = int(rank)
-    if rank not in (1, 2, 3, 4):
-        raise ValueError("transition RDM rank must be between one and four")
-    if bra_root == ket_root:
-        return _ss._make_rdm(dmrgci, bra_root, rank)
-
-    driver, bra, ket = _transition_root_kets(dmrgci, bra_root, ket_root)
-    kwargs = {
-        "site_type": int(getattr(dmrgci, "npdm_site_type", 0)),
-        "cutoff": float(getattr(dmrgci, "npdm_cutoff", 1.0e-24)),
-    }
-    method = getattr(driver, f"get_trans_{rank}pdm", None)
-    if callable(method):
-        density = method(bra, ket, **kwargs)
-    else:
-        method = getattr(driver, "get_npdm", None)
-        if not callable(method):
-            raise RuntimeError(
-                f"the installed pyblock2 driver has no transition {rank}-RDM "
-                "interface"
-            )
-        # Installed block2 0.5.4rc16 signature:
-        # get_npdm(ket, pdm_type=1, bra=None, ..., site_type=0, cutoff=1e-24)
-        density = method(ket, pdm_type=rank, bra=bra, **kwargs)
-    density = np.asarray(density)
-    ncas = int(getattr(dmrgci, "ncas"))
-    expected_shape = (ncas,) * (2 * rank)
-    if density.shape != expected_shape:
-        raise ValueError(
-            f"Block2 transition ({bra_root},{ket_root}) {rank}-RDM has "
-            f"shape {density.shape}; expected raw SGF shape {expected_shape}"
-        )
-    if not np.issubdtype(density.dtype, np.number):
-        raise TypeError("Block2 returned a non-numeric transition PDM")
-    return np.asarray(density, dtype=np.complex128)
-
-
-def make_transition_rdm1(dmrgci, bra_root, ket_root):
-    """Return ``<bra|C[p]D[q]|ket>`` in raw SGF order."""
-
-    return _make_transition_rdm(dmrgci, bra_root, ket_root, 1)
-
-
-def make_transition_rdm2(dmrgci, bra_root, ket_root):
-    """Return the explicit raw SGF transition 2-particle RDM."""
-
-    return _make_transition_rdm(dmrgci, bra_root, ket_root, 2)
-
-
-def make_transition_rdm3(dmrgci, bra_root, ket_root):
-    """Return the explicit raw SGF transition 3-particle RDM."""
-
-    return _make_transition_rdm(dmrgci, bra_root, ket_root, 3)
-
-
-def make_transition_rdm4(dmrgci, bra_root, ket_root):
-    """Return the explicit, uncompressed transition 4-particle RDM."""
-
-    return _make_transition_rdm(dmrgci, bra_root, ket_root, 4)
-
-
-def make_transition_dm1234(dmrgci, bra_root, ket_root):
-    """Form raw transition 1--4 PDMs for one ordered MPS root pair."""
-
-    return tuple(
-        _make_transition_rdm(dmrgci, bra_root, ket_root, rank)
-        for rank in range(1, 5)
-    )
-
-
-def _make_transition_dm123(dmrgci, bra_root, ket_root):
-    """Form only the ranks required by Angeli Eq. (18) SC couplings."""
-
-    return tuple(
-        _make_transition_rdm(dmrgci, bra_root, ket_root, rank)
-        for rank in range(1, 4)
-    )
-
-
-def _transition_contraction_pdms(pdms):
-    """Normalize only production ranks 1--3 to the TBLIS complex ABI."""
-
-    if not isinstance(pdms, (tuple, list)) or len(pdms) < 3:
-        raise ValueError("transition contractions require RDM ranks 1--3")
-    return tuple(
-        np.asarray(density, dtype=np.complex128) for density in pdms[:3]
-    )
-
-
-def _complex_scalar(value, *, name):
-    array = np.asarray(value)
-    if array.size != 1 or not np.issubdtype(array.dtype, np.number):
-        raise TypeError(f"{name} must be one numeric scalar")
-    result = complex(array.reshape(()))
-    if not np.isfinite(result):
-        raise ValueError(f"{name} is not finite")
-    return result
-
-
-def _finite_nonnegative(value, *, name):
-    value = float(value)
-    if not np.isfinite(value) or value < 0.0:
-        raise ValueError(f"{name} must be finite and non-negative")
-    return value
-
-
-def _make_transition_overlap(dmrgci, bra_root, ket_root, *, dm1=None):
-    driver, bra, ket = _transition_root_kets(dmrgci, bra_root, ket_root)
-    get_identity = getattr(driver, "get_identity_mpo", None)
-    expectation = getattr(driver, "expectation", None)
-    if callable(get_identity) and callable(expectation):
-        identity = get_identity()
-        overlap = expectation(bra, identity, ket)
-        return _complex_scalar(overlap, name="model-state overlap"), "identity_mpo"
-
-    if dm1 is None:
-        dm1 = make_transition_rdm1(dmrgci, bra_root, ket_root)
-    nelecas = getattr(dmrgci, "nelecas", None)
-    if nelecas is None:
-        raise RuntimeError(
-            "cannot infer overlap from transition dm1 without active electron count"
-        )
-    nelec = _ss._total_nelec(nelecas)
-    if nelec == 0:
-        if int(bra_root) == int(ket_root):
-            return 1.0 + 0.0j, "zero_electron_identity"
-        raise RuntimeError("a zero-electron transition overlap needs identity MPO")
-    overlap = np.trace(np.asarray(dm1)) / nelec
-    return _complex_scalar(overlap, name="dm1-derived overlap"), "dm1_trace_fallback"
-
-
-def make_transition_overlap(dmrgci, bra_root, ket_root):
-    """Return ``<bra_root|ket_root>`` using the Block2 identity MPO."""
-
-    return _make_transition_overlap(dmrgci, bra_root, ket_root)[0]
-
-
-def _complex_pair(value):
-    value = complex(value)
-    return [float(value.real), float(value.imag)]
-
-
-def validate_transition_pdms(
-    pdms_ij,
-    ncas,
-    nelec,
-    *,
-    overlap_ij,
-    pdms_ji=None,
-    atol=1.0e-9,
-    rtol=1.0e-8,
-    work_memory=512 * 2**20,
-):
-    """Validate raw SGF transition ranks 1--3 or 1--4.
-
-    This deliberately does not normalize a possible rank-4 tensor's dtype:
-    doing so could create a hidden tens-of-GiB copy for larger active spaces.
-    The production contraction path slices to ranks 1--3 and converts those
-    arrays to complex128 explicitly at its backend boundary.
-
-    Finite relation residuals beyond tolerance emit
-    :class:`~mrpt.x2cscnevpt2.MRPTNumericalWarning` and are retained in the
-    diagnostics.  Invalid shapes, nonnumeric arrays, and non-finite values
-    remain hard errors.
-    """
-
-    if not isinstance(pdms_ij, (tuple, list)) or len(pdms_ij) not in (3, 4):
-        raise ValueError(
-            "pdms_ij must contain consecutive transition RDM ranks 1--3 "
-            "or 1--4"
-        )
-    if pdms_ji is not None and (
-        not isinstance(pdms_ji, (tuple, list))
-        or len(pdms_ji) != len(pdms_ij)
-    ):
-        raise ValueError("pdms_ji must contain the same ranks as pdms_ij")
-    ncas = int(ncas)
-    nelec = int(nelec)
-    work_memory = int(work_memory)
-    if work_memory <= 0:
-        raise ValueError("work_memory must be positive")
-    overlap_ij = _complex_scalar(overlap_ij, name="overlap_ij")
-
-    checked = []
-    reverse_checked = [] if pdms_ji is not None else None
-    diagnostics = {"overlap": _complex_pair(overlap_ij)}
-    for rank, density in enumerate(pdms_ij, start=1):
-        density = np.asarray(density)
-        expected_shape = (ncas,) * (2 * rank)
-        if density.shape != expected_shape:
-            raise ValueError(
-                f"transition dm{rank} must have shape {expected_shape}, "
-                f"got {density.shape}"
-            )
-        if not np.issubdtype(density.dtype, np.number):
-            raise TypeError(f"transition dm{rank} must be numeric")
-        if not _ss._all_finite_chunked(density, work_memory):
-            raise ValueError(f"transition dm{rank} contains non-finite values")
-
-        creator_error = 0.0
-        annihilator_error = 0.0
-        for axis in range(rank - 1):
-            creator_error = max(
-                creator_error,
-                _ss._maximum_abs_relation(
-                    density,
-                    density.swapaxes(axis, axis + 1),
-                    sign=1.0,
-                    work_memory=work_memory,
-                ),
-            )
-            annihilator_axis = rank + axis
-            annihilator_error = max(
-                annihilator_error,
-                _ss._maximum_abs_relation(
-                    density,
-                    density.swapaxes(
-                        annihilator_axis, annihilator_axis + 1
-                    ),
-                    sign=1.0,
-                    work_memory=work_memory,
-                ),
-            )
-        scale = max(1.0, _ss._maximum_abs_chunked(density, work_memory))
-        tolerance = atol + rtol * scale
-        symmetry_gate_passed = bool(
-            max(creator_error, annihilator_error) <= tolerance
-        )
-        if not symmetry_gate_passed:
-            _ss._warn_numerical(
-                f"transition dm{rank} violates raw SGF antisymmetry: "
-                f"creator={creator_error:.3e}, "
-                f"annihilator={annihilator_error:.3e}"
-            )
-        rank_diagnostics = {
-            "shape": list(density.shape),
-            "creator_antisymmetry_error": creator_error,
-            "annihilator_antisymmetry_error": annihilator_error,
-            "symmetry_tolerance": float(tolerance),
-            "symmetry_gate_passed": symmetry_gate_passed,
-        }
-
-        if pdms_ji is not None:
-            reverse = np.asarray(pdms_ji[rank - 1])
-            if reverse.shape != expected_shape:
-                raise ValueError(
-                    f"reverse transition dm{rank} has shape {reverse.shape}; "
-                    f"expected {expected_shape}"
-                )
-            if not np.issubdtype(reverse.dtype, np.number):
-                raise TypeError(f"reverse transition dm{rank} must be numeric")
-            if not _ss._all_finite_chunked(reverse, work_memory):
-                raise ValueError(
-                    f"reverse transition dm{rank} contains non-finite values"
-                )
-            axes = tuple(range(2 * rank - 1, -1, -1))
-            adjoint_error = _ss._maximum_abs_relation(
-                reverse,
-                density.transpose(axes),
-                sign=-1.0,
-                conjugate_right=True,
-                work_memory=work_memory,
-            )
-            reverse_scale = max(
-                scale, _ss._maximum_abs_chunked(reverse, work_memory)
-            )
-            adjoint_tolerance = atol + rtol * max(1.0, reverse_scale)
-            adjoint_gate_passed = bool(adjoint_error <= adjoint_tolerance)
-            if not adjoint_gate_passed:
-                _ss._warn_numerical(
-                    f"transition dm{rank} reverse-adjoint relation failed: "
-                    f"error={adjoint_error:.3e}"
-                )
-            rank_diagnostics["reverse_adjoint_error"] = adjoint_error
-            rank_diagnostics["reverse_adjoint_tolerance"] = float(
-                adjoint_tolerance
-            )
-            rank_diagnostics[
-                "reverse_adjoint_gate_passed"
-            ] = adjoint_gate_passed
-            reverse_checked.append(reverse)
-
-        diagnostics[f"dm{rank}"] = rank_diagnostics
-        checked.append(density)
-
-    trace = np.trace(checked[0])
-    trace_error = abs(trace - nelec * overlap_ij)
-    trace_tolerance = atol + rtol * max(1.0, nelec * abs(overlap_ij))
-    trace_gate_passed = bool(trace_error <= trace_tolerance)
-    if not trace_gate_passed:
-        _ss._warn_numerical(
-            "transition dm1 trace is inconsistent with electron number and "
-            f"overlap: error={trace_error:.3e}"
-        )
-    diagnostics["dm1"]["trace"] = _complex_pair(trace)
-    diagnostics["dm1"]["trace_error"] = float(trace_error)
-    diagnostics["dm1"]["trace_tolerance"] = float(trace_tolerance)
-    diagnostics["dm1"]["trace_gate_passed"] = trace_gate_passed
-
-    for rank in range(2, len(checked) + 1):
-        contracted = np.trace(
-            checked[rank - 1], axis1=rank - 1, axis2=rank
-        )
-        expected = (nelec - rank + 1) * checked[rank - 2]
-        error = _ss._maximum_abs_relation(
-            contracted,
-            expected,
-            sign=-1.0,
-            work_memory=work_memory,
-        )
-        scale = max(1.0, _ss._maximum_abs_chunked(expected, work_memory))
-        contraction_tolerance = atol + rtol * scale
-        contraction_gate_passed = bool(error <= contraction_tolerance)
-        if not contraction_gate_passed:
-            _ss._warn_numerical(
-                f"transition dm{rank}->dm{rank - 1} particle-number "
-                f"contraction failed: error={error:.3e}"
-            )
-        diagnostics[f"dm{rank}"]["contraction_error"] = error
-        diagnostics[f"dm{rank}"]["contraction_tolerance"] = float(
-            contraction_tolerance
-        )
-        diagnostics[f"dm{rank}"][
-            "contraction_gate_passed"
-        ] = contraction_gate_passed
-
-    return tuple(checked), diagnostics
+# Transition-density operations are method-independent and re-exported here
+# for compatibility with the original QD module API.
+adjoint_transition_pdm = _utils.adjoint_transition_pdm
+_transition_root_kets = _utils._transition_root_kets
+_make_transition_rdm = _utils._make_transition_rdm
+make_transition_rdm1 = _utils.make_transition_rdm1
+make_transition_rdm2 = _utils.make_transition_rdm2
+make_transition_rdm3 = _utils.make_transition_rdm3
+make_transition_rdm4 = _utils.make_transition_rdm4
+make_transition_dm1234 = _utils.make_transition_dm1234
+_make_transition_dm123 = _utils._make_transition_dm123
+_transition_contraction_pdms = _utils._transition_contraction_pdms
+_complex_scalar = _utils._complex_scalar
+_finite_nonnegative = _utils._finite_nonnegative
+_make_transition_overlap = _utils._make_transition_overlap
+make_transition_overlap = _utils.make_transition_overlap
+_complex_pair = _utils._complex_pair
+validate_transition_pdms = _utils.validate_transition_pdms
 
 
 def _evaluate_transition_perturber_couplings(
@@ -494,7 +162,7 @@ def _evaluate_transition_perturber_couplings(
     norm_tol=1.0e-14,
     zero_norm_atol=1.0e-10,
     zero_norm_rtol=1.0e-9,
-    contraction_backend=_ss._DEFAULT_CONTRACTION_BACKEND,
+    contraction_backend=_utils._DEFAULT_CONTRACTION_BACKEND,
     return_diagnostics=False,
 ):
     """Evaluate complex ``<I|T_I^dagger T_I|J>`` tensors for all classes."""
@@ -513,19 +181,19 @@ def _evaluate_transition_perturber_couplings(
             "discarded row perturbers require row_norm and partner_norm "
             "for a Cauchy-bound audit"
         )
-    contraction_backend = _ss._normalize_contraction_backend(
+    contraction_backend = _utils._normalize_contraction_backend(
         contraction_backend
     )
     transition_pdms = _transition_contraction_pdms(transition_pdms)
     if contraction_backend == "pytblis":
-        _ss._validate_tblis_operand_dtypes(
+        _utils._validate_tblis_operand_dtypes(
             [
                 (f"h{key}", eris_row.get_h1eff(key))
-                for key in _ss._H1_KEYS
+                for key in _utils._H1_KEYS
             ]
             + [
                 (f"w{key}", eris_row.get_phys(key))
-                for key in _ss._W_KEYS
+                for key in _utils._W_KEYS
             ]
             + [
                 (f"dm{rank}", density)
@@ -534,17 +202,17 @@ def _evaluate_transition_perturber_couplings(
         )
     overlap = _complex_scalar(overlap, name="transition overlap")
     equations = _ss._compile_wick_equations()
-    wick_globals = {"np": _ss._wick_einsum_namespace(contraction_backend)}
-    base_context = _ss._execution_context(
+    wick_globals = {"np": _utils._wick_einsum_namespace(contraction_backend)}
+    base_context = _utils._execution_context(
         eris_row, transition_pdms, overlap=overlap
     )
     couplings = {}
     diagnostics = {}
-    for key in _ss.SUBSPACE_ORDER:
-        shape = _ss._free_index_shape(key, eris_row)
+    for key in _utils.SUBSPACE_ORDER:
+        shape = _utils._free_index_shape(key, eris_row)
         integral_dtypes = tuple(
-            eris_row.get_h1eff(block).dtype for block in _ss._H1_KEYS
-        ) + tuple(eris_row.get_phys(block).dtype for block in _ss._W_KEYS)
+            eris_row.get_h1eff(block).dtype for block in _utils._H1_KEYS
+        ) + tuple(eris_row.get_phys(block).dtype for block in _utils._W_KEYS)
         dtype = np.result_type(
             np.complex128,
             *integral_dtypes,
@@ -558,7 +226,7 @@ def _evaluate_transition_perturber_couplings(
             wick_globals,
             local_context,
         )
-        ordered = _ss._strict_pair_mask(key, shape)
+        ordered = _utils._strict_pair_mask(key, shape)
         selected = coupling[ordered]
         if not np.all(np.isfinite(selected)):
             raise FloatingPointError(
@@ -711,7 +379,7 @@ def _validate_discarded_couplings_cauchy(
             f"{subspace}: Cauchy audit contains non-finite values"
         )
     if np.iscomplexobj(selected_row_norm):
-        selected_row_norm = _ss._require_real(
+        selected_row_norm = _utils._require_real(
             selected_row_norm,
             root=row_root,
             subspace=subspace,
@@ -720,7 +388,7 @@ def _validate_discarded_couplings_cauchy(
             rtol=rtol,
         )
     if np.iscomplexobj(selected_partner_norm):
-        selected_partner_norm = _ss._require_real(
+        selected_partner_norm = _utils._require_real(
             selected_partner_norm,
             root=column_root,
             subspace=subspace,
@@ -733,7 +401,7 @@ def _validate_discarded_couplings_cauchy(
     minimum_row = float(np.min(selected_row_norm))
     minimum_partner = float(np.min(selected_partner_norm))
     if minimum_row < -norm_tol or minimum_partner < -norm_tol:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             f"row root {row_root}, column root {column_root}, subspace "
             f"{subspace}: negative diagonal norm in Cauchy audit "
             f"(row={minimum_row:.3e}, partner={minimum_partner:.3e})"
@@ -777,7 +445,7 @@ def _validate_discarded_couplings_cauchy(
     excess_index = full_index(excess_local)
     maximum_acceptance_excess = float(acceptance_excess[excess_local])
     if maximum_acceptance_excess > 0.0:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             f"row root {row_root}, column root {column_root}, subspace "
             f"{subspace}: discarded near-null perturber violates its Cauchy "
             f"bound at {tuple(excess_index)}: |B|={magnitude[excess_local]:.3e}, "
@@ -836,7 +504,7 @@ def _evaluate_row_basis_partner_norms(
     scalar_atol=1.0e-10,
     scalar_rtol=1.0e-9,
     norm_tol=1.0e-14,
-    contraction_backend=_ss._DEFAULT_CONTRACTION_BACKEND,
+    contraction_backend=_utils._DEFAULT_CONTRACTION_BACKEND,
     return_diagnostics=False,
 ):
     """Evaluate ``<J|T_I^dagger T_I|J>`` in the row-I orbital basis."""
@@ -854,10 +522,10 @@ def _evaluate_row_basis_partner_norms(
     )
     norms = {}
     diagnostics = {}
-    for key in _ss.SUBSPACE_ORDER:
+    for key in _utils.SUBSPACE_ORDER:
         raw = raw_norms[key]
-        ordered = _ss._strict_pair_mask(key, raw.shape)
-        selected = _ss._require_real(
+        ordered = _utils._strict_pair_mask(key, raw.shape)
+        selected = _utils._require_real(
             raw[ordered],
             root=partner_root,
             subspace=key,
@@ -867,7 +535,7 @@ def _evaluate_row_basis_partner_norms(
         )
         if np.any(selected < -norm_tol):
             minimum = float(np.min(selected))
-            _ss._warn_numerical(
+            _utils._warn_numerical(
                 f"row root {row_root}, partner root {partner_root}, subspace "
                 f"{key}: negative row-basis partner norm {minimum:.3e}"
             )
@@ -1009,7 +677,7 @@ def _injected_model_overlap(model_overlap, roots, *, atol, rtol):
                 if direct is not None and reverse is not None:
                     limit = atol + rtol * max(1.0, abs(direct), abs(reverse))
                     if abs(direct - reverse.conjugate()) > limit:
-                        _ss._warn_numerical(
+                        _utils._warn_numerical(
                             "injected forward/reverse model overlaps are not "
                             f"adjoints for roots ({root_i}, {root_j})"
                         )
@@ -1034,7 +702,7 @@ def _injected_model_overlap(model_overlap, roots, *, atol, rtol):
         np.max(np.abs(matrix - matrix.conj().T), initial=0.0)
     )
     if adjoint_error > limit:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             "injected model_overlap is not Hermitian: maximum error="
             f"{adjoint_error:.3e}"
         )
@@ -1042,7 +710,7 @@ def _injected_model_overlap(model_overlap, roots, *, atol, rtol):
         np.max(np.abs(matrix - np.eye(nmodel)), initial=0.0)
     )
     if identity_error > atol + rtol:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             "injected model states are not orthonormal: maximum overlap "
             f"error={identity_error:.3e}"
         )
@@ -1121,10 +789,10 @@ def _build_van_vleck_matrices(
     if not isinstance(h2_bloch_by_subspace, Mapping):
         raise TypeError("h2_bloch_by_subspace must be a mapping")
     missing = [
-        key for key in _ss.SUBSPACE_ORDER if key not in h2_bloch_by_subspace
+        key for key in _utils.SUBSPACE_ORDER if key not in h2_bloch_by_subspace
     ]
     extras = [
-        key for key in h2_bloch_by_subspace if key not in _ss.SUBSPACE_ORDER
+        key for key in h2_bloch_by_subspace if key not in _utils.SUBSPACE_ORDER
     ]
     if missing or extras:
         raise ValueError(
@@ -1149,7 +817,7 @@ def _build_van_vleck_matrices(
         np.max(np.abs(np.asarray(reference_energies).imag), initial=0.0)
     )
     if reference_imaginary > audit_tol:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             "reference energies have a material imaginary component: "
             f"{reference_imaginary:.3e}"
         )
@@ -1159,7 +827,7 @@ def _build_van_vleck_matrices(
     maximum_bloch_diagonal_imaginary = 0.0
     maximum_subspace_diagonal_change = 0.0
     subspace_diagnostics = {}
-    for key in _ss.SUBSPACE_ORDER:
+    for key in _utils.SUBSPACE_ORDER:
         h2_bloch_key = _square_numeric_matrix(
             h2_bloch_by_subspace[key],
             name=f"h2_bloch_by_subspace[{key!r}]",
@@ -1197,18 +865,18 @@ def _build_van_vleck_matrices(
         h2_van_vleck_by_subspace[key] = h2_van_vleck_key
 
     if maximum_bloch_diagonal_imaginary > audit_tol:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             "Bloch subspace diagonal has a material imaginary component: "
             f"{maximum_bloch_diagonal_imaginary:.3e}"
         )
     if maximum_subspace_diagonal_change > audit_tol:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             "Van Vleck subspace Hermitianization changed a diagonal: "
             f"{maximum_subspace_diagonal_change:.3e}"
         )
 
     h2_van_vleck = np.zeros((nmodel, nmodel), dtype=np.complex128)
-    for key in _ss.SUBSPACE_ORDER:
+    for key in _utils.SUBSPACE_ORDER:
         h2_van_vleck += h2_van_vleck_by_subspace[key]
     reference_matrix = np.diag(reference_energies.astype(np.complex128))
     h_eff_van_vleck = reference_matrix + h2_van_vleck
@@ -1239,17 +907,17 @@ def _build_van_vleck_matrices(
         )
     )
     if subspace_sum_error > audit_tol:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             "classwise Van Vleck sum disagrees with the global H2 formula: "
             f"{subspace_sum_error:.3e}"
         )
     if global_formula_error > audit_tol:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             "Van Vleck effective Hamiltonian disagrees with Eq. (46): "
             f"{global_formula_error:.3e}"
         )
     if maximum_diagonal_change > audit_tol:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             "Van Vleck Hermitianization changed an effective-Hamiltonian "
             f"diagonal: {maximum_diagonal_change:.3e}"
         )
@@ -1259,7 +927,7 @@ def _build_van_vleck_matrices(
         h_eff_van_vleck
     )
     if van_vleck_nonhermiticity["maximum"] > audit_tol:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             "constructed Van Vleck effective Hamiltonian is not Hermitian: "
             f"{van_vleck_nonhermiticity['maximum']:.3e}"
         )
@@ -1362,7 +1030,7 @@ def _solve_van_vleck_eigensystem(
     matrix = _square_numeric_matrix(matrix, name="h_eff_van_vleck")
     nonhermiticity = _nonhermiticity_diagnostics(matrix)
     if nonhermiticity["maximum"] > hermiticity_tol:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             "Van Vleck matrix failed the pre-eigh Hermiticity check: "
             f"{nonhermiticity['maximum']:.3e}"
         )
@@ -1403,11 +1071,11 @@ def _solve_van_vleck_eigensystem(
         "biorthogonality": gram,
     }
     if relative_residual_norm > residual_tol:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             "Hermitian Van Vleck eigensolver residual exceeds tolerance"
         )
     if orthonormality_error > residual_tol:
-        _ss._warn_numerical(
+        _utils._warn_numerical(
             "Hermitian Van Vleck eigenvectors are not orthonormal within "
             "tolerance"
         )
@@ -1424,7 +1092,7 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
     """
 
     def __init__(self, mc, frozen=0, qd_type="van_vleck"):
-        if _ss._has_frozen_orbitals(frozen) or _ss._has_frozen_orbitals(
+        if _utils._has_frozen_orbitals(frozen) or _utils._has_frozen_orbitals(
             getattr(mc, "frozen", None)
         ):
             raise NotImplementedError("nonzero frozen spinors are outside dense v1")
@@ -1437,7 +1105,7 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
         self.mo_energy = None
         self.canonicalized = False
         self.denominator_mode = "strict_si"
-        self.contraction_backend = _ss._DEFAULT_CONTRACTION_BACKEND
+        self.contraction_backend = _utils._DEFAULT_CONTRACTION_BACKEND
         for name, value in _ss._SC_NUMERICAL_DEFAULTS:
             setattr(self, name, value)
         self.model_overlap_atol = 1.0e-8
@@ -1579,9 +1247,9 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
         self.qd_type = qd_type
         if mc is None:
             mc = self._mc
-        if _ss._has_frozen_orbitals(getattr(mc, "frozen", None)):
+        if _utils._has_frozen_orbitals(getattr(mc, "frozen", None)):
             raise NotImplementedError("nonzero frozen spinors are outside dense v1")
-        eris_basis = _ss._normalize_eris_basis(eris_basis)
+        eris_basis = _utils._normalize_eris_basis(eris_basis)
         if denominator_mode is None:
             denominator_mode = self.denominator_mode
         if denominator_mode != "strict_si":
@@ -1591,7 +1259,7 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
         self.denominator_mode = "strict_si"
         if contraction_backend is None:
             contraction_backend = self.contraction_backend
-        self.contraction_backend = _ss._normalize_contraction_backend(
+        self.contraction_backend = _utils._normalize_contraction_backend(
             contraction_backend
         )
         for name in (
@@ -1643,12 +1311,12 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
         nelec_source = getattr(mc.fcisolver, "nelecas", None)
         if nelec_source is None:
             nelec_source = mc.nelecas
-        nelec = _ss._total_nelec(nelec_source)
+        nelec = _utils._total_nelec(nelec_source)
 
         nmodel = len(roots)
         h2_by_subspace = {
             key: np.zeros((nmodel, nmodel), dtype=complex)
-            for key in _ss.SUBSPACE_ORDER
+            for key in _utils.SUBSPACE_ORDER
         }
         reference_energies = np.empty(nmodel, dtype=float)
         row_data = {}
@@ -1659,7 +1327,7 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
         shared_eris_time = 0.0
         if eris is None:
             shared_start = time.perf_counter()
-            shared_input_eris = _ss._dense_eris_from_mc(
+            shared_input_eris = _utils._dense_eris_from_mc(
                 mc,
                 input_mo,
                 roundoff_factor=self.integral_roundoff_factor,
@@ -1669,7 +1337,7 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
             shared_eris_generated = True
         shared_eris_bytes = (
             shared_input_eris.nbytes
-            if isinstance(shared_input_eris, _ss.spinor_helper._SpinorERIs)
+            if isinstance(shared_input_eris, spinor_helper._SpinorERIs)
             else None
         )
         for irow, root in enumerate(roots):
@@ -1692,8 +1360,8 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
             if row.subspace_arrays is None:
                 raise RuntimeError("QD row preparation omitted subspace arrays")
             compact_eris = row.eris
-            if not isinstance(compact_eris, _ss._WickERIBlocks):
-                compact_eris = _ss._compact_wick_eris(compact_eris)
+            if not isinstance(compact_eris, _utils._WickERIBlocks):
+                compact_eris = _utils._compact_wick_eris(compact_eris)
             retained_arrays = _retain_qd_row_arrays(row.subspace_arrays)
             row = replace(
                 row,
@@ -1702,12 +1370,12 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
             )
             source_eris_nbytes = (
                 eris_root.nbytes
-                if isinstance(eris_root, _ss.spinor_helper._SpinorERIs)
+                if isinstance(eris_root, spinor_helper._SpinorERIs)
                 else None
             )
             row_data[root] = row
             reference_energies[irow] = row.reference_energy
-            for key in _ss.SUBSPACE_ORDER:
+            for key in _utils.SUBSPACE_ORDER:
                 h2_by_subspace[key][irow, irow] = row.subspace_energies[key]
             row_diagnostics[str(root)] = {
                 "preparation_time": time.perf_counter() - row_start,
@@ -1725,7 +1393,7 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
                 "subspace_energies": dict(row.subspace_energies),
                 "subspace_gaps": {
                     key: list(row.subspace_gaps[key])
-                    for key in _ss.SUBSPACE_ORDER
+                    for key in _utils.SUBSPACE_ORDER
                 },
             }
             logger.note(
@@ -1806,11 +1474,11 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
                 )
             masks_i = {
                 key: row_i.subspace_arrays[key]["nonzero"]
-                for key in _ss.SUBSPACE_ORDER
+                for key in _utils.SUBSPACE_ORDER
             }
             norms_i = {
                 key: row_i.subspace_arrays[key]["norm"]
-                for key in _ss.SUBSPACE_ORDER
+                for key in _utils.SUBSPACE_ORDER
             }
             for jcol in range(irow + 1, nmodel):
                 root_j = roots[jcol]
@@ -1834,7 +1502,7 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
                 if overlap_ij is not None:
                     overlap_limit = self.model_overlap_atol + self.model_overlap_rtol
                     if abs(overlap_ij) > overlap_limit:
-                        _ss._warn_numerical(
+                        _utils._warn_numerical(
                             f"model roots {root_i} and {root_j} are not "
                             f"orthogonal: |overlap|={abs(overlap_ij):.3e}"
                         )
@@ -1858,7 +1526,7 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
                     )
                     overlap_limit = self.model_overlap_atol + self.model_overlap_rtol
                     if abs(overlap_ij) > overlap_limit:
-                        _ss._warn_numerical(
+                        _utils._warn_numerical(
                             f"model roots {root_i} and {root_j} are not "
                             f"orthogonal: |overlap|={abs(overlap_ij):.3e}"
                         )
@@ -1941,11 +1609,11 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
                 )
                 masks_j = {
                     key: row_j.subspace_arrays[key]["nonzero"]
-                    for key in _ss.SUBSPACE_ORDER
+                    for key in _utils.SUBSPACE_ORDER
                 }
                 norms_j = {
                     key: row_j.subspace_arrays[key]["norm"]
-                    for key in _ss.SUBSPACE_ORDER
+                    for key in _utils.SUBSPACE_ORDER
                 }
                 partner_norms_ji, partner_norm_diagnostics_ji = (
                     _evaluate_row_basis_partner_norms(
@@ -1979,7 +1647,7 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
                 )
                 class_corrections_ij = {}
                 class_corrections_ji = {}
-                for key in _ss.SUBSPACE_ORDER:
+                for key in _utils.SUBSPACE_ORDER:
                     denominator_i = row_i.subspace_arrays[key]["denominator"]
                     denominator_j = row_j.subspace_arrays[key]["denominator"]
                     value_ij = -np.sum(
@@ -2029,7 +1697,7 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
         )
         overlap_limit = self.model_overlap_atol + self.model_overlap_rtol
         if overlap_error > overlap_limit:
-            _ss._warn_numerical(
+            _utils._warn_numerical(
                 "model-state overlap is not the identity within tolerance: "
                 f"maximum error={overlap_error:.3e}"
             )
@@ -2039,13 +1707,13 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
             )
         )
         if overlap_adjoint_error > overlap_limit:
-            _ss._warn_numerical(
+            _utils._warn_numerical(
                 "model-state overlap is not Hermitian: maximum error="
                 f"{overlap_adjoint_error:.3e}"
             )
 
         h2_bloch = np.zeros((nmodel, nmodel), dtype=complex)
-        for key in _ss.SUBSPACE_ORDER:
+        for key in _utils.SUBSPACE_ORDER:
             h2_bloch += h2_by_subspace[key]
         h_eff_bloch = np.diag(reference_energies.astype(complex)) + h2_bloch
         h2_bloch_by_subspace = h2_by_subspace
@@ -2063,7 +1731,7 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
         diagonal_reduction_error = 0.0
         for irow, root in enumerate(roots):
             row = row_data[root]
-            for key in _ss.SUBSPACE_ORDER:
+            for key in _utils.SUBSPACE_ORDER:
                 diagonal_reduction_error = max(
                     diagonal_reduction_error,
                     abs(
@@ -2102,7 +1770,7 @@ class WickX2CQDSCNEVPT2(lib.StreamObject):
                 maximum_relative_residual <= self.eigen_residual_tol
             )
             if not eig_diagnostics["residual_gate_passed"]:
-                _ss._warn_numerical(
+                _utils._warn_numerical(
                     "general Bloch eigensolver residual exceeds tolerance"
                 )
             maximum_eigen_imag = eig_diagnostics[
