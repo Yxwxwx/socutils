@@ -98,12 +98,8 @@ import numpy as np
 from pyscf import lib
 from pyscf.lib import logger
 
-try:
-    from . import nevpt2_utils as _utils
-    from . import spinor_helper
-except ImportError:  # pragma: no cover - permits running a repository snapshot
-    import nevpt2_utils as _utils
-    import spinor_helper
+from . import nevpt2_utils as _utils
+from . import spinor_helper
 
 
 __all__ = [

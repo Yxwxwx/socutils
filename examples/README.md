@@ -26,6 +26,7 @@ They use the canonical `.x2camf()` / `.x2cmp()` driver API.
 | `20-h2o_scalar_sc_spatial.py` | minimal H2O scalar SC regression with alpha/beta partners contracted spatially |
 | `21-h2o_scalar_sc_spinor.py` | minimal H2O scalar SC calculation with independent spinor channels |
 | `22-h2o_scalar_fic.py` | minimal H2O scalar FIC regression without strong-contraction grouping |
+| `23-h2o_scalar_tmps_nevpt2.py` | minimal H2O CAS(8e,6o) fully uncontracted t-MPS-NEVPT2 input (12 explicit spinors; exact small-sector overlap batching) |
 
 The `fci/` subfolder has examples for the spinor CI module (`socutils.fci`):
 
@@ -39,5 +40,5 @@ The `fci/` subfolder has examples for the spinor CI module (`socutils.fci`):
 
 Most examples need the optional `x2camf` package for the spin-orbit integrals;
 the Kramers-restricted SCF examples additionally need `zquatev`, and the
-DMRG-SCF, SC-NEVPT2, and QD-SC-NEVPT2 examples need Block2. See the
+DMRG-SCF and all NEVPT2 examples need Block2. See the
 [installation guide](https://xubwa.github.io/socutils/install.html).

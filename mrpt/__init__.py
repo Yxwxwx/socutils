@@ -34,6 +34,33 @@ from .x2cficnevpt2 import (
     X2CICNEVPT2,
     X2CPCNEVPT2,
 )
+from .x2ccaspt2 import (
+    CASPT2IPEAWarning,
+    CASPT2IntruderError,
+    CASPT2Matrices,
+    CASPT2NumericalError,
+    CASPT2Result,
+    WickX2CCASPT2,
+    X2CCASPT2,
+    build_caspt2_matrices,
+    build_generalized_fock,
+    build_ipea_matrix,
+    caspt2_from_integrals,
+    solve_caspt2,
+)
+from .x2cicmrcisd import (
+    WickX2CICMRCISD,
+    X2CICMRCISD,
+)
+from .x2cicmrrept2 import (
+    WickX2CICMRREPT2,
+    X2CICMRREPT2,
+)
+from .x2ctnevpt2 import (
+    TMPSNEVPT2,
+    X2CTMPSNEVPT2,
+    X2CTNEVPT2,
+)
 from .x2cqdscnevpt2 import (
     QDBlochSCNEVPT2Result,
     QDSCNEVPT2Result,
@@ -70,6 +97,25 @@ __all__ = [
     "X2CICNEVPT2",
     "WickX2CPCNEVPT2",
     "X2CPCNEVPT2",
+    "CASPT2IPEAWarning",
+    "CASPT2IntruderError",
+    "CASPT2Matrices",
+    "CASPT2NumericalError",
+    "CASPT2Result",
+    "WickX2CCASPT2",
+    "X2CCASPT2",
+    "build_caspt2_matrices",
+    "build_generalized_fock",
+    "build_ipea_matrix",
+    "caspt2_from_integrals",
+    "solve_caspt2",
+    "WickX2CICMRCISD",
+    "X2CICMRCISD",
+    "WickX2CICMRREPT2",
+    "X2CICMRREPT2",
+    "X2CTMPSNEVPT2",
+    "X2CTNEVPT2",
+    "TMPSNEVPT2",
     "QDSCNEVPT2Result",
     "QDBlochSCNEVPT2Result",
     "WickX2CQDSCNEVPT2",
