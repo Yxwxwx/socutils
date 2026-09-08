@@ -46,8 +46,9 @@ variance and rejects a materially nonstationary reference.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, wraps
 import gc
 import itertools
 import math
@@ -295,7 +296,19 @@ def _expression_integral_blocks(expression, types):
     return h1, eri
 
 
+def _preserve_omp_threads(function):
+    """Keep Block2 Wick's global-thread activation local to compilation."""
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with lib.with_omp_threads(lib.num_threads()):
+            return function(*args, **kwargs)
+
+    return wrapped
+
+
 @lru_cache(maxsize=1)
+@_preserve_omp_threads
 def _compile_equations() -> _EquationBundle:
     """Generate the complete complex-spinor FIC-MRCISD Wick system."""
 
@@ -521,6 +534,34 @@ def _index_space_from_type(index_type, types) -> str:
         raise RuntimeError(f"unsupported Wick orbital-index type {index_type}") from error
 
 
+@contextmanager
+def _tblis_thread_limit(threads=None):
+    """Explicit, restoring TBLIS-only control for serial validation drivers.
+
+    Does not change BLAS/OpenMP settings or any numerical threshold. Like
+    pytblis itself, this process-wide setting must not be switched concurrently
+    by multiple Python threads. None preserves the caller's current setting.
+    """
+
+    if threads is None:
+        yield
+        return
+    if (
+        isinstance(threads, bool)
+        or not isinstance(threads, (int, np.integer))
+        or threads <= 0
+    ):
+        raise ValueError("TBLIS thread count must be a positive integer")
+    import pytblis
+
+    previous = pytblis.get_num_threads()
+    pytblis.set_num_threads(int(threads))
+    try:
+        yield
+    finally:
+        pytblis.set_num_threads(previous)
+
+
 class _ExpressionEvaluator:
     """Evaluate lowered Wick expressions with fixed nonactive indices.
 
@@ -562,6 +603,16 @@ class _ExpressionEvaluator:
             for density in input_pdms
         )
         self._operand_cache: dict[tuple[str, str], np.ndarray] = {}
+        # Plans belong to this input/evaluator, not the global Wick cache:
+        # their operands are views of this calculation's integrals and RDMs.
+        self._expression_plans = {}
+        self.evaluation_diagnostics = {
+            "expression_plans": 0,
+            "expression_calls": 0,
+            "terms_visited": 0,
+            "exact_zero_terms": 0,
+            "einsum_calls": 0,
+        }
 
     def _coerce(self, value) -> np.ndarray:
         value = np.asarray(value)
@@ -630,24 +681,19 @@ class _ExpressionEvaluator:
             return self._operand_cache[cache_key]
         raise RuntimeError(f"unsupported lowered Wick tensor {tensor!r}")
 
-    def evaluate(
-        self,
-        expression,
-        output_labels: Sequence[str],
-        fixed_indices: dict[str, int],
-    ) -> np.ndarray:
-        """Evaluate one expression after fixing every core/virtual free index."""
+    def _prepare_expression(self, expression, output_labels, fixed_labels):
+        """Parse immutable Wick metadata once for all external-index values.
 
-        output_labels = tuple(output_labels)
-        if len(output_labels) != len(set(output_labels)):
-            raise ValueError("Wick output labels must be unique")
-        if any(_INDEX_SPACE[label] != "A" for label in output_labels):
-            raise ValueError(
-                "all remaining block-local Wick outputs must be active indices"
-            )
-        target_shape = tuple(int(self.eris.ncas) for _ in output_labels)
-        result = np.zeros(target_shape, dtype=self.dtype)
+        No numerical contraction or spin selection is done here. In particular,
+        a plan may be reused for *different* external tuples, but its numerical
+        result is never cached. Keep the expression alive to make its id safe.
+        """
 
+        key = (id(expression), output_labels, fixed_labels)
+        cached = self._expression_plans.get(key)
+        if cached is not None:
+            return cached[1]
+        plans = []
         for term in expression.terms:
             raw_factor = complex(term.factor)
             if self.strictly_real:
@@ -658,7 +704,8 @@ class _ExpressionEvaluator:
                 factor = float(raw_factor.real)
             else:
                 factor = raw_factor
-            operands = []
+            scalar_specs = []
+            operand_specs = []
             subscripts = []
             carried_labels = set()
             for tensor in term.tensors:
@@ -667,42 +714,94 @@ class _ExpressionEvaluator:
                 remaining = []
                 for index in tensor.indices:
                     label = index.name
-                    if label in fixed_indices:
-                        fixed = int(fixed_indices[label])
-                        dimension = _label_dimension(label, self.eris)
-                        if not 0 <= fixed < dimension:
-                            raise IndexError(
-                                f"fixed Wick index {label}={fixed} is out of range"
-                            )
-                        indexer.append(fixed)
+                    if label in fixed_labels:
+                        indexer.append(label)
                     else:
                         indexer.append(slice(None))
                         remaining.append(label)
                         carried_labels.add(label)
-                if indexer:
-                    value = value[tuple(indexer)]
                 if not remaining:
-                    factor *= np.asarray(value).item()
-                    continue
-                operands.append(value)
-                subscripts.append("".join(remaining))
-
+                    scalar_specs.append((value, tuple(indexer)))
+                else:
+                    # An unsliced active-only operand is shared by every
+                    # external tuple; avoid making even a new view of it.
+                    sliced = any(
+                        isinstance(item, str) for item in indexer
+                    )
+                    operand_specs.append((value, tuple(indexer) if sliced else ()))
+                    subscripts.append("".join(remaining))
             present_output = tuple(
                 label for label in output_labels if label in carried_labels
             )
+            equation = ",".join(subscripts) + "->" + "".join(present_output)
+            broadcast_shape = tuple(
+                int(self.eris.ncas) if label in present_output else 1
+                for label in output_labels
+            )
+            plans.append(
+                (factor, scalar_specs, operand_specs, equation, broadcast_shape)
+            )
+        self._expression_plans[key] = (expression, plans)
+        self.evaluation_diagnostics["expression_plans"] += 1
+        return plans
+
+    def evaluate(
+        self,
+        expression,
+        output_labels: Sequence[str],
+        fixed_indices: dict[str, int],
+    ) -> np.ndarray:
+        """Evaluate fixed-external blocks with exact scalar-zero screening.
+
+        Fixed Kronecker deltas and scalar integral coefficients are evaluated
+        before the active contractions. Only exact zero is screened; no energy,
+        integral, RDM or matrix-element threshold is introduced.
+        """
+
+        output_labels = tuple(output_labels)
+        if len(output_labels) != len(set(output_labels)):
+            raise ValueError("Wick output labels must be unique")
+        if any(_INDEX_SPACE[label] != "A" for label in output_labels):
+            raise ValueError(
+                "all remaining block-local Wick outputs must be active indices"
+            )
+        fixed_indices = {
+            label: int(value) for label, value in fixed_indices.items()
+        }
+        for label, fixed in fixed_indices.items():
+            if not 0 <= fixed < _label_dimension(label, self.eris):
+                raise IndexError(f"fixed Wick index {label}={fixed} is out of range")
+        plans = self._prepare_expression(
+            expression, output_labels, tuple(sorted(fixed_indices))
+        )
+        target_shape = (int(self.eris.ncas),) * len(output_labels)
+        result = np.zeros(target_shape, dtype=self.dtype)
+        counts = self.evaluation_diagnostics
+        counts["expression_calls"] += 1
+        counts["terms_visited"] += len(plans)
+        for factor, scalar_specs, operand_specs, equation, broadcast_shape in plans:
+            for operand, indices in scalar_specs:
+                if factor == 0:
+                    break
+                indexer = tuple(fixed_indices[label] for label in indices)
+                factor *= operand[indexer].item()
+            if factor == 0:
+                counts["exact_zero_terms"] += 1
+                continue
+            operands = [
+                operand[tuple(
+                    fixed_indices[item] if isinstance(item, str) else item
+                    for item in indices
+                )] if indices else operand
+                for operand, indices in operand_specs
+            ]
             if operands:
-                equation = ",".join(subscripts) + "->" + "".join(
-                    present_output
-                )
+                counts["einsum_calls"] += 1
                 value = self.einsum(equation, *operands, optimize=True)
             else:
                 value = np.asarray(1.0, dtype=self.dtype)
             value = factor * np.asarray(value)
             if output_labels:
-                broadcast_shape = tuple(
-                    int(self.eris.ncas) if label in present_output else 1
-                    for label in output_labels
-                )
                 value = np.asarray(value).reshape(broadcast_shape)
                 value = np.broadcast_to(value, target_shape)
             result += value
@@ -1773,27 +1872,7 @@ class WickX2CICMRCISD(lib.StreamObject):
         self.mo_coeff = getattr(mc, "mo_coeff", None)
         self.eris = None
         self.eris_basis = None
-        self.reference_energy = None
-        self.e_states = None
-        self.e_corr_states = None
-        self.ci = None
-        self.ci_orth = None
-        self.reference_weights = None
-        self.selected_state = None
-        self.state_indices = None
-        self.e_corr = None
-        self.de_dav_q_states = None
-        self.e_states_q = None
-        self.de_dav_q = None
-        self.sector_diagnostics = {}
-        self.matrix_diagnostics = {}
-        self.rdm_diagnostics = None
-        self.integral_symmetry_diagnostics = None
-        self.sub_times = {}
-        self.raw_metric = None
-        self.raw_shifted_hamiltonian = None
-        self.orthogonal_shifted_hamiltonian = None
-        self.basis_layouts = None
+        self._clear_results()
         self._keys = set(self.__dict__)
 
     def run(self, *args, **kwargs):
@@ -2024,6 +2103,8 @@ class WickX2CICMRCISD(lib.StreamObject):
             eris_basis=eris_basis,
         )
         self.sub_times["inputs"] = time.perf_counter() - input_start
+        logger.info(self, "native MRCISD inputs ready in %.3f s",
+                    self.sub_times["inputs"])
         self.mo_coeff = mo_coeff
         self.eris = prepared_eris
         self.eris_basis = "input_mo"
@@ -2036,6 +2117,8 @@ class WickX2CICMRCISD(lib.StreamObject):
         equation_start = time.perf_counter()
         equations = _compile_equations()
         self.sub_times["equations"] = time.perf_counter() - equation_start
+        logger.info(self, "native MRCISD Wick equations ready in %.3f s",
+                    self.sub_times["equations"])
         if equations.maximum_rdm_rank > 4:
             raise RuntimeError("generated MRCISD equations require >4-RDM")
         if self.contraction_backend == "pytblis":
@@ -2118,6 +2201,9 @@ class WickX2CICMRCISD(lib.StreamObject):
             )
 
         matrix_start = time.perf_counter()
+        logger.info(self, "native MRCISD assembling Hamiltonian: "
+                    "raw=%d retained=%d blocks=%d dtype=%s",
+                    raw_dimension, orth_dimension, len(blocks), evaluator.dtype.name)
         h_orth_raw, raw_h, assembly_diagnostics = (
             _assemble_shifted_hamiltonian(
                 evaluator,
@@ -2162,6 +2248,9 @@ class WickX2CICMRCISD(lib.StreamObject):
             self.raw_shifted_hamiltonian = raw_h
 
         diagonal_start = time.perf_counter()
+        logger.info(self, "native MRCISD Hamiltonian ready in %.3f s; "
+                    "starting full eigensolve",
+                    self.sub_times["hamiltonian"])
         eigenvalues, eigenvectors = linalg.eigh(
             h_orth,
             check_finite=False,
@@ -2300,6 +2389,7 @@ class WickX2CICMRCISD(lib.StreamObject):
             "reference_stationarity": reference_audit,
             "memory": memory,
             "assembly": assembly_diagnostics,
+            "contractions": dict(evaluator.evaluation_diagnostics),
             "raw_orthogonal_hamiltonian_hermiticity_error": (
                 raw_hermiticity_error
             ),

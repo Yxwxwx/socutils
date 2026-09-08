@@ -204,6 +204,7 @@ def dump_fink_h0_terms(filename: str | None = None) -> str:
 
 
 @lru_cache(maxsize=1)
+@_mrci._preserve_omp_threads
 def _compile_equations() -> _EquationBundle:
     """Generate S, left/right Fink A, and H/H0/V source equations."""
 
@@ -906,6 +907,7 @@ def _solve_class(
     raw_dimension = int(layout.raw_dimension)
     orthogonal_dimension = int(local_rank * free_count)
     x = metric.orthogonalizer
+    assembly_started = time.perf_counter()
 
     right_orth = np.zeros(
         (orthogonal_dimension, orthogonal_dimension), dtype=evaluator.dtype
@@ -1013,6 +1015,7 @@ def _solve_class(
                     right_raw[raw_ket, raw_bra] = raw_left.conj().T
                     left_raw[raw_ket, raw_bra] = raw_right.conj().T
 
+    assembly_seconds = time.perf_counter() - assembly_started
     source_norm = float(np.linalg.norm(source_h_raw))
     source_tolerance = _source_threshold(
         source_norm,
@@ -1113,6 +1116,7 @@ def _solve_class(
         fink_matrix - fink_matrix.conj().T
     )
 
+    response_started = time.perf_counter()
     energy, amplitudes_orth, response_diagnostics = (
         _solve_orthogonal_response(
             fink_matrix,
@@ -1127,6 +1131,7 @@ def _solve_class(
         )
     )
 
+    response_seconds = time.perf_counter() - response_started
     amplitudes_raw = np.zeros(raw_dimension, dtype=evaluator.dtype)
     for free_index in range(free_count):
         raw_slice = slice(
@@ -1141,6 +1146,8 @@ def _solve_class(
     diagnostics = {
         "class": layout.key,
         "matrix_shape": [orthogonal_dimension, orthogonal_dimension],
+        "assembly_seconds": assembly_seconds,
+        "response_seconds": response_seconds,
         "all_free_indices_coupled": True,
         "candidate_free_index_block_count": candidate_block_count,
         "evaluated_free_index_block_count": evaluated_block_count,
@@ -1250,27 +1257,7 @@ class WickX2CICMRREPT2(lib.StreamObject):
         self.mo_coeff = getattr(mc, "mo_coeff", None)
         self.eris = None
         self.eris_basis = None
-        self.reference_energy = None
-        self.e_corr = None
-        self.sub_eners = {}
-        self.sub_times = {}
-        self.metric_diagnostics = {}
-        self.fink_h0_diagnostics = {}
-        self.denominator_diagnostics = {}
-        self.rdm_diagnostics = None
-        self.integral_symmetry_diagnostics = None
-        self.basis_layouts = None
-        self.amplitudes = {}
-        self.raw_metric = None
-        self.raw_fink_matrix = None
-        self.raw_fink_right = None
-        self.raw_fink_left = None
-        self.raw_source = None
-        self.raw_h0_source = None
-        self.raw_v_source = None
-        self.orthogonal_fink_matrix = None
-        self.orthogonal_source = None
-        self.memory_diagnostics = {}
+        self._clear_results()
         self._keys = set(self.__dict__)
 
     def run(self, *args, **kwargs):
@@ -1471,6 +1458,8 @@ class WickX2CICMRREPT2(lib.StreamObject):
             eris=eris,
         )
         self.sub_times["inputs"] = time.perf_counter() - start
+        logger.info(self, "native MR-REPT2 inputs ready in %.3f s",
+                    self.sub_times["inputs"])
         self.mo_coeff = mo_coeff
         self.eris = prepared_eris
         self.eris_basis = "input_mo"
@@ -1483,6 +1472,8 @@ class WickX2CICMRREPT2(lib.StreamObject):
         start = time.perf_counter()
         equations = _compile_equations()
         self.sub_times["equations"] = time.perf_counter() - start
+        logger.info(self, "native MR-REPT2 Wick equations ready in %.3f s",
+                    self.sub_times["equations"])
         if equations.maximum_rdm_rank > 4:
             raise RuntimeError("generated MR-REPT2 equations require >4-RDM")
         if self.contraction_backend == "pytblis":
@@ -1577,6 +1568,10 @@ class WickX2CICMRREPT2(lib.StreamObject):
         class_diagnostics = {}
         for metric in metrics:
             key = metric.layout.key
+            logger.info(self, "native MR-REPT2 assembling class %s: "
+                        "raw=%d retained=%d free-blocks=%d",
+                        key, metric.layout.raw_dimension, metric.diagnostics["rank"],
+                        len(metric.layout.free_tuples))
             start = time.perf_counter()
             energy, amplitudes, diagnostics, retained = _solve_class(
                 self, metric, evaluator, equations
@@ -1651,6 +1646,7 @@ class WickX2CICMRREPT2(lib.StreamObject):
                 )
             ),
             "class_matrices_are_full": True,
+            "contractions": dict(evaluator.evaluation_diagnostics),
             "semicanonicalization_used": False,
             "orbital_energies_used": False,
         }
