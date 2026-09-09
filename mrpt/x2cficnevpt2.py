@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: GPL-3.0-or-later
-r"""Dense general-complex-spinor fully internally contracted NEVPT2.
+r"""General-complex-spinor fully internally contracted NEVPT2.
 
 This module implements the single-state, second-order, internally contracted
 NEVPT2 equations for the same no-pair X2C spinor Hamiltonian used by
@@ -93,6 +93,7 @@ from functools import lru_cache
 import gc
 import itertools
 import time
+from types import SimpleNamespace
 
 import numpy as np
 from pyscf import lib
@@ -469,8 +470,13 @@ def _execute_tensor(
     wick_globals,
     dtype,
     eris,
+    selections=None,
 ):
-    result = np.zeros(_shape_for_labels(labels, eris), dtype=dtype)
+    shape = _shape_for_labels(labels, eris)
+    if selections:
+        shape = tuple(len(range(size)[selections[label]]) if label in selections
+                      else size for label, size in zip(labels, shape))
+    result = np.zeros(shape, dtype=dtype)
     context = dict(base_context)
     context[target_name] = result
     exec(code, wick_globals, context)
@@ -864,6 +870,7 @@ def _evaluate_fic_subspaces(
     denominator_tol=1.0e-12,
     return_timings=False,
     return_diagnostics=False,
+    work_memory=256 * 2**20,
 ):
     """Evaluate and solve all eight spinor FIC-NEVPT2 subspaces."""
 
@@ -872,6 +879,8 @@ def _evaluate_fic_subspaces(
     contraction_backend = _utils._normalize_contraction_backend(
         contraction_backend
     )
+    if not np.isfinite(work_memory) or work_memory <= 0:
+        raise ValueError("work_memory must be positive")
     for name, value in (
         ("metric_atol", metric_atol),
         ("metric_rtol", metric_rtol),
@@ -923,6 +932,12 @@ def _evaluate_fic_subspaces(
             for rank in range(1, 4)
         }
     )
+    active_eris = SimpleNamespace(ncore=1, nvirt=1, ncas=eris.ncas)
+    active_context = {
+        **base_context,
+        "deltaII": np.zeros((1, 1)),
+        "deltaEE": np.zeros((1, 1)),
+    }
 
     sub_eners = {}
     sub_times = {}
@@ -933,19 +948,10 @@ def _evaluate_fic_subspaces(
         components = _IC_COMPONENTS[key]
         free_labels = tuple(key)
 
-        rhs_tensors = {}
-        for component in components:
-            labels = free_labels + component.bra_active
-            rhs_tensors[component.name] = _execute_tensor(
-                equations.rhs_code[(key, component.name)],
-                "rhs",
-                labels,
-                base_context,
-                wick_globals,
-                dtype,
-                eris,
-            )
-
+        # In a fixed, ordered external/core tuple the Dyall active matrices
+        # are independent of the tuple. Cross-label deltas (i=j or r=s) are
+        # zero on that domain; identN axes broadcast. Store these matrices
+        # once, not nvirt/ncore copies of an ncas**6 tensor.
         metric_tensors = {}
         right_tensors = {}
         left_tensors = {}
@@ -965,45 +971,62 @@ def _evaluate_fic_subspaces(
                     equations.metric_code[pair],
                     "metric",
                     labels,
-                    base_context,
+                    active_context,
                     wick_globals,
                     dtype,
-                    eris,
+                    active_eris,
                 )
                 right_tensors[short_pair] = _execute_tensor(
                     equations.right_code[pair],
                     "right",
                     labels,
-                    base_context,
+                    active_context,
                     wick_globals,
                     dtype,
-                    eris,
+                    active_eris,
                 )
                 left_tensors[short_pair] = _execute_tensor(
                     equations.left_code[pair],
                     "left",
                     labels,
-                    base_context,
+                    active_context,
                     wick_globals,
                     dtype,
-                    eris,
+                    active_eris,
                 )
 
+        zero_indices = (0,) * len(key)
+        metric = _assemble_matrix(metric_tensors, zero_indices, components, eris.ncas)
+        right = _assemble_matrix(right_tensors, zero_indices, components, eris.ncas)
+        left = _assemble_matrix(left_tensors, zero_indices, components, eris.ncas)
+        del metric_tensors, right_tensors, left_tensors
         summary = _new_subspace_summary(key, components, eris.ncas)
         summary["contraction_backend"] = contraction_backend
+        summary["active_matrices_shared"] = True
+        summary["active_matrix_bytes"] = metric.nbytes + right.nbytes + left.nbytes
         energy = 0.0
+        free_shape = _shape_for_labels(free_labels, eris)
+        per_row = max(1, int(np.prod(free_shape[1:])) * np.dtype(dtype).itemsize
+                      * sum(eris.ncas ** len(c.bra_active) for c in components))
+        tile_size = max(1, int(work_memory) // per_row)
+        tile_start = -1
+        rhs_tensors = {}
         for free_indices in _iter_free_tuples(key, eris):
+            start_index = free_indices[0] // tile_size * tile_size
+            if start_index != tile_start:
+                rhs_tensors.clear()
+                tile_start = start_index
+                selections = {key[0]: slice(tile_start, min(free_shape[0], tile_start + tile_size))}
+                tile_globals = {"np": _utils._sliced_wick_namespace(
+                    contraction_backend, selections)}
+                for component in components:
+                    rhs_tensors[component.name] = _execute_tensor(
+                        equations.rhs_code[(key, component.name)], "rhs",
+                        free_labels + component.bra_active, base_context,
+                        tile_globals, dtype, eris, selections=selections)
+            local_indices = (free_indices[0] - tile_start,) + free_indices[1:]
             rhs = _assemble_vector(
-                rhs_tensors, free_indices, components, eris.ncas
-            )
-            metric = _assemble_matrix(
-                metric_tensors, free_indices, components, eris.ncas
-            )
-            right = _assemble_matrix(
-                right_tensors, free_indices, components, eris.ncas
-            )
-            left = _assemble_matrix(
-                left_tensors, free_indices, components, eris.ncas
+                rhs_tensors, local_indices, components, eris.ncas
             )
             orbital_gap = _orbital_gap_at(
                 key,
@@ -1040,7 +1063,7 @@ def _evaluate_fic_subspaces(
         summary["elapsed_time"] = sub_times[key]
         diagnostics[key] = summary
 
-        del rhs_tensors, metric_tensors, right_tensors, left_tensors
+        del rhs_tensors, metric, right, left
         gc.collect()
 
     result = (sub_eners,)
@@ -1074,6 +1097,7 @@ class WickX2CFICNEVPT2(lib.StreamObject):
         self.eris = None
         self.eris_basis = None
         self.reference_energy = None
+        self.reference_energy_diagnostics = None
         self.e_corr = None
         self.sub_eners = {}
         self.sub_times = {}
@@ -1084,6 +1108,9 @@ class WickX2CFICNEVPT2(lib.StreamObject):
         self.integral_roundoff_factor = (
             _utils._DEFAULT_AO2MO_ROUNDOFF_FACTOR
         )
+        self.integral_max_memory = 2000  # AO2MO working memory, MB
+        self.integral_ioblk_size = 128  # MB
+        self.contraction_work_memory = 256 * 2**20  # RHS tile target, bytes
         self.rdm_atol = _utils._DEFAULT_RDM_ATOL
         self.rdm_rtol = _utils._DEFAULT_RDM_RTOL
         self.rdm_work_memory = _utils._DEFAULT_RDM_WORK_MEMORY
@@ -1132,11 +1159,25 @@ class WickX2CFICNEVPT2(lib.StreamObject):
 
         ``pdms`` must contain raw SGF particle RDMs of ranks one through four.
         The active basis is never rotated after those RDMs are formed.
+        By default AO2MO transforms only required Wick blocks. Set
+        ``compact_eris=False`` for the legacy full-MO-ERI path.
+        ``integral_max_memory`` and ``integral_ioblk_size`` control AO2MO
+        buffers in MB; ``contraction_work_memory`` sets the RHS tile target
+        in bytes. These are not limits on total process memory or RDM storage.
+        Active-space metric/Dyall matrices are shared by all external tuples;
+        their null-space projection and dense eigensolver remain unchanged.
+        For CD/DF MCSCF references only the MPS and orbitals are reused:
+        semicanonical J/K and AO2MO use full Coulomb integrals, and ``E0`` is
+        their full-H RDM expectation. ``reference_energy_diagnostics`` retains
+        the original CD energy. No full-integral CI/MCSCF solve is performed.
+        Supplied ``eris`` and ``canonicalized=True`` energies must already
+        correspond to full integrals.
         """
 
         total_start = time.perf_counter()
         if mc is None:
             mc = self._mc
+        mc = _utils._full_integral_mc(mc)
         if _utils._has_frozen_orbitals(getattr(mc, "frozen", None)):
             raise NotImplementedError(
                 "nonzero frozen spinors are outside dense FIC v1"
@@ -1197,10 +1238,16 @@ class WickX2CFICNEVPT2(lib.StreamObject):
             mc, input_mo, pdms[0], root
         )
         if eris is None:
-            prepared_eris = _utils._dense_eris_from_mc(
+            from .nevpt2_eris import wick_eris_from_mc
+            builder = wick_eris_from_mc if compact_eris else _utils._dense_eris_from_mc
+            memory_options = ({"max_memory": self.integral_max_memory,
+                               "ioblk_size": self.integral_ioblk_size}
+                              if compact_eris else {})
+            prepared_eris = builder(
                 mc,
                 semicanonical_mo,
                 roundoff_factor=self.integral_roundoff_factor,
+                **memory_options,
             )
             self.integral_symmetry_diagnostics = getattr(
                 prepared_eris, "symmetry_diagnostics", None
@@ -1208,10 +1255,12 @@ class WickX2CFICNEVPT2(lib.StreamObject):
             if compact_eris:
                 prepared_eris = _utils._compact_wick_eris(prepared_eris)
         else:
-            if not isinstance(eris, spinor_helper._SpinorERIs):
+            if not isinstance(eris, (spinor_helper._SpinorERIs, _utils._WickERIBlocks)):
                 raise TypeError(
-                    "eris must be a spinor_helper._SpinorERIs instance"
+                    "eris must be a _SpinorERIs or _WickERIBlocks instance"
                 )
+            if isinstance(eris, _utils._WickERIBlocks) and not compact_eris:
+                raise ValueError("compact block ERIs require compact_eris=True")
             if (eris.ncore, eris.ncas, eris.nmo) != (
                 int(mc.ncore),
                 int(mc.ncas),
@@ -1239,6 +1288,10 @@ class WickX2CFICNEVPT2(lib.StreamObject):
                 )
             elif compact_eris:
                 prepared_eris = _utils._compact_wick_eris(eris)
+        self.reference_energy, self.reference_energy_diagnostics = (
+            _utils._pt_reference_energy(mc, root, semicanonical_mo, pdms,
+                                        prepared_eris)
+        )
         integral_time = time.perf_counter() - integral_start
 
         self.mo_coeff = semicanonical_mo
@@ -1258,6 +1311,7 @@ class WickX2CFICNEVPT2(lib.StreamObject):
             virtual_energy,
             root=root,
             contraction_backend=contraction_backend,
+            work_memory=self.contraction_work_memory,
             metric_atol=self.metric_atol,
             metric_rtol=self.metric_rtol,
             metric_rcond=self.metric_rcond,

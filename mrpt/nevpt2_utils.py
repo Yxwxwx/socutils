@@ -10,11 +10,12 @@ SC, FIC, and QD equations and solvers remain in their dedicated modules.
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
 from functools import lru_cache
 import itertools
 import warnings
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 from pyscf.lib import logger
@@ -168,6 +169,33 @@ def _wick_einsum_namespace(contraction_backend):
     return SimpleNamespace(einsum=einsum)
 
 
+def _sliced_wick_namespace(contraction_backend, selections):
+    """Slice free *labels*, not whole orbital spaces, before contraction.
+
+    For example slicing i must leave j untouched even though both are core
+    indices. Singleton identN operands are broadcast and must not be sliced.
+    """
+    einsum = _wick_einsum_namespace(contraction_backend).einsum
+
+    def sliced_einsum(expression, *operands, **kwargs):
+        inputs, output = expression.split("->")
+        if not set(selections).issubset(set(output)):
+            # Some Wick terms lack an output free index and broadcast into
+            # the target; only slice indices actually appearing in this term.
+            selected = {k: v for k, v in selections.items() if k in output}
+        else:
+            selected = selections
+        views = []
+        for labels, operand in zip(inputs.split(","), operands, strict=True):
+            indices = tuple(selected.get(label, slice(None)) if size != 1
+                            else slice(None)
+                            for label, size in zip(labels, operand.shape, strict=True))
+            views.append(operand[indices])
+        return einsum(expression, *views, **kwargs)
+
+    return SimpleNamespace(einsum=sliced_einsum)
+
+
 # Each expression is the fixed-free-index component of P_omega H |Phi>.
 # The factors and signs follow the unantisymmetrized Hamiltonian above.  In
 # particular, a fixed pair is represented by its explicit exchange
@@ -247,6 +275,7 @@ class _WickERIBlocks:
     nvirt: int
     h1eff_blocks: dict[str, np.ndarray]
     phys_blocks: dict[str, np.ndarray]
+    symmetry_diagnostics: dict | None = None
 
     @property
     def nocc(self):
@@ -287,6 +316,7 @@ def _compact_wick_eris(eris):
             key: np.array(eris.get_phys(key), copy=True, order="C")
             for key in _W_KEYS
         },
+        symmetry_diagnostics=getattr(eris, "symmetry_diagnostics", None),
     )
 
 
@@ -299,8 +329,8 @@ def _rotate_wick_eris(eris, rotation, *, block_atol=1.0e-10):
     ``nmo**4`` row tensor is unnecessary.
     """
 
-    if not isinstance(eris, spinor_helper._SpinorERIs):
-        raise TypeError("blockwise Wick rotation requires dense input ERIs")
+    if not isinstance(eris, (spinor_helper._SpinorERIs, _WickERIBlocks)):
+        raise TypeError("blockwise Wick rotation requires spinor ERIs")
     rotation = np.asarray(rotation)
     if rotation.shape != (eris.nmo, eris.nmo):
         raise ValueError("orbital rotation has the wrong shape")
@@ -376,6 +406,7 @@ def _rotate_wick_eris(eris, rotation, *, block_atol=1.0e-10):
         nvirt=int(eris.nvirt),
         h1eff_blocks=h1eff_blocks,
         phys_blocks=phys_blocks,
+        symmetry_diagnostics=getattr(eris, "symmetry_diagnostics", None),
     )
 
 def _block2_wick_types():
@@ -621,7 +652,10 @@ def _maximum_abs_chunked(array, work_memory) -> float:
     array = np.asarray(array)
     maximum = 0.0
     for index in _leading_chunks(array.shape, array.dtype, work_memory):
-        maximum = max(maximum, _maximum_abs(array[index]))
+        value = _maximum_abs(array[index])
+        if not np.isfinite(value):
+            return value
+        maximum = max(maximum, value)
     return maximum
 
 
@@ -645,7 +679,10 @@ def _maximum_abs_relation(
         if conjugate_right:
             right_chunk = right_chunk.conj()
         difference = left[index] + sign * right_chunk
-        maximum = max(maximum, _maximum_abs(difference))
+        value = _maximum_abs(difference)
+        if not np.isfinite(value):
+            return value
+        maximum = max(maximum, value)
     return maximum
 
 
@@ -988,7 +1025,7 @@ def _ao2mo_roundoff_policy(
     )
     gamma = _roundoff_gamma(operation_count, epsilon, name="AO2MO")
     with np.errstate(over="ignore", invalid="ignore"):
-        maximum_absolute_value = _maximum_abs(values)
+        maximum_absolute_value = _maximum_abs_chunked(values, 128 * 2**20)
     if not np.isfinite(maximum_absolute_value):
         raise ValueError(
             "AO2MO maximum absolute value is non-finite; the roundoff gate "
@@ -1259,6 +1296,97 @@ def _reference_energy(mc, root):
             return float(solver_energies[root])
         raise RuntimeError("state-specific CASSCF reference energies are unavailable")
     return float(energies)
+
+
+def _full_coulomb_jk(mf, mol=None, dm=None, hermi=1, with_j=True,
+                     with_k=True, omega=None):
+    """Direct j-spinor Coulomb J/K, independent of DF/CD or SCF caches."""
+    from pyscf.x2c.x2c import get_jk
+
+    if mol is None:
+        mol = mf.mol
+    if dm is None:
+        dm = mf.make_rdm1()
+    return get_jk(mol, np.ascontiguousarray(dm), hermi=hermi,
+                  with_j=with_j, with_k=with_k, omega=omega)
+
+
+def _full_integral_mc(mc):
+    """Detach CD/DF only on a shallow PT view; preserve the reference MPS.
+
+    The original solver, orbital array, one-electron X2CAMF helper and
+    checkpoint Hamiltonian are not rebuilt or modified. Both semicanonical
+    J/K and subsequent AO2MO must use the full Coulomb operator. Merely
+    setting ``with_df=None`` is insufficient for socutils' DF SCF mixin.
+    """
+    df = getattr(mc._scf, "with_df", None)
+    legacy_cd = getattr(mc, "_cderi", None)
+    if df is None and legacy_cd is None:
+        return mc
+    result = copy(mc)
+    # Remove the DF mixin as well: its _cderi descriptor forwards writes to
+    # the (shared) with_df object, which must remain untouched for restart.
+    from pyscf.df.df_jk import _DFHF
+
+    result._scf = (mc._scf.undo_df() if isinstance(mc._scf, _DFHF)
+                   else copy(mc._scf))
+    result._scf.with_df = None
+    result._scf._eri = None
+    result._scf._cderi = None
+    result._scf.get_jk = MethodType(_full_coulomb_jk, result._scf)
+    result._cderi = None
+    result._mrpt_factorized_reference = {
+        "source": type(df).__name__ if df is not None else "legacy-cderi",
+        "threshold": getattr(df, "tau", None),
+    }
+    return result
+
+
+def _pt_reference_energy(mc, root, mo_coeff, pdms, eris):
+    """Full-H expectation on a fixed CD/DF reference, without a new CI solve.
+
+    Nonfactorized references retain their existing energy convention. For
+    CD/DF references this removes the CD energy offset from ``E0 + E2``;
+    it does not turn the MPS into an exact eigenstate of the full Hamiltonian.
+    """
+    original = _reference_energy(mc, root)
+    provenance = getattr(mc, "_mrpt_factorized_reference", None)
+    if provenance is None:
+        return original, {"source": "mcscf", "mcscf_energy": original}
+    ncore = int(mc.ncore)
+    if isinstance(eris, spinor_helper._SpinorERIs):
+        electronic_core = 0.5 * np.trace(
+            (eris.h1e + eris.h1eff)[:ncore, :ncore])
+    else:
+        audit = getattr(eris, "symmetry_diagnostics", None) or {}
+        electronic_core = audit.get("electronic_core_energy")
+        if electronic_core is None:
+            # Explicitly supplied compact ERIs may lack AO2MO provenance.
+            core = np.asarray(mo_coeff)[:, :ncore]
+            dm_core = np.ascontiguousarray(core @ core.conj().T)
+            electronic_core = np.einsum("ij,ji", mc.get_hcore(), dm_core)
+            if ncore:
+                vj, vk = _full_coulomb_jk(mc._scf, mc.mol, dm_core)
+                electronic_core += 0.5 * np.einsum("ij,ji", vj - vk, dm_core)
+    energy = (
+        mc.mol.energy_nuc() + electronic_core
+        + np.einsum("pq,pq", eris.get_h1eff("AA"), pdms[0])
+        + 0.5 * np.einsum("pqrs,pqsr", eris.get_phys("AAAA"), pdms[1])
+    )
+    if not np.isfinite(energy) or abs(np.imag(energy)) > 1e-8:
+        raise RuntimeError(f"invalid full-H reference expectation: {energy}")
+    energy = float(np.real(energy))
+    logger.info(mc, "NEVPT2 root %d: CD/DF E(MCSCF)=%.12f, "
+                "<H(full)>=%.12f, delta=%+.3e Eh (fixed MPS)",
+                root, original, energy, energy - original)
+    return energy, {
+        "source": "full_hamiltonian_expectation",
+        "factorized_reference": dict(provenance),
+        "mcscf_energy": original,
+        "full_hamiltonian_energy": energy,
+        "energy_shift": energy - original,
+        "mps_reoptimized": False,
+    }
 
 
 

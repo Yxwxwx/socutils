@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+import pytest
 from pyscf.fci import fci_dhf_slow
 
 from socutils.dmrg.dmrgci import (
@@ -299,6 +300,94 @@ def test_fiedler_reordering_restores_original_rdm_indices(tmp_path, monkeypatch)
     assert np.max(abs(dm2 - dm2_ref)) <= RDM_TOL
     assert abs(energy_from_rdms(h1_rot, eri_rot, dm1, dm2) - energy) <= ENERGY_TOL
     solver.close()
+
+
+def test_original_ordering_cold_warm_and_checkpoint_restore(tmp_path, monkeypatch):
+    """Opting out must never invoke Fiedler, including between CASSCF steps."""
+    from pyblock2.driver.core import DMRGDriver
+
+    def forbidden_reordering(*args, **kwargs):
+        raise AssertionError("original ordering must not call Fiedler")
+
+    monkeypatch.setattr(DMRGDriver, "orbital_reordering", forbidden_reordering)
+    _, _, h1, eri, _ = _complex_hamiltonians()
+    norb, nelec = len(h1), 2
+    checkpoint = tmp_path / "checkpoint"
+    solver = _solver(tmp_path / "first", norb, nelec)
+    solver.init(norb, nelec, orbital_ordering="original", checkpoint_dir=checkpoint)
+    try:
+        for step in range(2):
+            if step:
+                h1 = h1.copy()
+                h1[1, 1] -= 0.03
+                solver.restart_scheduler_step({"orbital_gradient_norm": 5e-4})
+            energy, state = solver.kernel(h1, eri, norb, nelec, verbose=0)
+            reference = zfci.FCISolver()
+            exact, ci = reference.kernel(h1, eri, norb, nelec)
+            dm1_ref, dm2_ref = reference.make_rdm12(ci, norb, nelec)
+            dm1, dm2 = solver.make_rdm12(state, norb, nelec)
+            assert solver.converged
+            assert abs(energy - exact) <= ENERGY_TOL
+            assert np.max(abs(dm1 - dm1_ref)) <= RDM_TOL
+            assert np.max(abs(dm2 - dm2_ref)) <= RDM_TOL
+            assert solver.convergence_info["orbital_ordering"] == "original"
+            assert np.array_equal(solver.driver.reorder_idx, np.arange(norb))
+            assert solver.convergence_info["run_mode"] == (
+                "cold-start" if step == 0 else "casscf-warm-start"
+            )
+    finally:
+        solver.close()
+
+    restored = _solver(tmp_path / "restored", norb, nelec)
+    restored.init(norb, nelec, orbital_ordering="original", checkpoint_dir=checkpoint)
+    try:
+        restored.restore_checkpoint(h1, eri, norb, nelec, verbose=0)
+        assert restored.converged
+        assert restored.convergence_info["sweeps"] == 0
+        assert restored.convergence_info["orbital_ordering"] == "original"
+        assert np.array_equal(restored.driver.reorder_idx, np.arange(norb))
+        dm1, dm2 = restored.make_rdm12(restored.ci, norb, nelec)
+        assert np.max(abs(dm1 - dm1_ref)) <= RDM_TOL
+        assert np.max(abs(dm2 - dm2_ref)) <= RDM_TOL
+    finally:
+        restored.close()
+
+
+def test_original_ordering_rejects_reordered_restart(tmp_path, monkeypatch):
+    from pyblock2.driver.core import DMRGDriver
+
+    monkeypatch.setattr(
+        DMRGDriver, "orbital_reordering", lambda *args, **kwargs: np.array([2, 0, 1])
+    )
+    h1 = np.diag([-1.3, -0.4, 0.8]).astype(complex)
+    eri = np.zeros((3,) * 4, dtype=complex)
+    solver = _solver(tmp_path / "scratch", 3, 1, bond_dim=8)
+    solver.checkpoint_dir = str(tmp_path / "checkpoint")
+    try:
+        solver.kernel(h1, eri, 3, 1, verbose=0)
+        old_driver = solver.driver
+        old_scratch = solver._scratch
+        solver.orbital_ordering = "original"
+        solver.restart = True
+        with pytest.raises(ValueError, match="cannot reuse a reordered MPS"):
+            solver.kernel(h1, eri, 3, 1, verbose=0)
+        assert solver.driver is old_driver
+        assert solver._scratch == old_scratch
+        assert solver.converged
+        solver.resume = True
+        with pytest.raises(ValueError, match="cannot reuse a reordered MPS"):
+            solver.kernel(h1, eri, 3, 1, verbose=0)
+        with pytest.raises(ValueError, match="cannot reuse a reordered MPS"):
+            solver.restore_checkpoint(h1, eri, 3, 1, verbose=0)
+        assert solver.driver is old_driver
+    finally:
+        solver.close()
+
+
+def test_orbital_ordering_option_validation():
+    assert DMRGCI().orbital_ordering == "fiedler"
+    with pytest.raises(ValueError, match="orbital_ordering must be"):
+        DMRGCI().init(3, 1, orbital_ordering="typo")
 
 
 def test_casscf_restart_reuses_only_compatible_internal_mps(

@@ -258,16 +258,20 @@ def dump_wick_equations(filename: str | None = None) -> str:
 _free_index_shape = _utils._free_index_shape
 
 
-def _orbital_gap(key: str, core_energy, virtual_energy):
+def _orbital_gap(key: str, core_energy, virtual_energy, leading_slice=None):
     shape = tuple(
         len(core_energy) if char in "ij" else len(virtual_energy)
         for char in key
     )
+    if leading_slice is not None:
+        shape = (len(range(shape[0])[leading_slice]),) + shape[1:]
     gap = np.zeros(shape, dtype=float)
     for axis, char in enumerate(key):
         values = -np.asarray(core_energy) if char in "ij" else np.asarray(
             virtual_energy
         )
+        if axis == 0 and leading_slice is not None:
+            values = values[leading_slice]
         reshape = [1] * len(key)
         reshape[axis] = len(values)
         gap += values.reshape(reshape)
@@ -833,6 +837,84 @@ def _validate_zero_norm_commutator(
 _execution_context = _utils._execution_context
 
 
+def _sc_tiles(eris, work_memory, *, enabled):
+    """Bound each scalar working array, retaining full label ordering."""
+    if not np.isfinite(work_memory) or work_memory <= 0:
+        raise ValueError("work_memory must be positive")
+    for key in SUBSPACE_ORDER:
+        shape = _free_index_shape(key, eris)
+        row_bytes = max(1, int(np.prod(shape[1:])) * 16)
+        size = max(1, int(work_memory) // row_bytes)
+        if not enabled or size >= shape[0] or 0 in shape:
+            yield key, None
+        else:
+            for start in range(0, shape[0], size):
+                yield key, slice(start, min(start + size, shape[0]))
+
+
+def _offset_sc_diagnostics(diagnostics, offset):
+    for name, value in diagnostics.items():
+        if isinstance(value, dict):
+            _offset_sc_diagnostics(value, offset)
+        elif name.endswith("_index") and value:
+            value[0] += offset
+        elif name.endswith("_indices"):
+            for index in value:
+                if index:
+                    index[0] += offset
+
+
+def _merge_sc_diagnostics(previous, current):
+    """Combine tile audits, keeping indices/limits with their maxima."""
+    companions = {
+        "maximum_adjoint_error": ("maximum_adjoint_error_index", "reality_limit_at_maximum_error"),
+        "maximum_imaginary_part": ("maximum_imaginary_index", "reality_limit_at_maximum", "real_part_at_maximum"),
+        "maximum_imaginary_to_limit_ratio": ("maximum_ratio_index",),
+        "maximum_numerator_imaginary_part": ("maximum_numerator_imaginary_index",),
+        "maximum_numerator_imaginary_to_limit_ratio": ("maximum_numerator_ratio_index",),
+        "maximum_absolute_value": ("maximum_absolute_index", "acceptance_limit_at_maximum"),
+    }
+    linked = {name for names in companions.values() for name in names}
+    result = dict(previous)
+    for name, value in current.items():
+        old = previous.get(name)
+        if name in linked:
+            continue
+        if isinstance(value, dict):
+            result[name] = _merge_sc_diagnostics(old, value)
+        elif isinstance(value, bool):
+            result[name] = old and value
+        elif name.endswith("_dimension") or name.endswith("_count") or name in (
+            "imaginary_energy_l1", "real_projection_shift_l1"
+        ):
+            result[name] = old + value
+        elif name.endswith("_indices"):
+            result[name] = old + value
+        elif name.startswith("minimum_"):
+            result[name] = value if old is None else old if value is None else min(old, value)
+        elif name.startswith("maximum_"):
+            result[name] = max(old, value)
+            related = companions.get(name, ())
+            # An empty tile has zero maxima but no argmax. A later nonempty
+            # tile with an exactly zero residual must still provide its index.
+            fills_empty_index = any(
+                companion.endswith("_index")
+                and not previous[companion] and current[companion]
+                for companion in related
+            )
+            if value > old or (value == old and fills_empty_index):
+                for companion in companions.get(name, ()):
+                    result[companion] = current[companion]
+    # Per-tile gates alone are not sufficient for an additive energy audit.
+    if "imaginary_energy_l1" in result:
+        for prefix in ("imaginary_energy_l1", "real_projection_shift_l1"):
+            result[prefix + "_gate_passed"] = result[prefix] <= result[prefix + "_tolerance"]
+        result["strict_si_compatible"] &= (
+            result["imaginary_energy_l1_gate_passed"]
+            and result["real_projection_shift_l1_gate_passed"])
+    return result
+
+
 def _evaluate_wick_subspaces(
     eris,
     pdms,
@@ -857,6 +939,7 @@ def _evaluate_wick_subspaces(
     return_arrays=False,
     return_timings=False,
     return_diagnostics=False,
+    work_memory=256 * 2**20,
 ):
     """Evaluate all generated equations in the supplied semicanonical basis."""
 
@@ -885,9 +968,6 @@ def _evaluate_wick_subspaces(
         )
     # Block2 emits source containing ``np.einsum``.  That global name is
     # resolved only here at exec time, so the cached source is backend-agnostic.
-    wick_globals = {
-        "np": _wick_einsum_namespace(contraction_backend),
-    }
     equations = _compile_wick_equations()
     base_context = _execution_context(eris, pdms)
     sub_eners = {}
@@ -897,9 +977,16 @@ def _evaluate_wick_subspaces(
     timings = {}
     realness_diagnostics = {}
 
-    for key in SUBSPACE_ORDER:
+    for key, leading_slice in _sc_tiles(
+        eris, work_memory, enabled=not return_arrays and normalized_groups is None
+    ):
         subspace_start = time.perf_counter()
         shape = _free_index_shape(key, eris)
+        if leading_slice is not None:
+            shape = (leading_slice.stop - leading_slice.start,) + shape[1:]
+        wick_globals = {"np": _utils._sliced_wick_namespace(
+            contraction_backend, {key[0]: leading_slice})
+            if leading_slice is not None else _wick_einsum_namespace(contraction_backend)}
         integral_dtypes = tuple(
             eris.get_h1eff(block).dtype for block in _H1_KEYS
         ) + tuple(eris.get_phys(block).dtype for block in _W_KEYS)
@@ -927,6 +1014,12 @@ def _evaluate_wick_subspaces(
             local_context,
         )
         ordered = _strict_pair_mask(key, shape)
+        if leading_slice is not None:
+            grid = list(np.indices(shape, sparse=True))
+            grid[0] = grid[0] + leading_slice.start
+            ordered[:] = True
+            for left, right in _utils._PAIR_RESTRICTIONS[key]:
+                ordered &= grid[left] < grid[right]
         branch_diagnostics = _require_adjoint_pair(
             left_commutator,
             right_commutator,
@@ -936,7 +1029,7 @@ def _evaluate_wick_subspaces(
             atol=scalar_atol,
             rtol=scalar_rtol,
         )
-        orbital_gap = _orbital_gap(key, core_energy, virtual_energy)
+        orbital_gap = _orbital_gap(key, core_energy, virtual_energy, leading_slice)
         raw_ordered_dimension = int(np.count_nonzero(ordered))
         if normalized_groups is None:
             grouping_diagnostics = {
@@ -1142,10 +1235,15 @@ def _evaluate_wick_subspaces(
             "retained_dimension": int(np.count_nonzero(nonzero_flat)),
             "discarded_zero_norm_dimension": int(np.count_nonzero(zero_norm)),
         }
+        if leading_slice is not None:
+            _offset_sc_diagnostics(class_diagnostics, leading_slice.start)
+        if key in realness_diagnostics:
+            class_diagnostics = _merge_sc_diagnostics(realness_diagnostics[key], class_diagnostics)
+            old_min, old_max = sub_gaps[key]
+            gap_min, gap_max = float(np.fmin(old_min, gap_min)), float(np.fmax(old_max, gap_max))
         realness_diagnostics[key] = class_diagnostics
-
-        sub_eners[key] = float(contribution)
-        sub_norms[key] = float(np.sum(np.maximum(selected_norm, 0.0)))
+        sub_eners[key] = sub_eners.get(key, 0.0) + float(contribution)
+        sub_norms[key] = sub_norms.get(key, 0.0) + float(np.sum(np.maximum(selected_norm, 0.0)))
         sub_gaps[key] = (gap_min, gap_max)
         if return_arrays:
             arrays[key] = {
@@ -1168,7 +1266,7 @@ def _evaluate_wick_subspaces(
                 "ordered": ordered,
                 "nonzero": nonzero,
             }
-        timings[key] = time.perf_counter() - subspace_start
+        timings[key] = timings.get(key, 0.0) + time.perf_counter() - subspace_start
 
     root_imaginary_energy_l1 = float(
         sum(
@@ -1280,6 +1378,7 @@ class _PreparedSCRoot:
 
     root: int
     reference_energy: float
+    reference_energy_diagnostics: dict[str, Any]
     reference_residual_bound: float
     scalar_tolerance: float
     mo_coeff: np.ndarray
@@ -1324,6 +1423,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         self.eris_basis = None
         self.e_corr = None
         self.reference_energy = None
+        self.reference_energy_diagnostics = None
         self.sub_eners = {}
         self.sub_norms = {}
         self.sub_denominators = {}
@@ -1334,6 +1434,9 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         for name, value in _SC_NUMERICAL_DEFAULTS:
             setattr(self, name, value)
         self.denominator_mode = "strict_si"
+        self.integral_max_memory = 2000  # AO2MO working memory, MB
+        self.integral_ioblk_size = 128  # MB
+        self.contraction_work_memory = 256 * 2**20  # scalar tile target, bytes
         self.contraction_backend = _DEFAULT_CONTRACTION_BACKEND
         self.strong_contraction_groups = None
         self.strict_si_compatible = None
@@ -1383,7 +1486,6 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         subclass-provided canonicalization policies remain valid.
         """
 
-        reference_energy = _reference_energy(mc, root)
         solver = mc.fcisolver
         residual_bound = getattr(solver, "convergence_info", {}).get(
             "local_residual_bound", 0.0
@@ -1419,10 +1521,16 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             mc, original_mo, pdms[0], root
         )
         if eris is None:
-            prepared_eris = _dense_eris_from_mc(
+            from .nevpt2_eris import wick_eris_from_mc
+            builder = wick_eris_from_mc if compact_eris else _dense_eris_from_mc
+            memory_options = ({"max_memory": self.integral_max_memory,
+                               "ioblk_size": self.integral_ioblk_size}
+                              if compact_eris else {})
+            prepared_eris = builder(
                 mc,
                 semicanonical_mo,
                 roundoff_factor=self.integral_roundoff_factor,
+                **memory_options,
             )
             integral_symmetry_diagnostics = getattr(
                 prepared_eris, "symmetry_diagnostics", None
@@ -1430,10 +1538,12 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             if compact_eris:
                 prepared_eris = _compact_wick_eris(prepared_eris)
         else:
-            if not isinstance(eris, spinor_helper._SpinorERIs):
+            if not isinstance(eris, (spinor_helper._SpinorERIs, _utils._WickERIBlocks)):
                 raise TypeError(
-                    "eris must be a spinor_helper._SpinorERIs instance"
+                    "eris must be a _SpinorERIs or _WickERIBlocks instance"
                 )
+            if isinstance(eris, _utils._WickERIBlocks) and not compact_eris:
+                raise ValueError("compact block ERIs require compact_eris=True")
             if (eris.ncore, eris.ncas, eris.nmo) != (
                 int(mc.ncore),
                 int(mc.ncas),
@@ -1456,6 +1566,9 @@ class WickX2CSCNEVPT2(lib.StreamObject):
                     prepared_eris = _rotate_eris(eris, rotation)
             elif compact_eris:
                 prepared_eris = _compact_wick_eris(eris)
+        reference_energy, reference_energy_diagnostics = _utils._pt_reference_energy(
+            mc, root, semicanonical_mo, pdms, prepared_eris
+        )
         integral_time = time.perf_counter() - integral_start
 
         ncore = prepared_eris.ncore
@@ -1468,6 +1581,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             core_energy,
             virtual_energy,
             root=root,
+            work_memory=self.contraction_work_memory,
             scalar_atol=scalar_tolerance,
             scalar_rtol=self.scalar_rtol,
             norm_tol=self.norm_tol,
@@ -1515,6 +1629,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         return _PreparedSCRoot(
             root=root,
             reference_energy=reference_energy,
+            reference_energy_diagnostics=reference_energy_diagnostics,
             reference_residual_bound=residual_bound,
             scalar_tolerance=scalar_tolerance,
             mo_coeff=semicanonical_mo,
@@ -1549,7 +1664,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         root=None,
         contraction_backend=None,
         strong_contraction_groups=None,
-        compact_eris=False,
+        compact_eris=True,
     ):
         """Compute one root-specific SC-NEVPT2 correction.
 
@@ -1561,13 +1676,24 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         spin-free SC contraction from explicit alpha/beta spinors.  Because
         labels describe the final MO columns, this option requires
         ``canonicalized=True``.
-        With a dense input-basis ``eris``, ``compact_eris=True`` rotates and
-        retains only the blocks used by Wick; the default preserves the
-        historical full-ERI result object.
+        By default only required ERI blocks are transformed and retained.
+        ``compact_eris=False`` explicitly requests the historical full-ERI
+        path. AO2MO buffers are controlled by ``integral_max_memory`` and
+        ``integral_ioblk_size`` (MB), separately from RDM/MPS storage.
+        ``contraction_work_memory`` is a per-array tile target in bytes,
+        not a total process memory limit. Explicit partner grouping and
+        internal ``return_arrays=True`` diagnostics retain untiled arrays.
+        CD/DF MCSCF references keep their MPS and active orbitals, but PT
+        semicanonical J/K and AO2MO use full Coulomb integrals. Their ``E0``
+        is the full-H expectation from the same raw RDMs, not the CD energy;
+        ``reference_energy_diagnostics`` records both. This is an approximate
+        reference, not a new full-integral CASSCF solve. Supplied ``eris`` and
+        ``canonicalized=True`` orbital energies must already be full-integral.
         """
 
         if mc is None:
             mc = self._mc
+        mc = _utils._full_integral_mc(mc)
         if _has_frozen_orbitals(getattr(mc, "frozen", None)):
             raise NotImplementedError("nonzero frozen spinors are outside dense v1")
         eris_basis = _normalize_eris_basis(eris_basis)
@@ -1616,6 +1742,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             compact_eris=bool(compact_eris),
         )
         self.reference_energy = row.reference_energy
+        self.reference_energy_diagnostics = row.reference_energy_diagnostics
         self.reference_residual_bound = row.reference_residual_bound
         self.scalar_tolerance = row.scalar_tolerance
         self.rdm_diagnostics = row.rdm_diagnostics

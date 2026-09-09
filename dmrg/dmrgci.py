@@ -413,6 +413,7 @@ class DMRGCI(StreamObject):
         self.dav_rel_conv_thrd = 0.0
         self.noise_type = None
         self.random_seed = 1234
+        self.orbital_ordering = "fiedler"
         self.npdm_site_type = 2
         self.npdm_cutoff = 1e-24
 
@@ -479,6 +480,7 @@ class DMRGCI(StreamObject):
         random_seed=None,
         npdm_site_type=None,
         npdm_cutoff=None,
+        orbital_ordering=None,
     ):
         """Configure the active space, sweep schedule, and solver controls.
 
@@ -491,6 +493,11 @@ class DMRGCI(StreamObject):
         MPS. The callback returned by :meth:`restart_scheduler_` controls
         subsequent CASSCF warm starts. ``resume=True`` is distinct: it is a
         one-shot, exact-Hamiltonian disk reload from ``checkpoint_dir``.
+
+        ``orbital_ordering="original"`` disables Fiedler site reordering.
+        The default is ``"fiedler"``. Warm starts and disk resumes preserve
+        the saved MPS permutation; original-order mode rejects an already
+        reordered MPS instead of silently reinterpreting its sites.
         """
         self.ncas = int(ncas)
         self.nelecas = _electron_number(nelecas)
@@ -608,6 +615,9 @@ class DMRGCI(StreamObject):
             self.npdm_site_type = int(npdm_site_type)
         if npdm_cutoff is not None:
             self.npdm_cutoff = float(npdm_cutoff)
+        if orbital_ordering is not None:
+            self.orbital_ordering = str(orbital_ordering).lower()
+        self._validate_orbital_ordering(self.ncas)
 
         if self.n_sweeps <= 0 or self.tol <= 0:
             raise ValueError("n_sweeps and tol must be positive")
@@ -624,6 +634,19 @@ class DMRGCI(StreamObject):
         if self.n_threads <= 0 or self.stack_memory <= 0:
             raise ValueError("n_threads and stack_memory must be positive")
         return self
+
+    def _validate_orbital_ordering(self, norb, preserved=None):
+        if self.orbital_ordering not in ("fiedler", "original"):
+            raise ValueError("orbital_ordering must be 'fiedler' or 'original'")
+        if (
+            self.orbital_ordering == "original"
+            and preserved is not None
+            and not numpy.array_equal(preserved, numpy.arange(int(norb)))
+        ):
+            raise ValueError(
+                "orbital_ordering='original' cannot reuse a reordered MPS; "
+                "use a fresh solve or an original-order checkpoint"
+            )
 
     def generate_schedule(self):
         """Generate and install the official PySCF-style cold schedule."""
@@ -1271,6 +1294,7 @@ class DMRGCI(StreamObject):
                 )
             else:
                 preserved_reorder_idx = numpy.asarray(stored_reorder_idx, dtype=int)
+        self._validate_orbital_ordering(norb, preserved_reorder_idx)
         if resume_checkpoint:
             run_mode = "checkpoint-resume"
         elif use_internal_mps:
@@ -1356,19 +1380,24 @@ class DMRGCI(StreamObject):
                 n_elec=nelec,
                 orb_sym=[0] * int(norb),
             )
-            fiedler_idx = numpy.asarray(
-                driver.orbital_reordering(numpy.abs(h1_block2), numpy.abs(eri_block2)),
-                dtype=int,
-            )
             expected_indices = numpy.arange(int(norb))
-            if fiedler_idx.shape != (int(norb),) or not numpy.array_equal(
-                numpy.sort(fiedler_idx), expected_indices
+            if self.orbital_ordering == "original":
+                proposed_idx = expected_indices.copy()
+            else:
+                proposed_idx = numpy.asarray(
+                    driver.orbital_reordering(
+                        numpy.abs(h1_block2), numpy.abs(eri_block2)
+                    ),
+                    dtype=int,
+                )
+            if proposed_idx.shape != (int(norb),) or not numpy.array_equal(
+                numpy.sort(proposed_idx), expected_indices
             ):
                 raise RuntimeError(
                     "Block2 returned an invalid orbital-reordering permutation"
                 )
             reorder_idx = (
-                fiedler_idx if preserved_reorder_idx is None else preserved_reorder_idx
+                proposed_idx if preserved_reorder_idx is None else preserved_reorder_idx
             )
             if reorder_idx.shape != (int(norb),) or not numpy.array_equal(
                 numpy.sort(reorder_idx), expected_indices
@@ -1377,12 +1406,12 @@ class DMRGCI(StreamObject):
                     "stored DMRG orbital-reordering permutation is invalid"
                 )
             if preserved_reorder_idx is not None and not numpy.array_equal(
-                fiedler_idx, reorder_idx
+                proposed_idx, reorder_idx
             ):
                 logger.new_logger(self, verbose).note(
                     "DMRG Fiedler proposal %s replaced by preserved restart "
                     "ordering %s",
-                    fiedler_idx.tolist(),
+                    proposed_idx.tolist(),
                     reorder_idx.tolist(),
                 )
             logger.new_logger(self, verbose).note(
@@ -1570,6 +1599,7 @@ class DMRGCI(StreamObject):
                     "checkpoint_dir": self.checkpoint_dir,
                     "checkpoint_fingerprint": checkpoint_problem["hamiltonian_sha256"],
                     "orbital_reordering": reorder_idx.tolist(),
+                    "orbital_ordering": self.orbital_ordering,
                     "restart_scheduler": dict(self.restart_diagnostics),
                     "restart_site_conversion_sweeps": (restart_site_conversion_sweeps),
                 }
@@ -1695,6 +1725,7 @@ class DMRGCI(StreamObject):
         reorder_idx = numpy.asarray(reordering_array, dtype=int)
         if not numpy.array_equal(numpy.sort(reorder_idx), expected_indices):
             raise ValueError("checkpoint orbital reordering is not a permutation")
+        self._validate_orbital_ordering(norb, reorder_idx)
 
         stored_energies = _real_energy(manifest.get("energies"))
         energy_array = numpy.asarray(stored_energies, dtype=float)
@@ -1897,6 +1928,7 @@ class DMRGCI(StreamObject):
                 ],
                 "checkpoint_manifest_run_mode": manifest.get("run_mode"),
                 "orbital_reordering": reorder_idx.tolist(),
+                "orbital_ordering": self.orbital_ordering,
                 "state_average_weights": weights.copy(),
                 "local_squared_residual_threshold": final_threshold,
                 "local_residual_bound": math.sqrt(final_threshold),
@@ -2238,6 +2270,7 @@ class DMRGCI(StreamObject):
         log.info("schedule Davidson thrd max   = %s", self.schedule_thrd_max)
         log.info("Davidson max iterations      = %d", self.dav_max_iter)
         log.info("noise type                   = %s", self.noise_type)
+        log.info("orbital ordering             = %s", self.orbital_ordering)
         log.info("n_threads                    = %d", self.n_threads)
         log.info("stack memory cap             = %.1f MB", self.stack_memory)
         log.info("scratch parent               = %s", self.scratch)
