@@ -413,7 +413,7 @@ class DMRGCI(StreamObject):
         self.dav_rel_conv_thrd = 0.0
         self.noise_type = None
         self.random_seed = 1234
-        self.orbital_ordering = "fiedler"
+        self.orbital_ordering = "original"
         self.npdm_site_type = 2
         self.npdm_cutoff = 1e-24
 
@@ -494,9 +494,10 @@ class DMRGCI(StreamObject):
         subsequent CASSCF warm starts. ``resume=True`` is distinct: it is a
         one-shot, exact-Hamiltonian disk reload from ``checkpoint_dir``.
 
-        ``orbital_ordering="original"`` disables Fiedler site reordering.
-        The default is ``"fiedler"``. Warm starts and disk resumes preserve
-        the saved MPS permutation; original-order mode rejects an already
+        ``orbital_ordering="original"`` (the default) keeps the input site
+        order; ``"fiedler"`` explicitly enables Fiedler site reordering.
+        Warm starts and disk resumes preserve the saved MPS permutation;
+        original-order mode rejects an already
         reordered MPS instead of silently reinterpreting its sites.
         """
         self.ncas = int(ncas)

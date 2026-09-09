@@ -18,7 +18,7 @@ ENERGY_TOL = 1e-9
 RDM_TOL = 1e-8
 
 
-def _solver(tmp_path, norb, nelec, nroots=1, bond_dim=32):
+def _solver(tmp_path, norb, nelec, nroots=1, bond_dim=32, orbital_ordering=None):
     return DMRGCI().init(
         ncas=norb,
         nelecas=nelec,
@@ -34,6 +34,7 @@ def _solver(tmp_path, norb, nelec, nroots=1, bond_dim=32):
         dav_max_iter=1000,
         random_seed=2468,
         npdm_site_type=2,
+        orbital_ordering=orbital_ordering,
     )
 
 
@@ -286,7 +287,7 @@ def test_fiedler_reordering_restores_original_rdm_indices(tmp_path, monkeypatch)
     )
     dm1_ref, dm2_ref = reference.make_rdm12(ci_ref, norb, nelec)
 
-    solver = _solver(tmp_path, norb, nelec)
+    solver = _solver(tmp_path, norb, nelec, orbital_ordering="fiedler")
     energy, state = solver.kernel(
         h1_rot, eri_rot, norb, nelec, verbose=0
     )
@@ -302,8 +303,11 @@ def test_fiedler_reordering_restores_original_rdm_indices(tmp_path, monkeypatch)
     solver.close()
 
 
-def test_original_ordering_cold_warm_and_checkpoint_restore(tmp_path, monkeypatch):
-    """Opting out must never invoke Fiedler, including between CASSCF steps."""
+@pytest.mark.parametrize("ordering_kwargs", [{}, {"orbital_ordering": "original"}])
+def test_original_ordering_cold_warm_and_checkpoint_restore(
+    tmp_path, monkeypatch, ordering_kwargs
+):
+    """Default and explicit original order must never invoke Fiedler."""
     from pyblock2.driver.core import DMRGDriver
 
     def forbidden_reordering(*args, **kwargs):
@@ -314,7 +318,7 @@ def test_original_ordering_cold_warm_and_checkpoint_restore(tmp_path, monkeypatc
     norb, nelec = len(h1), 2
     checkpoint = tmp_path / "checkpoint"
     solver = _solver(tmp_path / "first", norb, nelec)
-    solver.init(norb, nelec, orbital_ordering="original", checkpoint_dir=checkpoint)
+    solver.init(norb, nelec, checkpoint_dir=checkpoint, **ordering_kwargs)
     try:
         for step in range(2):
             if step:
@@ -339,7 +343,7 @@ def test_original_ordering_cold_warm_and_checkpoint_restore(tmp_path, monkeypatc
         solver.close()
 
     restored = _solver(tmp_path / "restored", norb, nelec)
-    restored.init(norb, nelec, orbital_ordering="original", checkpoint_dir=checkpoint)
+    restored.init(norb, nelec, checkpoint_dir=checkpoint, **ordering_kwargs)
     try:
         restored.restore_checkpoint(h1, eri, norb, nelec, verbose=0)
         assert restored.converged
@@ -361,7 +365,9 @@ def test_original_ordering_rejects_reordered_restart(tmp_path, monkeypatch):
     )
     h1 = np.diag([-1.3, -0.4, 0.8]).astype(complex)
     eri = np.zeros((3,) * 4, dtype=complex)
-    solver = _solver(tmp_path / "scratch", 3, 1, bond_dim=8)
+    solver = _solver(
+        tmp_path / "scratch", 3, 1, bond_dim=8, orbital_ordering="fiedler"
+    )
     solver.checkpoint_dir = str(tmp_path / "checkpoint")
     try:
         solver.kernel(h1, eri, 3, 1, verbose=0)
@@ -385,7 +391,11 @@ def test_original_ordering_rejects_reordered_restart(tmp_path, monkeypatch):
 
 
 def test_orbital_ordering_option_validation():
-    assert DMRGCI().orbital_ordering == "fiedler"
+    assert DMRGCI().orbital_ordering == "original"
+    assert DMRGCI().init(3, 1).orbital_ordering == "original"
+    solver = DMRGCI().init(3, 1, orbital_ordering="fiedler")
+    assert solver.orbital_ordering == "fiedler"
+    assert solver.init(3, 1).orbital_ordering == "fiedler"
     with pytest.raises(ValueError, match="orbital_ordering must be"):
         DMRGCI().init(3, 1, orbital_ordering="typo")
 
@@ -414,7 +424,7 @@ def test_casscf_restart_reuses_only_compatible_internal_mps(
         dtype=complex,
     )
     eri = np.zeros((3,) * 4, dtype=complex)
-    solver = _solver(tmp_path, 3, 1, bond_dim=8)
+    solver = _solver(tmp_path, 3, 1, bond_dim=8, orbital_ordering="fiedler")
     energy0, state0 = solver.kernel(h1, eri, 3, 1, verbose=0)
     solver.make_rdm12(state0, 3, 1)
     assert solver.convergence_info["block2_sweep_tolerance"] == solver.tol
@@ -596,6 +606,7 @@ def test_multiroot_checkpoint_only_restore_runs_no_sweeps_and_preserves_state(
         stack_memory=256,
         random_seed=2468,
         npdm_site_type=2,
+        orbital_ordering="fiedler",
     )
     energy0, _ = first.kernel(h1, eri, 3, 1, ecore=ecore, verbose=0)
     dm1_reference = [first.make_rdm1(root, 3, 1) for root in range(2)]
@@ -648,6 +659,7 @@ def test_multiroot_checkpoint_only_restore_runs_no_sweeps_and_preserves_state(
         stack_memory=256,
         random_seed=999,
         npdm_site_type=2,
+        orbital_ordering="fiedler",
     )
     energy1, states = restored.restore_checkpoint(
         hamiltonian["h1e"],
