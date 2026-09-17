@@ -56,7 +56,8 @@ def test_pyscf_schedule_is_expanded_for_direct_pyblock2():
     )
 
     # These are the anchor rows produced by the official PySCF loop.  The
-    # extra 1e-7 row reflects its literal repeated floating-point division.
+    # default endpoint remains two-site; the optional one-site tail is tested
+    # separately below.
     assert schedule.anchor_sweeps == (0, 4, 8, 12, 14, 16, 18, 20)
     assert schedule.anchor_bond_dims == (
         200,
@@ -74,11 +75,21 @@ def test_pyscf_schedule_is_expanded_for_direct_pyblock2():
         rtol=1e-14,
         atol=0.0,
     )
-    assert schedule.n_sweeps == 32
-    assert schedule.twosite_to_onesite == 24
+    assert schedule.n_sweeps == 22
+    assert schedule.twosite_to_onesite is None
     assert schedule.bond_dims[:4] == (200,) * 4
     assert schedule.bond_dims[4:8] == (400,) * 4
-    assert schedule.noises[20:] == (0.0,) * 12
+    assert schedule.noises[20:] == (0.0,) * 2
+
+    one_site = pyscf_dmrg_schedule(
+        max_bond_dimension=1000,
+        start_bond_dimension=200,
+        tol=1e-7,
+        final_one_site=True,
+    )
+    assert one_site.n_sweeps == 32
+    assert one_site.twosite_to_onesite == 24
+    assert one_site.noises[20:] == (0.0,) * 12
 
     restart = pyscf_dmrg_schedule(
         max_bond_dimension=1000, tol=1e-7, restart=True
@@ -449,11 +460,11 @@ def test_casscf_restart_reuses_only_compatible_internal_mps(
         "fresh-driver-mps-reload"
     )
     assert solver.convergence_info["schedule"]["restart"]
-    assert solver.convergence_info["schedule"]["n_sweeps"] == 10
-    assert solver.convergence_info["restart_site_conversion_sweeps"] == 2
+    assert solver.convergence_info["schedule"]["n_sweeps"] == 8
+    assert solver.convergence_info["restart_site_conversion_sweeps"] == 0
     assert solver.convergence_info["block2_sweep_tolerance"] == 0.0
-    assert solver.convergence_info["sweeps"] == 10
-    assert solver._multi_mps.dot == 1
+    assert solver.convergence_info["sweeps"] == 8
+    assert solver._multi_mps.dot == 2
     assert np.array_equal(reorder0, [2, 0, 1])
     assert np.array_equal(solver.driver.reorder_idx, reorder0)
     assert solver.convergence_info["orbital_reordering"] == reorder0.tolist()
@@ -487,7 +498,7 @@ def test_multiroot_checkpoint_resume_and_fingerprint_gate(tmp_path):
         "orbital_reordering"
     ]
     assert (checkpoint / "mps" / "GS-mps_info.bin").is_file()
-    assert first._multi_mps.dot == 1
+    assert first._multi_mps.dot == 2
     # A killed process leaves status=running; the last completed sweep is
     # nevertheless a valid pyblock2 restart image.
     manifest["status"] = "running"
@@ -509,7 +520,7 @@ def test_multiroot_checkpoint_resume_and_fingerprint_gate(tmp_path):
         orb_sym=[0] * 3,
     )
     checkpoint_state = checkpoint_driver.load_mps("GS", nroots=2)
-    assert checkpoint_state.dot == 1
+    assert checkpoint_state.dot == 2
     del checkpoint_state, checkpoint_driver
 
     resumed = DMRGCI().init(
@@ -754,11 +765,11 @@ def test_checkpoint_only_restore_rejects_a_corrupt_manifest_before_scratch(
     restored.close()
 
 
-def test_legacy_twosite_checkpoint_is_converted_before_restart(
+def test_legacy_twosite_checkpoint_is_retained_by_default_on_restart(
     tmp_path,
     monkeypatch,
 ):
-    """Old sweep checkpoints need a real 2-site to 1-site transition."""
+    """A two-site checkpoint remains two-site unless conversion is requested."""
     h1 = np.diag([-1.3, -0.4, 0.8]).astype(complex)
     eri = np.zeros((3,) * 4, dtype=complex)
     checkpoint = tmp_path / "checkpoint"
@@ -811,11 +822,11 @@ def test_legacy_twosite_checkpoint_is_converted_before_restart(
     energy1, _ = resumed.kernel(h1, eri, 3, 1, verbose=0)
 
     assert np.max(abs(energy1 - energy0)) <= ENERGY_TOL
-    assert resumed.convergence_info["restart_site_conversion_sweeps"] == 2
-    assert resumed.convergence_info["schedule"]["n_sweeps"] == 10
-    assert resumed.convergence_info["schedule"]["twosite_to_onesite"] == 2
+    assert resumed.convergence_info["restart_site_conversion_sweeps"] == 0
+    assert resumed.convergence_info["schedule"]["n_sweeps"] == 8
+    assert resumed.convergence_info["schedule"]["twosite_to_onesite"] is None
     assert resumed.convergence_info["root_orthogonality_error"] <= 1e-7
-    assert resumed._multi_mps.dot == 1
+    assert resumed._multi_mps.dot == 2
     resumed.close()
 
 

@@ -73,6 +73,7 @@ def pyscf_dmrg_schedule(
     restart_sweeps=8,
     noise_scale=1.0,
     max_davidson_threshold=None,
+    final_one_site=False,
 ):
     """Translate PySCF's official Block schedule to direct pyblock2 arrays.
 
@@ -80,7 +81,9 @@ def pyscf_dmrg_schedule(
     input file.  pyblock2 instead accepts one array indexed by sweep, so the
     anchor rows are expanded here without changing their ranges.  A restart
     follows the reference ``fullrestart`` path: maximum bond dimension,
-    zero noise, one-site sweeps, and a local threshold of ``tol / 10``.
+    zero noise, and a local threshold of ``tol / 10``.  Cold schedules retain
+    a two-site endpoint by default; set ``final_one_site=True`` to append the
+    former two-site-to-one-site finishing sweeps explicitly.
     When ``max_davidson_threshold`` is supplied, the Davidson squared-residual
     schedule is tightened independently of the PySCF noise schedule: it starts
     at ``1e-8`` and decreases by decades to the requested final threshold.
@@ -89,6 +92,7 @@ def pyscf_dmrg_schedule(
     tol = float(tol)
     restart_sweeps = int(restart_sweeps)
     noise_scale = float(noise_scale)
+    final_one_site = bool(final_one_site)
     if max_davidson_threshold is not None:
         max_davidson_threshold = float(max_davidson_threshold)
     if max_bond_dimension <= 0:
@@ -183,8 +187,12 @@ def pyscf_dmrg_schedule(
         anchor_bond_dims = tuple(bond_dims)
         anchor_thrds = tuple(thrds)
         anchor_noises = tuple(noises)
-        twosite_to_onesite = sweep + 2
-        n_sweeps = twosite_to_onesite + 8
+        if final_one_site:
+            twosite_to_onesite = sweep + 2
+            n_sweeps = twosite_to_onesite + 8
+        else:
+            twosite_to_onesite = None
+            n_sweeps = sweep
 
     return DMRGSweepSchedule(
         anchor_sweeps=anchor_sweeps,
@@ -397,6 +405,7 @@ class DMRGCI(StreamObject):
         self.thrds = []
         self.n_sweeps = 0
         self.twosite_to_onesite = None
+        self.final_one_site = False
         self.generate_schedule()
         self.dmrg_switch_tol = 1e-3
         self.restart = False
@@ -477,6 +486,7 @@ class DMRGCI(StreamObject):
         dav_rel_conv_thrd=None,
         noise_type=None,
         twosite_to_onesite=None,
+        final_one_site=None,
         random_seed=None,
         npdm_site_type=None,
         npdm_cutoff=None,
@@ -530,6 +540,8 @@ class DMRGCI(StreamObject):
             self.schedule_noise_scale = float(schedule_noise_scale)
         if schedule_thrd_max is not None:
             self.schedule_thrd_max = float(schedule_thrd_max)
+        if final_one_site is not None:
+            self.final_one_site = bool(final_one_site)
 
         explicit_controls = any(
             value is not None for value in (bond_dims, noises, thrds, n_sweeps)
@@ -659,6 +671,7 @@ class DMRGCI(StreamObject):
             restart_sweeps=self.restart_sweeps,
             noise_scale=self.schedule_noise_scale,
             max_davidson_threshold=self.schedule_thrd_max,
+            final_one_site=self.final_one_site,
         )
         self.schedule_sweeps = list(schedule.anchor_sweeps)
         self.schedule_bond_dims = list(schedule.anchor_bond_dims)
@@ -1322,15 +1335,6 @@ class DMRGCI(StreamObject):
         schedule = self._schedule_snapshot(restart=run_mode != "cold-start")
         effective_twosite_to_onesite = schedule.twosite_to_onesite
         restart_site_conversion_sweeps = 0
-        if (
-            run_mode == "cold-start"
-            and nroots > 1
-            and int(norb) > 2
-            and effective_twosite_to_onesite is None
-        ):
-            # Retain two two-site sweeps for initial optimization and leave at
-            # least one one-site sweep even for deliberately short schedules.
-            effective_twosite_to_onesite = 2 if schedule.n_sweeps >= 3 else 0
 
         if run_mode == "cold-start":
             self._release_run(remove_scratch=True)
@@ -1440,19 +1444,26 @@ class DMRGCI(StreamObject):
                         raise RuntimeError(
                             "checkpoint MPS has unsupported site type %s" % ket.dot
                         )
-                    restart_site_conversion_sweeps = 2
-                    schedule = _convert_twosite_restart_schedule(
-                        schedule,
-                        conversion_sweeps=restart_site_conversion_sweeps,
-                    )
-                    effective_twosite_to_onesite = restart_site_conversion_sweeps
-                    logger.warn(
-                        self,
-                        "loaded a two-site MPS; running %d conversion sweeps "
-                        "before the configured %d one-site restart sweeps",
-                        restart_site_conversion_sweeps,
-                        self.restart_sweeps,
-                    )
+                    if self.final_one_site:
+                        restart_site_conversion_sweeps = 2
+                        schedule = _convert_twosite_restart_schedule(
+                            schedule,
+                            conversion_sweeps=restart_site_conversion_sweeps,
+                        )
+                        effective_twosite_to_onesite = restart_site_conversion_sweeps
+                        logger.warn(
+                            self,
+                            "loaded a two-site MPS; running %d conversion sweeps "
+                            "before the configured %d one-site restart sweeps",
+                            restart_site_conversion_sweeps,
+                            self.restart_sweeps,
+                        )
+                    else:
+                        logger.note(
+                            self,
+                            "loaded a two-site MPS; retaining the two-site "
+                            "endpoint for this restart",
+                        )
             mpo = driver.get_qc_mpo(
                 h1e=h1_block2,
                 g2e=eri_block2,
@@ -1493,7 +1504,7 @@ class DMRGCI(StreamObject):
                     nroots=nroots,
                 )
             elif run_mode != "cold-start":
-                target_dot = 2 if restart_site_conversion_sweeps else 1
+                target_dot = 2 if int(ket.dot) == 2 else 1
                 ket, forward = driver.adjust_mps(ket, dot=target_dot)
                 dmrg_kwargs["forward"] = forward
             if nroots > 1:
@@ -1559,15 +1570,22 @@ class DMRGCI(StreamObject):
                     max(root_orthogonality_error, root_eigen_equation_error)
                     > root_validation_tolerance
                 ):
-                    raise RuntimeError(
+                    message = (
                         "split state-averaged MultiMPS roots are inconsistent "
-                        "with the reported energies (S-I %.3e, H-SE %.3e); "
-                        "finish the multi-root calculation with one-site sweeps"
-                        % (
-                            root_orthogonality_error,
-                            root_eigen_equation_error,
-                        )
+                        "with the reported energies (S-I %.3e, H-SE %.3e)"
+                        % (root_orthogonality_error, root_eigen_equation_error)
                     )
+                    if int(ket.dot) == 2 and not self.final_one_site:
+                        logger.warn(
+                            self,
+                            "%s; accepting the configured two-site endpoint",
+                            message,
+                        )
+                    else:
+                        raise RuntimeError(
+                            "%s; finish the multi-root calculation with "
+                            "one-site sweeps" % message
+                        )
 
             self._save_final_checkpoint_mps(ket)
 
@@ -1792,10 +1810,14 @@ class DMRGCI(StreamObject):
                 orb_sym=[0] * int(norb),
             )
             ket = driver.load_mps(mps_tag, nroots=nroots)
-            if int(ket.dot) != 1:
+            if int(ket.dot) not in (1, 2):
                 raise RuntimeError(
-                    "checkpoint-only restore requires a final one-site MPS; "
-                    "use kernel(resume=True) to convert an older two-site checkpoint"
+                    "checkpoint MPS has unsupported site type %s" % ket.dot
+                )
+            if int(ket.dot) == 2 and self.final_one_site:
+                raise RuntimeError(
+                    "checkpoint-only restore was configured for a final "
+                    "one-site MPS but found a two-site checkpoint"
                 )
             if int(ket.n_sites) != int(norb):
                 raise RuntimeError("checkpoint MPS site count does not match")
@@ -1893,11 +1915,19 @@ class DMRGCI(StreamObject):
                 max(root_orthogonality_error, root_eigen_equation_error)
                 > root_validation_tolerance
             ):
-                raise RuntimeError(
+                message = (
                     "restored checkpoint roots are inconsistent with the saved "
                     "energies (S-I %.3e, H-SE %.3e)"
                     % (root_orthogonality_error, root_eigen_equation_error)
                 )
+                if int(ket.dot) == 2 and not self.final_one_site:
+                    logger.warn(
+                        self,
+                        "%s; accepting the configured two-site endpoint",
+                        message,
+                    )
+                else:
+                    raise RuntimeError(message)
 
             self.driver = driver
             self._active_mpo = mpo
@@ -1935,6 +1965,7 @@ class DMRGCI(StreamObject):
                 "local_residual_bound": math.sqrt(final_threshold),
                 "bond_dimension": max(item.info.bond_dim for item in kets),
                 "canonical_forms": [item.canonical_form for item in kets],
+                "final_site_type": int(ket.dot),
                 "npdm_site_type": self.npdm_site_type,
                 "npdm_cutoff": self.npdm_cutoff,
                 "scratch": self._scratch,

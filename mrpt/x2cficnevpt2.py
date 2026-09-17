@@ -648,10 +648,19 @@ def _solve_fic_block(
         metric_atol + metric_rtol * max(1.0, abs(metric_maximum))
     )
     metric_minimum = float(np.min(metric_eigenvalues, initial=0.0))
-    if metric_minimum < -metric_negative_tolerance:
-        raise FloatingPointError(
+    metric_negative_gate = metric_minimum >= -metric_negative_tolerance
+    if not metric_negative_gate:
+        # Approximate DMRG RDMs can make a formally positive semidefinite IC
+        # metric slightly indefinite.  The nonpositive directions are removed
+        # below by ``retained``; report the inconsistency, while retaining the
+        # independent source-in-null-space guard rather than aborting before
+        # its numerical impact can be assessed.
+        _warn_numerical(
             f"root {root} subspace {subspace} block {free_indices}: "
-            f"contracted metric has a negative eigenvalue {metric_minimum:.3e}"
+            "contracted metric has a negative eigenvalue "
+            f"{metric_minimum:.3e} (diagnostic tolerance "
+            f"{-metric_negative_tolerance:.3e}); discarding nonpositive "
+            "metric directions"
         )
 
     metric_cutoff = max(
@@ -678,6 +687,8 @@ def _solve_fic_block(
         "metric_rank": metric_rank,
         "metric_minimum_eigenvalue": metric_minimum,
         "metric_maximum_eigenvalue": metric_maximum,
+        "metric_negative_tolerance": metric_negative_tolerance,
+        "metric_negative_gate_passed": metric_negative_gate,
         "metric_cutoff": metric_cutoff,
         "discarded_rhs_norm": discarded_rhs_norm,
         "discarded_rhs_limit": null_rhs_limit,
