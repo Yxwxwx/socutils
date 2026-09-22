@@ -581,6 +581,8 @@ class _CDERIS(lib.StreamObject):
                  _mb(getattr(self, 'vk_core', None)),
                  _mb(self.cd_pa) + _mb(self.cd_aa) + _mb(self.aaaa) + _mb(self.paaa) + _mb(getattr(self, 'vk_core', None)))
         self._scf = zcasscf._scf
+        self.max_memory = zcasscf.max_memory
+        self._aa_half = None
         self.mo = mo
         self.ncore = ncore
         self.ncas = ncas
@@ -869,6 +871,45 @@ class _CDERIS(lib.StreamObject):
 
         return vj_a_mo, vk_a_mo
 
+def _spinor_blocks(mol, left, right_blocks, target, max_memory, half=None, verbose=0):
+    """Full Coulomb transforms sharing one first-pair pass (no CD/DF).
+
+    The returned temporary owns the half transform; reuse it only for the
+    identical left pair at the same orbital point.
+    """
+    ca, cb = mol.sph2spinor_coeff()
+    if half is None:
+        half = lib.NamedTemporaryFile(dir=lib.param.TMPDIR)
+        nrr_outcore.half_e1(mol, ([ca @ c for c in left], [cb @ c for c in left]),
+                           half.name, intor='int2e_sph', aosym='s1', comp=1,
+                           max_memory=max_memory, verbose=verbose)
+    nij = left[0].shape[1] * left[1].shape[1]
+    nao = mol.nao_nr()
+    with h5py.File(half.name, 'r') as source:
+        for name, (ck, cl) in right_blocks.items():
+            nk, nl = ck.shape[1], cl.shape[1]
+            alpha = np.asarray(np.hstack((ca @ ck, ca @ cl)), order='F')
+            beta = np.asarray(np.hstack((cb @ ck, cb @ cl)), order='F')
+            result = target.create_dataset(name, (nij, nk*nl), dtype='c16')
+            # Two transformed outputs plus the AO buffer fit inside this
+            # budget; row blocking also avoids retaining a whole MO block.
+            rows = max(1, min(nij, int(min(max_memory*.25, 256)*1e6 /
+                                       (16*(nao**2 + 2*nk*nl)))))
+            for start in range(0, nij, rows):
+                stop = min(start+rows, nij)
+                buf = np.empty((stop-start, nao**2), complex)
+                offset = 0
+                for key in sorted(source['0'], key=int):
+                    data = source['0'][key]
+                    buf[:, offset:offset+data.shape[1]] = data[start:stop]
+                    offset += data.shape[1]
+                shape = (0, nk, nk, nk+nl)
+                args = (shape, np.asarray(mol.tmap()), np.asarray(mol.ao_loc), 's1')
+                result[start:stop] = (_ao2mo.r_e2(buf, alpha, *args)
+                                      + _ao2mo.r_e2(buf, beta, *args))
+    return half
+
+
 class _ERIS(object):
     def __init__(self, zcasscf, mo, method='outcore', level=1):
         mol = zcasscf.mol
@@ -877,6 +918,8 @@ class _ERIS(object):
         ncas = zcasscf.ncas
         nocc = ncore+ncas
         self._scf = zcasscf._scf
+        self.max_memory = zcasscf.max_memory
+        self._aa_half = None
         self.mo = mo
         self.ncore = ncore
         self.ncas = ncas
@@ -894,7 +937,7 @@ class _ERIS(object):
             gc.collect()
             log = logger.Logger(zcasscf.stdout, zcasscf.verbose)
             self.feri = lib.H5TmpFile()
-            max_memory = max(3000, zcasscf.max_memory*.9-mem_now)
+            max_memory = max(64, (zcasscf.max_memory-mem_now)*.5)
             if max_memory < mem_basic:
                 log.warn('Calculation needs %d MB memory, over CASSCF.max_memory (%d MB) limit',
                          (mem_basic+mem_now)/.9, zcasscf.max_memory)
@@ -902,22 +945,18 @@ class _ERIS(object):
                 #r_outcore.general(mol, (moa, moa, moa, moa), self.feri, dataname='aaaa', intor="int2e_spinor")
                 nrr_outcore.general(mol, (moa, moa, moa, moa), self.feri,
                                     dataname='aaaa', motype='ghf',
-                                    verbose=zcasscf.verbose)
+                                    max_memory=max_memory, verbose=zcasscf.verbose)
                 self.aaaa = \
                         self.feri['aaaa'][:,:].reshape((ncas, ncas, ncas, ncas))
-            elif level == 2:   
-                nrr_outcore.general(mol, (moa, moa, mo, moa), self.feri,
-                                    dataname='aapa', motype='j-spinor',
-                                    verbose=zcasscf.verbose)
-                #r_outcore.general(mol, (moa, moa, mo, moa), self.feri, dataname='aapa', intor="int2e_spinor", verbose=5)
+            elif level == 2:
+                self._aa_half = _spinor_blocks(mol, (moa, moa), {'aapa': (mo, moa)},
+                                               self.feri, max_memory, verbose=zcasscf.verbose)
                 self.paaa = self.feri['aapa'][:,:].T.reshape((nmo, ncas, ncas, ncas))
-                #r_outcore.general(mol, (mo, moa, moa, moa), self.feri, dataname='paaa', intor="int2e_spinor", verbose=5)
-                #self.paaa = self.feri['paaa'][:,:].reshape((nmo, ncas, ncas, ncas))
             else:
                 #r_outcore.general(mol, (mo, mo, mo, mo), self.feri, dataname='pppp', intor="int2e_spinor", verbose=5)
                 nrr_outcore.general(mol, (mo, mo, mo, mo), self.feri,
                                     dataname='pppp', motype='j-spinor',
-                                    verbose=zcasscf.verbose)
+                                    max_memory=max_memory, verbose=zcasscf.verbose)
                 self.pppp = self.feri['pppp'][:,:].reshape((nmo, nmo, nmo, nmo))
             
         if (level == 1):
@@ -929,10 +968,39 @@ class _ERIS(object):
             self.paaa = self.pppp[:,ncore:nocc,ncore:nocc,ncore:nocc]
             self.aaaa = self.pppp[ncore:nocc,ncore:nocc,ncore:nocc,ncore:nocc]
 
+    def second_order_blocks(self, reserved_mb=0):
+        """Reuse aa and pa half transforms at this orbital point."""
+        mol, mo = self._scf.mol, self.mo
+        a = mo[:, self.ncore:self.nocc]
+        budget = max(64, .5*(self.max_memory-lib.current_memory()[0]-reserved_mb))
+        if 'aapp' not in self.feri:
+            self._aa_half = _spinor_blocks(mol, (a, a), {'aapp': (mo, mo)}, self.feri,
+                                           budget, half=self._aa_half)
+        if 'papa' not in self.feri:
+            half = _spinor_blocks(mol, (mo, a), {'papa': (mo, a), 'paap': (a, mo)},
+                                  self.feri, budget)
+            half.close()
+        if self._aa_half is not None:
+            self._aa_half.close()
+            self._aa_half = None
+        return (self.feri['aapp'][:].reshape(len(a.T), len(a.T), mo.shape[1], mo.shape[1]).transpose(2, 3, 0, 1),
+                self.feri['papa'][:].reshape(mo.shape[1], self.ncas, mo.shape[1], self.ncas),
+                self.feri['paap'][:].reshape(mo.shape[1], self.ncas, self.ncas, mo.shape[1]))
+
     def get_jk(self, dm, mo_coeff=None, mo_occ=None):
+        # CASCI and orbital gradients request the same core density. Cache
+        # only that tagged request; responses and active JK stay independent.
+        core = (mo_coeff is not None and mo_occ is not None and np.ndim(dm) == 2
+                and np.array_equal(mo_occ, np.arange(self.mo.shape[1]) < self.ncore))
+        cached = getattr(self, '_core_jk', None)
+        if core and cached is not None and np.array_equal(dm, cached[0]):
+            return cached[1]
         if mo_coeff is not None and mo_occ is not None:
             dm = lib.tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
-        return self._scf.get_jk(self._scf.mol, dm)
+        jk = self._scf.get_jk(self._scf.mol, dm)
+        if core:
+            self._core_jk = (np.array(dm, copy=True), jk)
+        return jk
 
     def get_jk_active_mo(self, casdm1):
         nmo = self.mo.shape[1]

@@ -236,6 +236,39 @@ def davidson(
     if g.ndim != 1 or hdiag.shape != g.shape:
         raise ValueError("g and hdiag must be one-dimensional arrays of equal size")
 
+    if hasattr(hop, '_superci_frame'):
+        # Conditioning belongs to the unshifted solver too.  In particular,
+        # do not require adaptive orbital regularization to resolve tiny
+        # particle/hole occupations in the Super-CI overlap.
+        expand, restrict, diagonal, inverse_metric, _ = hop._superci_frame
+        y, energy, info = davidson(
+            lambda v: restrict(hop(expand(v))), restrict(g), diagonal,
+            sop=lambda v: v, max_stepsize=max_stepsize, tol=tol * .2,
+            neig=neig, mmax=mmax, lindep=lindep, log=log,
+        )
+        step = expand(y)
+        residual = hop(step) + g - energy * sop(step)
+        reference = abs(np.vdot(g, step) - energy)
+        raw_norm = float(np.hypot(np.linalg.norm(residual), reference))
+        white_norm = float(np.hypot(np.linalg.norm(restrict(residual)), reference))
+        residual_norm = max(raw_norm, white_norm)
+        info.update(
+            converged=residual_norm <= tol, residual_norm=residual_norm,
+            raw_full_residual=raw_norm, retained_residual=white_norm,
+            orbital_shift=0., metric_condition_bound=float(np.max(inverse_metric, initial=1.)),
+            step_norm=float(np.linalg.norm(step)),
+            retained_dimension=len(diagonal), full_dimension=len(g),
+            total_davidson_iterations=info['iterations'],
+        )
+        if info['converged']:
+            info['reason'] = 'converged_unshifted_metric_frame'
+        elif info['reason'] in ('converged', 'zero_gradient'):
+            info['reason'] = 'full_metric_residual'
+        if log is not None:
+            log.info('Super-CI unshifted metric solve: retained_res=%.3e full_res=%.3e step=%.6g',
+                     white_norm, raw_norm, info['step_norm'])
+        return step, energy, info
+
     gnorm = np.linalg.norm(g)
     if gnorm <= tol:
         info = {
@@ -657,6 +690,7 @@ def _ci_convergence_snapshot(solver):
         "run_mode",
         "restart_transport",
         "restart_requested",
+        "restart_fallback",
         "schedule_mode",
         "effective_twosite_to_onesite",
     )
@@ -664,6 +698,102 @@ def _ci_convergence_snapshot(solver):
 
 
 # note: the ncas, nelecas, ncore should all be counted as the number of spin orbitals
+def _full_eri_operators(mc, mo, raw_dm1, dm2, fock, lag):
+    """Hermitian mixed-one-body Super-CI projection, not an orbital Hessian.
+
+    The natural-occupation frame conditions the linear algebra without
+    rotating active orbitals or the DMRG MPS. Both step policies use it.
+    """
+    nc, na = mc.ncore, mc.ncas
+    no, nm = nc + na, mo.shape[1]
+    nv = nm - no
+    density, diagnostics = _physical_active_density(raw_dm1.T)
+    mc.superci_metric_diagnostics = diagnostics
+    d = raw_dm1.T
+    fc, fv = fock[:nc, :nc], fock[no:, no:]
+    fa = lag[nc:no, nc:no]
+    defect = np.linalg.norm(fa - fa.conj().T)
+    # Define the active block of the Hermitian mixed one-body operator.
+    # This is not symmetrization of a faulty full/projected Super-CI matrix.
+    fa = (fa + fa.conj().T) * .5
+    removal = np.einsum('tuvw,vw->tu', dm2, fa) - raw_dm1 * np.einsum('vw,vw->', raw_dm1, fa)
+    addition = fa - removal.T - fa @ d - d @ fa
+    lc = lag[no:, nc:no] @ (np.eye(na) - d)
+    bc = d @ lag[nc:no, :nc]
+
+    def action(x):
+        out = np.zeros_like(x)
+        cv, ca, va = x[no:, :nc], x[nc:no, :nc], x[no:, nc:no]
+        out[no:, :nc] = fv @ cv - cv @ fc + lc @ ca - va @ bc
+        out[nc:no, :nc] = (d - np.eye(na)) @ ca @ fc + addition @ ca + lc.conj().T @ cv
+        out[no:, nc:no] = fv @ va @ d + va @ removal.T - cv @ bc.conj().T
+        return out
+
+    gradient = mc.pack_uniq_var(lag - lag.conj().T)
+    size = gradient.size
+    if size != nc * (na + nv) + nv * na:
+        raise ValueError('Full-ERI Super-CI supports unscreened, unfrozen spinor rotations only')
+    hop = LinearOperator((size, size), matvec=lambda x: mc.pack_uniq_var(action(mc.unpack_uniq_var(x))), dtype=complex)
+    sop = LinearOperator((size, size), matvec=lambda x: mc.pack_uniq_var(
+        _apply_superci_metric(mc.unpack_uniq_var(x), density, nc, no)), dtype=complex)
+    diagonal = np.zeros((nm, nm))
+    diagonal[no:, :nc] = (np.diag(fv)[:, None] - np.diag(fc)[None, :]).real
+    diagonal[nc:no, :nc] = ((np.diag(d) - 1)[:, None] * np.diag(fc)[None, :] + np.diag(addition)[:, None]).real
+    diagonal[no:, nc:no] = (np.diag(fv)[:, None] * np.diag(d)[None, :] + np.diag(removal)[None, :]).real
+    hd = mc.pack_uniq_var(diagonal)
+
+    p, q = scipy.linalg.eigh(density)
+    cutoff = 1e-14
+    holes = 1 - p
+    wh = q[:, holes > cutoff] / np.sqrt(holes[holes > cutoff])
+    wp = q[:, p > cutoff] / np.sqrt(p[p > cutoff])
+    cv_size, ca_size = nv * nc, wh.shape[1] * nc
+
+    def expand(z):
+        out = np.zeros((nm, nm), complex)
+        out[no:, :nc] = z[:cv_size].reshape(nv, nc)
+        out[nc:no, :nc] = wh @ z[cv_size:cv_size+ca_size].reshape(wh.shape[1], nc)
+        out[no:, nc:no] = z[cv_size+ca_size:].reshape(nv, wp.shape[1]) @ wp.conj().T
+        return mc.pack_uniq_var(out)
+
+    def restrict(x):
+        mat = mc.unpack_uniq_var(x)
+        return np.concatenate((mat[no:, :nc].ravel(),
+            (wh.conj().T @ mat[nc:no, :nc]).ravel(), (mat[no:, nc:no] @ wp).ravel()))
+
+    white_hd = np.concatenate((diagonal[no:, :nc].ravel(),
+        (np.diag(wh.conj().T @ (d-np.eye(na)) @ wh)[:, None] * np.diag(fc)[None, :]
+         + np.diag(wh.conj().T @ addition @ wh)[:, None]).ravel(),
+        (np.diag(fv)[:, None] * np.diag(wp.conj().T @ d @ wp)[None, :]
+         + np.diag(wp.conj().T @ removal.T @ wp)[None, :]).ravel())).real
+    # B^H B is diagonal in this frame; an orbital shift is NOT mu * S.
+    shift_diag = np.concatenate((np.ones(cv_size),
+        np.repeat(1 / holes[holes > cutoff], nc), np.tile(1 / p[p > cutoff], nv)))
+    hop._superci_frame = (expand, restrict, white_hd, shift_diag, mc.max_stepsize / np.sqrt(2))
+    logger.info(mc, 'Super-CI metric frame: full=%d retained=%d cutoff=%.1e active-L antihermiticity=%.3e',
+                size, white_hd.size, cutoff, defect)
+    precond = LinearOperator((size, size), matvec=lambda x: x / np.maximum(abs(hd), 1e-8), dtype=complex)
+    return gradient, hd, hop, sop, precond, mo
+
+
+def _gen_g_hop_full(mc, mo, raw_dm1, dm2, eris):
+    if not isinstance(eris, zmc_ao2mo._ERIS) or _resolve_kramers_mode(mc):
+        raise ValueError('Full-ERI Super-CI requires full ERI and no Kramers restriction')
+    if mc.canonicalize_:
+        raise ValueError('Full-ERI Super-CI requires canonicalize_=False')
+    nc, no = mc.ncore, mc.ncore + mc.ncas
+    core = mo[:, :nc]
+    occ = np.zeros(mo.shape[1]); occ[:nc] = 1
+    jc, kc = eris.get_jk(core @ core.conj().T, mo_coeff=mo, mo_occ=occ)
+    eris.vj_c, eris.vk_c = jc, kc
+    fc = mo.conj().T @ (mc.get_hcore() + jc - kc) @ mo
+    ja, ka = eris.get_jk_active_mo(raw_dm1.T)
+    fock = fc + ja - ka
+    lag = np.zeros_like(fock)
+    lag[:, :nc] = fock[:, :nc]
+    lag[:, nc:no] = fc[:, nc:no] @ raw_dm1.T + _contract_dm2_gradient(eris, dm2)
+    return _full_eri_operators(mc, mo, raw_dm1, dm2, fock, lag)
+
 def gen_g_hop(casscf, mo, casdm1, casdm2, eris):
     if casscf.mo_coeff is None:
         casscf.mo_coeff = mo
@@ -672,6 +802,14 @@ def gen_g_hop(casscf, mo, casdm1, casdm2, eris):
     ncore = casscf.ncore
     nocc = ncas + ncore
     nmo = mo.shape[1]
+
+    # The corrected complex operator and full occupation metric are shared
+    # by both step policies on the unrestricted full-ERI route.
+    mask = casscf.uniq_var_indices(nmo, ncore, ncas, casscf.frozen)
+    if (isinstance(eris, zmc_ao2mo._ERIS) and not casscf.canonicalize_
+            and not _resolve_kramers_mode(casscf)
+            and np.count_nonzero(mask) == ncore * (nmo - ncore) + (nmo - nocc) * ncas):
+        return _gen_g_hop_full(casscf, mo, casdm1, casdm2, eris)
 
     # casdm1 = np.diag(np.diag(casdm1))
 
@@ -960,6 +1098,114 @@ def postprocess_x0(xbar, xs, ys, rhos, a, bfgs_space=10):
     return 0.5 * xbar
 
 
+def _schedule_orbital_trial(mc, gradient, step, *, accepted=True, ci_converged=True):
+    """Gate the MPS immediately before the Hamiltonian it will initialize."""
+    schedule = getattr(mc.fcisolver, 'restart_scheduler_step', None)
+    if schedule is not None:
+        # Disk resume/manual restart is a one-shot initial condition. Trials
+        # use only the current validated MPS and the actual proposed step.
+        mc.fcisolver.restart = False
+        mc.fcisolver.resume = False
+        schedule(dict(accepted=accepted, ci_solver_converged=ci_converged,
+                      orbital_gradient_norm=float(gradient),
+                      applied_orbital_step_norm=step))
+        return dict(mc.fcisolver.restart_diagnostics)
+    return None
+
+
+def _bounded_orbital_update(mc, mo, base_energy, g, hd, hop, sop, solve,
+                            radius, max_radius, tol, mmax, conv_tol,
+                            conv_tol_grad, second_order, verbose, log):
+    """Try bounded steps from one accepted point; rejected MPS are never reused.
+
+    A cold replay of the base restores live CI/MPS, its RDMs and checkpoint
+    on exhaustion/error. This follows the existing Super-CIPT replay policy
+    without requiring an in-memory copy of a native Block2 driver. Numerical
+    inner failures shrink the radius before touching any CI/MPS state.
+    """
+    gradient = float(np.linalg.norm(g))
+    trials = []
+    touched = False
+    micro_tol = (getattr(mc, 'second_order_micro_step_tol', 1e-4)
+                 if gradient > 10*conv_tol_grad else 0.)
+
+    def evaluate(coeff):
+        eri, provenance = _build_eris(mc, coeff)
+        cas = zmcscf._fake_h_for_fast_casci(mc, coeff, eri)
+        energy, ecas, ci = cas.kernel(coeff, ci0=None, verbose=verbose)
+        if not np.all(getattr(mc.fcisolver, 'converged', True)) or not np.isfinite(energy):
+            raise RuntimeError('Active-space solver failed at the trial orbitals')
+        return energy, ecas, ci, eri, provenance
+
+    try:
+        for attempt in range(6):
+            options = dict(micro_step_tol=micro_tol) if second_order else dict(step_radius=radius)
+            x, _, info = solve(hop, g, hd, sop=sop, max_stepsize=radius,
+                               tol=tol, mmax=mmax, log=log, **options)
+            info = dict(info, solver='davidson')
+            if not info['converged']:
+                trials.append(dict(attempt=attempt, radius=radius, accepted=False,
+                                   stage='orbital_solve', linear_solver=info))
+                if (info.get('reason') not in ('maximum_space', 'linear_dependence')
+                        or not np.isfinite(info.get('residual_norm', np.nan))):
+                    raise RuntimeError('Orbital solve did not converge: %s' % info)
+                log.info('Orbital solve retry: attempt=%d radius=%.5g reason=%s residual=%.3e; shrink radius',
+                         attempt, radius, info['reason'], info['residual_norm'])
+                radius *= .5
+                continue
+            dr = mc.unpack_uniq_var(x)
+            size = float(np.linalg.norm(dr))
+            if size > radius*(1+1e-10):
+                raise RuntimeError('Orbital solver exceeded its trust radius')
+            predicted = float(2*np.vdot(x, g).real)
+            if second_order:
+                predicted += info['quadratic_form']
+            proposed = mo @ expmat(dr)
+            restart = _schedule_orbital_trial(mc, gradient, size, accepted=not touched)
+            record = dict(attempt=attempt, radius=radius, step_norm=size,
+                          predicted_energy_change=predicted, accepted=False, stage='casci',
+                          linear_solver=info, restart=restart)
+            trials.append(record)
+            touched = True
+            try:
+                energy, ecas, ci, eri, provenance = evaluate(proposed)
+            except RuntimeError as error:
+                record['error'] = str(error)
+            else:
+                change = float(energy-base_energy)
+                ratio = change/predicted if predicted < -1e-16 else None
+                # Admit only noise-scale rises at already-small gradients;
+                # the unchanged outer energy and gradient tests still apply.
+                slack = conv_tol if gradient < conv_tol_grad else 0.
+                accepted = change <= slack and (abs(change) < conv_tol or
+                                                (ratio is not None and ratio >= .1))
+                record.update(accepted=bool(accepted), energy=float(energy),
+                              energy_change=change, ratio=ratio,
+                              ci_solver_diagnostics=_ci_convergence_snapshot(mc.fcisolver))
+                if accepted:
+                    next_radius = radius
+                    if ratio is not None and ratio < .25:
+                        next_radius *= .5
+                    elif ratio is not None and ratio > .75 and size >= .9*radius and change < 0:
+                        next_radius = min(max_radius, radius*1.5)
+                    return (proposed, energy, ecas, ci, eri, provenance, dr, x,
+                            info, predicted, change, ratio, next_radius, trials)
+            log.info('Orbital trial rejected: attempt=%d radius=%.5g dE=%s; retry from accepted orbitals',
+                     attempt, radius, record.get('energy_change', record.get('error')))
+            radius *= .5
+        raise RuntimeError('Six orbital trials failed (inner solve or energy acceptance)')
+    except Exception:
+        mc.converged = False
+        mc.orbital_trial_history = trials
+        if touched:
+            _schedule_orbital_trial(mc, gradient, None, accepted=False)
+            energy, ecas, ci, _, _ = evaluate(mo)
+            mc.mo_coeff, mc.e_tot, mc.e_cas, mc.ci = mo.copy(), energy, ecas, ci
+            mc.fcisolver.make_rdm12(ci, mc.ncas, mc.nelecas)
+            log.info('Restored accepted orbitals and recomputed matching CI/RDM/checkpoint')
+        raise
+
+
 def mcscf_superci(
     mc,
     mo_coeff,
@@ -979,6 +1225,7 @@ def mcscf_superci(
     diis_start_cycle=3,
     diis_start_gradient=0.02,
     callback=None,
+    second_order=False,
 ):
     # cderi is retained for compatibility with callers that supply vectors
     # directly; normal calculations use the CD object attached to the SCF.
@@ -1008,6 +1255,34 @@ def mcscf_superci(
     if use_diis and bfgs:
         raise ValueError("Super-CI DIIS and BFGS acceleration are mutually exclusive")
     kramers = _resolve_kramers_mode(mc, symm)
+    adaptive = bool(getattr(mc, "superci_adaptive", False)) and not second_order
+    build_operators, solve_davidson = gen_g_hop, davidson
+    if second_order:
+        from socutils.mcscf import zmc_second, zmc_superci_adaptive
+
+        zmc_superci_adaptive.validate(mc, mo, solver=solver, cderi=cderi, kramers=kramers)
+        if bfgs or use_diis:
+            raise ValueError('Second-order scaled AH requires BFGS and orbital DIIS disabled')
+        build_operators, solve_davidson = zmc_second.gen_g_hop, zmc_second.davidson
+        log.info('Orbital optimizer = second-order Hessian / real-space scaled AH (BAGEL scheme)')
+    elif adaptive:
+        from socutils.mcscf import zmc_superci_adaptive
+
+        zmc_superci_adaptive.validate(
+            mc, mo, solver=solver, cderi=cderi, kramers=kramers,
+        )
+        build_operators = zmc_superci_adaptive.gen_g_hop
+        solve_davidson = zmc_superci_adaptive.davidson
+        log.info("Super-CI adaptive = True (orbital shift selected by step radius)")
+    bounded = adaptive or second_order
+    if bounded and (bfgs or use_diis):
+        raise ValueError('Bounded orbital optimization requires BFGS and DIIS disabled')
+    initial_radius = getattr(mc, 'orbital_trust_start', .2)
+    micro_tol = getattr(mc, 'second_order_micro_step_tol', 1e-4)
+    if bounded and (not np.isfinite(initial_radius) or initial_radius <= 0 or
+                    not np.isfinite(micro_tol) or micro_tol < 0):
+        raise ValueError('Invalid orbital trust radius or micro-step tolerance')
+    orbital_radius = min(max_stepsize, initial_radius)
     orbital_diis = None
     if use_diis:
         orbital_diis = OrbitalDIIS(
@@ -1122,7 +1397,7 @@ def mcscf_superci(
                 casdm1.diagonal(),
             )
 
-        g, h_diag, hop, sop, precond, mo = gen_g_hop(mc, mo, casdm1, casdm2, eris)
+        g, h_diag, hop, sop, precond, mo = build_operators(mc, mo, casdm1, casdm2, eris)
         norm_gorb = norm(g)
         de_text = "inf" if not np.isfinite(de) else "%.3e" % de
         log.info(
@@ -1150,6 +1425,7 @@ def mcscf_superci(
             "orbital_step_norm": float(norm_rot),
             "natural_occupations": natural_occupations.tolist(),
             "converged": False,
+            "accepted": True,
             "ci_solver_converged": ci_converged,
             "ci_solver_diagnostics": _ci_convergence_snapshot(mc.fcisolver),
             "integral_representation": integral_info["representation"],
@@ -1158,6 +1434,8 @@ def mcscf_superci(
             "cholesky_active": integral_info["active"],
             "cholesky_naux": integral_info["naux"],
             "superci_metric": dict(mc.superci_metric_diagnostics),
+            "adaptive": adaptive,
+            "orbital_method": "second_order" if second_order else "superci",
         }
         macro_history.append(history_entry)
 
@@ -1192,6 +1470,7 @@ def mcscf_superci(
         if abs(de) < conv_tol and norm_gorb < conv_tol_grad:
             conv = True
         if conv:
+            _schedule_orbital_trial(mc, norm_gorb, None)
             history_entry["converged"] = True
             log.info(
                 "MCSCF converged | Macro = %4d | E = %22.15f | Grad norm = %.3e",
@@ -1203,258 +1482,252 @@ def mcscf_superci(
                 callback(dict(history_entry))
             break
 
-        gbar = g
-
-        t_gmres = (logger.process_clock(), logger.perf_counter())
-        BFGS_SUBSPACE = 6
-        apply_bfgs = False
-        if imacro > 0:
-            bfgs_on = 1.0
-            if not rejected and norm_gorb < bfgs_on:
-                ys.append(g - g_prev)
-                xs.append(x_prev)
-                rhos.append(2 * np.dot(ys[-1].conj(), xs[-1]).real)
-            if len(ys) > BFGS_SUBSPACE:
-                ys.pop(0)
-                xs.pop(0)
-                rhos.pop(0)
-            # if np.linalg.norm(g_prev) < norm_gorb or de > 0.0:
-            if de > 0.0:
-                log.debug(
-                    "Super-CI BFGS history reset: gradient %.6g -> %.6g",
-                    np.linalg.norm(g_prev),
-                    norm_gorb,
-                )
-                xs = []
-                ys = []
-                rhos = []
-            if bfgs is True and norm_gorb < bfgs_on:
-                gbar, a = precondition_grad(g, xs, ys, rhos, bfgs_space=BFGS_SUBSPACE)
-                apply_bfgs = True
-
-        if solver == "gmres":
-            residuals = []
-
-            def linear_callback(rk):
-                residuals.append(float(rk))
-
-            x, gmres_info = gmres(
-                hop,
-                -trust_radii * gbar,
-                M=precond,
-                maxiter=50,
-                callback=linear_callback,
-                callback_type="pr_norm",
-            )
-            last_linear_info = {
-                "solver": "gmres",
-                "converged": gmres_info == 0,
-                "iterations": len(residuals),
-                "residual_norm": residuals[-1] if residuals else None,
-                "residual_history": residuals,
-                "reason": "converged" if gmres_info == 0 else "maximum_iterations",
-            }
+        if bounded:
+            (mo_new, e_tot, e_cas, fcivec, eris, integral_info, dr, applied_x,
+             last_linear_info, e2, de, r, orbital_radius, trials) = _bounded_orbital_update(
+                mc, mo, e_last, g, h_diag, hop, sop, solve_davidson,
+                orbital_radius, max_stepsize, davidson_tol, davidson_mmax,
+                conv_tol, conv_tol_grad, second_order, verbose, log)
+            ci_converged = True
+            step_rescaled = False
+            trust_radii = orbital_radius
+            trust_action = 'accepted / bounded AH' if second_order else 'accepted / bounded Super-CI'
+            history_entry.update(linear_solver=last_linear_info, orbital_trials=trials,
+                proposed_orbital_step_norm=float(norm(dr)), applied_orbital_step_norm=float(norm(dr)),
+                step_rescaled=False, next_total_energy=float(e_tot), accepted_energy_change=de,
+                predicted_energy_change=e2,
+                prediction_model='quadratic_orbital_hessian' if second_order else 'linear_orbital_gradient',
+                next_ci_solver_diagnostics=_ci_convergence_snapshot(mc.fcisolver),
+                restart_before_trial=trials[-1]['restart'],
+                rejected_trials=sum(trial['stage'] == 'casci' and not trial['accepted'] for trial in trials),
+                inner_solver_failures=sum(trial['stage'] == 'orbital_solve' for trial in trials),
+                trial_radius=trials[-1]['radius'])
+            if r is None:
+                r = np.nan
         else:
+            gbar = g
+
+            t_gmres = (logger.process_clock(), logger.perf_counter())
+            BFGS_SUBSPACE = 6
+            apply_bfgs = False
             if imacro > 0:
-                trust_radii = max(trust_radii, 0.2)
-            x, e, last_linear_info = davidson(
-                hop,
-                trust_radii * gbar,
-                h_diag,
-                sop=sop,
-                max_stepsize=trust_radii,
-                tol=davidson_tol,
-                mmax=davidson_mmax,
-                log=log,
-            )
-            last_linear_info = dict(last_linear_info, solver="davidson")
-        linear_residual = last_linear_info["residual_norm"]
-        residual_text = "n/a" if linear_residual is None else "%.3e" % linear_residual
-        log.info(
-            "Super-CI solve = %4d | Solver = %-8s | Iterations = %4d | "
-            "Residual = %9s | Converged = %s \n",
-            imacro,
-            solver.capitalize(),
-            last_linear_info["iterations"],
-            residual_text,
-            last_linear_info["converged"],
-        )
-        history_entry["linear_solver"] = last_linear_info
-        if not last_linear_info["converged"]:
-            message = (
-                "Super-CI %s did not converge: residual %s after %d iterations"
-                % (
-                    solver,
-                    last_linear_info["residual_norm"],
-                    last_linear_info["iterations"],
-                )
-            )
-            if davidson_strict:
-                mc.superci_diagnostics = {
-                    "linear_solver": last_linear_info,
-                    "final_gradient_norm": float(norm_gorb),
-                    "converged": False,
-                    "integrals": dict(integral_info),
-                }
-                raise RuntimeError(message)
-            log.warn(message)
-        if apply_bfgs:
-            x = 0.5 * postprocess_x(x, xs, ys, rhos, a, bfgs_space=BFGS_SUBSPACE)
-        t2m = log.timer("Solving Super-CI equation", *t_gmres)
-
-        dr = mc.unpack_uniq_var(x)
-        kramers_mapping = (
-            _identify_kramers_mapping(mc, mo) if kramers else None
-        )
-        dr, kramers_rotation = _project_kramers_rotation(
-            mc,
-            mo,
-            dr,
-            force=kramers,
-            mapping=kramers_mapping,
-        )
-        step_control = max_stepsize
-        proposed_step_norm = float(norm(dr))
-        history_entry["proposed_orbital_step_norm"] = proposed_step_norm
-        if log.verbose >= logger.DEBUG:
-            for i in range(nmo):
-                for j in range(i):
-                    if abs(dr[i, j]) > 1e-2:
-                        log.debug(
-                            "Super-CI orbital step (%d,%d) = %s",
-                            i,
-                            j,
-                            dr[i, j],
-                        )
-        step_rescaled = proposed_step_norm > step_control
-        if step_rescaled:
-            dr = dr * (step_control / proposed_step_norm)
-        if kramers_rotation is not None:
-            history_entry["kramers_rotation"] = kramers_rotation
-            log.info(
-                "Kramers-projected orbital generator: input residual "
-                "%.6g, output residual %.6g, change %.6g",
-                kramers_rotation["input_generator_residual"],
-                kramers_rotation["output_generator_residual"],
-                kramers_rotation["projection_change_norm"],
-            )
-        rotation = expmat(dr)
-        mo_new = np.dot(mo, rotation)
-        if use_diis:
-            def project_generator(current_mo, generator):
-                screened = mc.unpack_uniq_var(mc.pack_uniq_var(generator))
-                if kramers:
-                    return _project_kramers_rotation(
-                        mc,
-                        current_mo,
-                        screened,
-                        force=True,
-                        mapping=kramers_mapping,
+                bfgs_on = 1.0
+                if not rejected and norm_gorb < bfgs_on:
+                    ys.append(g - g_prev)
+                    xs.append(x_prev)
+                    rhos.append(2 * np.dot(ys[-1].conj(), xs[-1]).real)
+                if len(ys) > BFGS_SUBSPACE:
+                    ys.pop(0)
+                    xs.pop(0)
+                    rhos.pop(0)
+                # if np.linalg.norm(g_prev) < norm_gorb or de > 0.0:
+                if de > 0.0:
+                    log.debug(
+                        "Super-CI BFGS history reset: gradient %.6g -> %.6g",
+                        np.linalg.norm(g_prev),
+                        norm_gorb,
                     )
-                return screened, None
+                    xs = []
+                    ys = []
+                    rhos = []
+                if bfgs is True and norm_gorb < bfgs_on:
+                    gbar, a = precondition_grad(g, xs, ys, rhos, bfgs_space=BFGS_SUBSPACE)
+                    apply_bfgs = True
 
-            diis_result = orbital_diis.update(
+            if solver == "gmres":
+                residuals = []
+
+                def linear_callback(rk):
+                    residuals.append(float(rk))
+
+                x, gmres_info = gmres(
+                    hop,
+                    -trust_radii * gbar,
+                    M=precond,
+                    maxiter=50,
+                    callback=linear_callback,
+                    callback_type="pr_norm",
+                )
+                last_linear_info = {
+                    "solver": "gmres",
+                    "converged": gmres_info == 0,
+                    "iterations": len(residuals),
+                    "residual_norm": residuals[-1] if residuals else None,
+                    "residual_history": residuals,
+                    "reason": "converged" if gmres_info == 0 else "maximum_iterations",
+                }
+            else:
+                if imacro > 0:
+                    trust_radii = max(trust_radii, 0.2)
+                x, e, last_linear_info = solve_davidson(
+                    hop,
+                    gbar if second_order else trust_radii * gbar,
+                    h_diag,
+                    sop=sop,
+                    max_stepsize=max_stepsize if second_order else trust_radii,
+                    tol=davidson_tol,
+                    mmax=davidson_mmax,
+                    log=log,
+                )
+                last_linear_info = dict(last_linear_info, solver="davidson")
+            linear_residual = last_linear_info["residual_norm"]
+            residual_text = "n/a" if linear_residual is None else "%.3e" % linear_residual
+            log.info(
+                "Super-CI solve = %4d | Solver = %-8s | Iterations = %4d | "
+                "Residual = %9s | Converged = %s \n",
+                imacro,
+                solver.capitalize(),
+                last_linear_info["iterations"],
+                residual_text,
+                last_linear_info["converged"],
+            )
+            history_entry["linear_solver"] = last_linear_info
+            if not last_linear_info["converged"]:
+                message = (
+                    "Super-CI %s did not converge: residual %s after %d iterations"
+                    % (
+                        solver,
+                        last_linear_info["residual_norm"],
+                        last_linear_info["iterations"],
+                    )
+                )
+                if davidson_strict:
+                    mc.superci_diagnostics = {
+                        "adaptive": adaptive,
+                        "linear_solver": last_linear_info,
+                        "final_gradient_norm": float(norm_gorb),
+                        "converged": False,
+                        "integrals": dict(integral_info),
+                    }
+                    raise RuntimeError(message)
+                log.warn(message)
+            if apply_bfgs:
+                x = 0.5 * postprocess_x(x, xs, ys, rhos, a, bfgs_space=BFGS_SUBSPACE)
+            t2m = log.timer("Solving Super-CI equation", *t_gmres)
+
+            dr = mc.unpack_uniq_var(x)
+            kramers_mapping = (
+                _identify_kramers_mapping(mc, mo) if kramers else None
+            )
+            dr, kramers_rotation = _project_kramers_rotation(
+                mc,
                 mo,
-                mo_new,
-                g_unpack,
-                cycle=imacro,
-                gradient_norm=norm_gorb,
-                max_stepsize=max_stepsize,
-                step_metric="frobenius",
-                projector=project_generator,
+                dr,
+                force=kramers,
+                mapping=kramers_mapping,
             )
-            dr = diis_result.generator
-            mo_new = diis_result.mo_coeff
+            step_control = max_stepsize
+            proposed_step_norm = float(norm(dr))
+            history_entry["proposed_orbital_step_norm"] = proposed_step_norm
+            if log.verbose >= logger.DEBUG:
+                for i in range(nmo):
+                    for j in range(i):
+                        if abs(dr[i, j]) > 1e-2:
+                            log.debug(
+                                "Super-CI orbital step (%d,%d) = %s",
+                                i,
+                                j,
+                                dr[i, j],
+                            )
+            step_rescaled = proposed_step_norm > step_control
+            if step_rescaled:
+                dr = dr * (step_control / proposed_step_norm)
+            if kramers_rotation is not None:
+                history_entry["kramers_rotation"] = kramers_rotation
+                log.info(
+                    "Kramers-projected orbital generator: input residual "
+                    "%.6g, output residual %.6g, change %.6g",
+                    kramers_rotation["input_generator_residual"],
+                    kramers_rotation["output_generator_residual"],
+                    kramers_rotation["projection_change_norm"],
+                )
             rotation = expmat(dr)
-            step_rescaled = bool(
-                step_rescaled or diis_result.diagnostics["step_scale"] < 1.0
-            )
-            history_entry["diis"] = diis_result.diagnostics
-        history_entry["applied_orbital_step_norm"] = float(norm(dr))
-        history_entry["step_rescaled"] = bool(step_rescaled)
-        applied_x = mc.pack_uniq_var(dr)
+            mo_new = np.dot(mo, rotation)
+            if use_diis:
+                def project_generator(current_mo, generator):
+                    screened = mc.unpack_uniq_var(mc.pack_uniq_var(generator))
+                    if kramers:
+                        return _project_kramers_rotation(
+                            mc,
+                            current_mo,
+                            screened,
+                            force=True,
+                            mapping=kramers_mapping,
+                        )
+                    return screened, None
 
-        norm_rot = np.linalg.norm(rotation - np.eye(nmo, dtype=complex))
-        # e_tot, e_cas, fcivec, _, _ = mci.kernel(mo)
-        eris, integral_info = _build_eris(mc, mo_new, cderi=cderi)
-        t2m = log.timer("update eris", *t2m)
-        mci = zmcscf._fake_h_for_fast_casci(mc, mo_new, eris)
-        e_tot, e_cas, fcivec = mci.kernel(mo_new, ci0=None, verbose=verbose)
-        ci_converged = bool(np.all(getattr(mc.fcisolver, "converged", True)))
-        if not ci_converged:
-            raise RuntimeError(
-                "The active-space CI solver did not converge after the orbital step"
-            )
+                diis_result = orbital_diis.update(
+                    mo,
+                    mo_new,
+                    g_unpack,
+                    cycle=imacro,
+                    gradient_norm=norm_gorb,
+                    max_stepsize=max_stepsize,
+                    step_metric="frobenius",
+                    projector=project_generator,
+                )
+                dr = diis_result.generator
+                mo_new = diis_result.mo_coeff
+                rotation = expmat(dr)
+                step_rescaled = bool(
+                    step_rescaled or diis_result.diagnostics["step_scale"] < 1.0
+                )
+                history_entry["diis"] = diis_result.diagnostics
+            history_entry["applied_orbital_step_norm"] = float(norm(dr))
+            history_entry["step_rescaled"] = bool(step_rescaled)
+            applied_x = mc.pack_uniq_var(dr)
 
-        # trus radius control
-        # g_new, h_diag, hop, precondition = gen_g_hop(mc, mo_new, casdm1, casdm2, eris)
-        # dg = norm(g_new) - norm(g)
-        de = e_tot - e_last  # + dg * .1
-        e2 = float(0.5 * np.vdot(applied_x, g).real)
-        r = de / e2 if abs(e2) > 1e-16 else np.inf
-
-        history_entry["next_total_energy"] = float(np.real(e_tot))
-        history_entry["accepted_energy_change"] = float(np.real(de))
-        history_entry["predicted_energy_change"] = float(np.real(e2))
-        history_entry["next_ci_solver_diagnostics"] = _ci_convergence_snapshot(
-            mc.fcisolver
-        )
-        # while(True):
-        #    if de < 0.0:
-        #        print('energy lowered, exit iteration')
-        #        break
-        #    elif (abs(r) < 2.0):
-        #        print('normal step')
-        #        break
-        #    dr = 0.5*dr
-        #    rotation = expmat(dr)
-        #    mo_new = np.dot(mo, rotation)
-        #    eris = zmc_ao2mo._CDERIS(mc, mo_new, cderi=cderi, level=2)
-        #    mci = zmcscf._fake_h_for_fast_casci(mc, mo_new, eris)
-        #    e_tot, e_cas, fcivec = mci.kernel(mo_new, ci0=None, verbose=verbose)
-        #    de = e_tot - e_last
-        #    e2 = 0.5 * np.dot(x.T.conj(), g)
-        #    r = de / e2
-        #    print(f'Energy change {de:.4e}, predicted change {e2:.4e}')
-        if False:  # r < -10 and de > 0.0:
-            trust_radii *= 0.7
-            log.debug("Super-CI rejected orbital step = %s", dr)
-            rejected = True
-            new_rot = expmat(0.01 * dr)
-            mo_new = np.dot(mo, new_rot)
+            norm_rot = np.linalg.norm(rotation - np.eye(nmo, dtype=complex))
+            # e_tot, e_cas, fcivec, _, _ = mci.kernel(mo)
             eris, integral_info = _build_eris(mc, mo_new, cderi=cderi)
             t2m = log.timer("update eris", *t2m)
-            mci = zmcscf._fake_h_for_fast_casci(mc, mo, eris)
-            log.debug(
-                "Super-CI rejected step norms: generator %.6g, rotation %.6g",
-                np.linalg.norm(dr),
-                np.linalg.norm(rotation),
+            mci = zmcscf._fake_h_for_fast_casci(mc, mo_new, eris)
+            history_entry['restart_before_trial'] = _schedule_orbital_trial(
+                mc, norm_gorb, float(norm(dr)))
+            e_tot, e_cas, fcivec = mci.kernel(mo_new, ci0=None, verbose=verbose)
+            ci_converged = bool(np.all(getattr(mc.fcisolver, "converged", True)))
+            if not ci_converged:
+                raise RuntimeError(
+                    "The active-space CI solver did not converge after the orbital step"
+                )
+
+            # trus radius control
+            # g_new, h_diag, hop, precondition = gen_g_hop(mc, mo_new, casdm1, casdm2, eris)
+            # dg = norm(g_new) - norm(g)
+            de = e_tot - e_last  # + dg * .1
+            # On the corrected route g is half the real-coordinate gradient:
+            # dE = 2 Re(g^H x). The numerator is not an orbital Hessian.
+            # Preserve the old heuristic for the other integral/rotation routes.
+            metric_frame = hasattr(hop, '_superci_frame')
+            e2 = float((2.0 if metric_frame else 0.5) * np.vdot(applied_x, g).real)
+            if second_order:
+                e2 = float(2*np.vdot(applied_x, g).real + np.vdot(applied_x, hop(applied_x)).real)
+            r = de / e2 if abs(e2) > 1e-16 else np.inf
+
+            history_entry["next_total_energy"] = float(np.real(e_tot))
+            history_entry["accepted_energy_change"] = float(np.real(de))
+            history_entry["predicted_energy_change"] = float(np.real(e2))
+            history_entry["prediction_model"] = (
+                "quadratic_orbital_hessian" if second_order else
+                "linear_orbital_gradient" if metric_frame else "legacy_superci_estimate"
             )
-            # print(rotation[np.where(abs(rotation) > 1e-4)])
-            # for dri in dr:
-            #    print(dri)
-            # for roti in rotation:
-            #    print(roti)
-            e_tot, e_cas, fcivec = mci.kernel(mo, ci0=None, verbose=verbose)
-            casdm1, casdm2 = mci.fcisolver.make_rdm12(fcivec, ncas, mc.nelecas)
-            de = e_tot - e_last
-            e_last = e_tot
-            # continue
-            trust_action = "rejected / trust reduced"
-        elif de > 0.0:
-            trust_radii *= 0.5
-            trust_action = "accepted energy rise / trust reduced"
-        elif r < 0.25:  # and de < 0.0:
-            trust_radii *= 0.5
-            trust_action = "accepted / trust reduced"
-        elif r > 0.75 and de < 0.0:
-            trust_radii = min(1.4 * trust_radii, 1.0)
-            trust_action = "accepted / trust increased"
-        else:
-            trust_action = "accepted / trust unchanged"
-        if trust_radii < 1e-2 * max_stepsize:
-            trust_radii = 1e-2 * max_stepsize
-            rejected = False
+            history_entry["next_ci_solver_diagnostics"] = _ci_convergence_snapshot(
+                mc.fcisolver
+            )
+            if de > 0.0:
+                trust_radii *= 0.5
+                trust_action = "accepted energy rise / trust reduced"
+            elif r < 0.25:  # and de < 0.0:
+                trust_radii *= 0.5
+                trust_action = "accepted / trust reduced"
+            elif r > 0.75 and de < 0.0:
+                trust_radii = min(1.4 * trust_radii, 1.0)
+                trust_action = "accepted / trust increased"
+            else:
+                trust_action = "accepted / trust unchanged"
+            if trust_radii < 1e-2 * max_stepsize:
+                trust_radii = 1e-2 * max_stepsize
+                rejected = False
         macro_wall = logger.perf_counter() - macro_wall_start
         history_entry["trust_radius"] = float(trust_radii)
         history_entry["trust_action"] = trust_action
@@ -1474,21 +1747,7 @@ def mcscf_superci(
             macro_wall,
             trust_action,
         )
-        #'''
-        # print(trust_radii)
-        # dr[::2,::2] = dr[1::2,1::2]
-        # dr[::2,1::2] = dr[1::2,::2]
-
-        rotation = expmat(dr)
         norm_rot = np.linalg.norm(dr)
-        nvar = rotation.shape[0]
-        # for i in range(nvar):
-        #    if abs(rotation[i, i]) > 1.01 or abs(rotation[i, i]) < 0.99:
-        #        print(rotation[i, i] > 1.01, rotation[i, i] < 0.99, i, i,
-        #              rotation[i, i])
-        #    for j in range(i):
-        #        if abs(rotation[i, j]) > 0.01:
-        #            continue
 
         rejected = False
         mo = mo_new
@@ -1538,6 +1797,8 @@ def mcscf_superci(
     mc.mo_energy = mo_energy
     mc.final_orbital_gradient_norm = float(norm_gorb)
     mc.superci_diagnostics = {
+        "adaptive": adaptive,
+        "orbital_method": "second_order" if second_order else "superci",
         "converged": bool(conv),
         "final_gradient_norm": float(norm_gorb),
         "energy_tolerance": float(conv_tol),

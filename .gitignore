@@ -104,13 +104,20 @@ benchmarck/kramers/results/**/*.progress.json
 # Local DMRG runtime state
 dmrg_scratch/
 dmrg_checkpoint/
+/.tmp_superci_debug/
+ref/
 
 # Shelved MRPT prototype and its validation artifacts
 /mrpt/temp/
 
 
 /tests/*
-docs/
+!/tests/test_superci_adaptive.py
+!/tests/test_zmc_second.py
+!/tests/test_superci_transactions.py
+docs/*
+!docs/bagel_zmcscf_caoh.md
+!docs/bagel_zmcscf_followup.md
 
 .pytest_cache/
 
@@ -120,4 +127,3 @@ docs/
 *.out
 *.npz
 scripts/
-

@@ -341,8 +341,9 @@ class CASSCF(zcasci.CASCI):
         'max_cycle_macro', 'max_stepsize', 'conv_tol', 'conv_tol_grad',
         'freeze_pair', 'canonicalize_', 'superci_solver', 'superci_bfgs',
         'superci_davidson_tol', 'superci_davidson_max_space',
-        'superci_davidson_strict', 'superci_diis', 'macro_history',
+        'superci_davidson_strict', 'superci_diis', 'superci_adaptive', 'macro_history',
         'superci_diagnostics', 'superci_metric_diagnostics',
+        'orbital_trust_start', 'second_order_micro_step_tol', 'orbital_trial_history',
         'cholesky_diagnostics', 'canonicalization_diagnostics',
         'final_orbital_gradient_norm', 'supercipt_level_shift',
         'supercipt_metric_tol', 'supercipt_denominator_tol',
@@ -369,6 +370,10 @@ class CASSCF(zcasci.CASCI):
         self.superci_davidson_max_space = 200
         self.superci_davidson_strict = True
         self.superci_diis = False
+        self.superci_adaptive = False
+        self.orbital_trust_start = .2
+        self.second_order_micro_step_tol = 1e-4
+        self.orbital_trial_history = []
         self.macro_history = []
         self.superci_diagnostics = None
         self.superci_metric_diagnostics = None
@@ -508,6 +513,15 @@ class CASSCF(zcasci.CASCI):
         and the returned ``mo_energy`` contains generalized-Fock energies; the
         active orbitals and CI/MPS are not transformed by this final step.
 
+        Full-ERI unrestricted, unscreened, unfrozen rotations with
+        ``canonicalize_=False`` use the corrected complex operator and
+        occupation-metric Davidson even when ``superci_adaptive=False``.
+        Set ``self.superci_adaptive = True`` to additionally solve for an
+        orbital shift that bounds the step before exponentiation. The default
+        False solves the unshifted equation. Adaptive mode requires full ERI, no Kramers
+        restriction or screened/frozen rotations, ``canonicalize_=False``
+        and ``natorb=False``. It does not install global function overrides.
+
         Returns:
             Five elements -- total energy, active-space CI energy, the
             active-space FCI coefficients, and the MCSCF canonical orbital
@@ -559,6 +573,18 @@ class CASSCF(zcasci.CASCI):
         logger.note(self, 'CASSCF energy = %#.15g', self.e_tot)
         self._finalize()
         return self.e_tot, self.e_cas, self.ci, self.mo_coeff, self.mo_energy
+
+    def second_order(self, mo_coeff=None, ci0=None, callback=None):
+        """Fixed-RDM orbital Hessian with BAGEL-style scaled augmented Hessian.
+
+        Requires full ERIs, unrestricted unscreened/unfrozen rotations,
+        natorb=False, canonicalize_=False, and no orbital DIIS/BFGS. The
+        existing active-space solver (including DMRG) supplies the 1/2-RDMs.
+        """
+        from functools import partial
+        from socutils.mcscf.zmc_superci import mcscf_superci
+        return self.superci(mo_coeff, ci0=ci0, callback=callback,
+                           _kern=partial(mcscf_superci, second_order=True))
 
     def supercipt(
         self,

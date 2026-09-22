@@ -1578,7 +1578,7 @@ class DMRGCI(StreamObject):
                     if int(ket.dot) == 2 and not self.final_one_site:
                         logger.warn(
                             self,
-                            "%s; accepting the configured two-site endpoint",
+                            "%s; marking the two-site result unconverged",
                             message,
                         )
                     else:
@@ -1600,6 +1600,11 @@ class DMRGCI(StreamObject):
             self.e_cas = _real_energy(energy)
             self.e_tot = self.e_cas + ecore_value
             self._record_convergence(run_records)
+            if nroots > 1 and max(
+                root_orthogonality_error, root_eigen_equation_error
+            ) > root_validation_tolerance:
+                self.converged = False
+                self.convergence_info["converged"] = False
             self.convergence_info.update(
                 {
                     "constant_energy_shift": ecore_value,
@@ -1637,6 +1642,24 @@ class DMRGCI(StreamObject):
                 self.convergence_info["root_eigen_equation_error"] = (
                     root_eigen_equation_error
                 )
+            if run_mode == "casscf-warm-start" and not self.converged:
+                failure = {key: self.convergence_info.get(key) for key in (
+                    "converged", "run_mode", "sweeps", "energy_change",
+                    "root_orthogonality_error", "root_eigen_equation_error",
+                )}
+                logger.warn(self, "DMRG warm restart failed validation; "
+                            "retrying the full cold schedule")
+                # Release every native object before replacing Block2's
+                # process-global frame. A failed cold solve is returned as
+                # unconverged; this retry cannot recurse indefinitely.
+                ket = ci = kets = mpo = identity_mpo = driver = None
+                self._release_run(remove_scratch=True)
+                self.restart = self._restart = False
+                result = DMRGCI.kernel(self, h1e, eri, norb, nelec,
+                    verbose=verbose, max_memory=max_memory, ecore=ecore,
+                    nroots=nroots, **_kwargs)
+                self.convergence_info["restart_fallback"] = failure
+                return result
             self._complete_checkpoint(schedule, run_mode)
             self._checkpoint_hamiltonian = {
                 "format": "socutils.dmrgci.hamiltonian-snapshot",

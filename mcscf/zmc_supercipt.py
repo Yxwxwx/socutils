@@ -268,9 +268,8 @@ def build_orbital_quantities(
     nmo = mo.shape[1]
 
     h1e = reduce(np.dot, (mo.T.conj(), mc.get_hcore(), mo))
-    dm_core_mo = np.zeros((nmo, nmo), dtype=np.complex128)
-    dm_core_mo[np.arange(ncore), np.arange(ncore)] = 1.0
-    dm_core_ao = reduce(np.dot, (mo, dm_core_mo, mo.T.conj()))
+    mo_core = mo[:, :ncore]
+    dm_core_ao = mo_core @ mo_core.conj().T
     core_occ = np.zeros(nmo)
     core_occ[:ncore] = 1.0
     vj_core, vk_core = eris.get_jk(

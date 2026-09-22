@@ -471,6 +471,42 @@ def test_casscf_restart_reuses_only_compatible_internal_mps(
     solver.close()
 
 
+@pytest.mark.parametrize('cold_retry_succeeds', [True, False])
+def test_inconsistent_warm_restart_is_retried_without_accepting_bad_energy(
+    tmp_path, monkeypatch, cold_retry_succeeds,
+):
+    from pyblock2.driver.core import DMRGDriver
+    original = DMRGDriver.dmrg
+    calls = []
+    def reported_energy_error(driver, *args, **kwargs):
+        energy = original(driver, *args, **kwargs)
+        calls.append(kwargs['n_sweeps'])
+        if len(calls) == 2 or (len(calls) == 3 and not cold_retry_succeeds):
+            return np.asarray(energy) + .01
+        return energy
+    monkeypatch.setattr(DMRGDriver, 'dmrg', reported_energy_error)
+    h1 = np.diag([-1.3, -.4, .8]).astype(complex)
+    eri = np.zeros((3,)*4, complex)
+    solver = DMRGCI().init(3, 1, nroots=2, bond_dims=[8]*8,
+        noises=[0.]*8, thrds=[1e-14]*8, n_sweeps=8, tol=1e-12,
+        scratch=tmp_path, n_threads=1, stack_memory=256)
+    try:
+        solver.kernel(h1, eri, 3, 1, verbose=0)
+        assert solver.converged
+        solver.restart_scheduler_step({'orbital_gradient_norm': 1e-4})
+        energy, _ = solver.kernel(h1, eri, 3, 1, verbose=0)
+        assert len(calls) == 3
+        assert solver.converged == cold_retry_succeeds
+        assert solver.convergence_info['run_mode'] == 'cold-start'
+        failure = solver.convergence_info['restart_fallback']
+        assert not failure['converged']
+        assert failure['root_eigen_equation_error'] > .009
+        if cold_retry_succeeds:
+            np.testing.assert_allclose(energy, [-1.3, -.4], atol=1e-10)
+    finally:
+        solver.close()
+
+
 def test_multiroot_checkpoint_resume_and_fingerprint_gate(tmp_path):
     h1 = np.diag([-1.3, -0.4, 0.8]).astype(complex)
     eri = np.zeros((3,) * 4, dtype=complex)
