@@ -15,7 +15,7 @@ from socutils.dmrg.kramers import (
     time_reverse_one_body,
 )
 from socutils.fci import zfci
-from socutils.mcscf import zmc_superci, zmcscf
+from socutils.mcscf import zmc_superci, zmcscf, zmc_ah
 from socutils.scf import spinor_hf
 
 
@@ -366,7 +366,8 @@ def test_odd_electron_kramers_pair_exact_dmrg_and_transition(tmp_path):
     assert solver.converged
     assert solver.convergence_info["root_strategy"] == "state-averaged-multimps"
     assert solver.convergence_info["effective_dav_type"] == "Normal"
-    assert solver.convergence_info["effective_twosite_to_onesite"] == 2
+    assert solver.convergence_info["effective_twosite_to_onesite"] is None
+    assert int(solver._multi_mps.dot) == 2
     assert np.max(
         abs(np.asarray(solver.convergence_info["state_average_weights"]) - 0.5)
     ) <= 1e-15
@@ -441,7 +442,8 @@ def test_general_complex_multiroot_path_remains_unrestricted(tmp_path):
     assert solver._multi_mps is not None
     assert solver.convergence_info["root_strategy"] == "state-averaged-multimps"
     assert solver.convergence_info["effective_dav_type"] == "Normal"
-    assert solver.convergence_info["effective_twosite_to_onesite"] == 2
+    assert solver.convergence_info["effective_twosite_to_onesite"] is None
+    assert int(solver._multi_mps.dot) == 2
     assert np.max(
         abs(
             np.asarray(solver.convergence_info["state_average_weights"])
@@ -536,70 +538,49 @@ def _kramers_casscf(mf, initial_mo, fcisolver=None):
     return mc
 
 
-@pytest.mark.integration
-def test_kramers_superci_orbital_diis_preserves_pairs():
-    mol, mf, initial_mo = _tilted_h_kramers_reference()
-    mc = _kramers_casscf(mf, initial_mo)
+def test_second_order_kramers_hessian_stays_in_tangent():
+    _, mf, mo = _tilted_h_kramers_reference()
+    mc = _kramers_casscf(mf, mo)
     mc.natorb = False
-    mc.superci(use_diis=True)
-
-    mapping = identify_kramers_orbitals(
-        mol,
-        mc.mo_coeff,
-        mf.get_ovlp(),
-        tolerance=1e-7,
-    )
-    assert mc.converged
-    assert mc.superci_diagnostics["kramers_restricted"]
-    assert mc.superci_diagnostics["diis"]
-    assert mc.canonicalization_diagnostics["enabled"]
-    assert mc.canonicalization_diagnostics["active_orbital_change"] == 0.0
-    assert mc.canonicalization_diagnostics["virtual_offdiagonal_after"] <= 1e-10
-    assert np.max(abs(mc.mo_energy[0::2] - mc.mo_energy[1::2])) <= 1e-10
-    assert mapping.diagnostics["subspace_closure_error"] <= 1e-7
-    assert mapping.diagnostics["partner_orbital_error"] <= 1e-7
-    assert any(
-        row.get("diis", {}).get("extrapolated", False)
-        for row in mc.macro_history
-    )
+    eris, _ = zmc_superci._build_eris(mc, mo)
+    cas = zmcscf._fake_h_for_fast_casci(mc, mo, eris)
+    _, _, ci = cas.kernel(mo, verbose=0)
+    dm1, dm2 = cas.fcisolver.make_rdm12(ci, mc.ncas, mc.nelecas)
+    gradient, diagonal, hop, *_ = zmc_ah.gen_g_hop(
+        mc, mo, dm1, dm2, eris, kramers=True)
+    rng = np.random.default_rng(819)
+    raw = rng.normal(size=len(gradient)) + 1j*rng.normal(size=len(gradient))
+    direction = hop.project(raw)
+    other = hop.project(rng.normal(size=len(gradient)) +
+                        1j*rng.normal(size=len(gradient)))
+    assert abs(np.vdot(other, hop(direction)).real -
+               np.vdot(hop(other), direction).real) < 1e-10
+    np.testing.assert_allclose(hop.project(gradient), gradient, atol=1e-13)
+    np.testing.assert_allclose(hop.project(hop(direction)), hop(direction), atol=1e-13)
+    preconditioned = hop.precondition(direction, -.01, 1e-8)
+    np.testing.assert_allclose(hop.project(preconditioned), preconditioned, atol=1e-13)
+    step, _, info = zmc_ah.davidson(hop, gradient, diagonal, tol=1e-10, mmax=20)
+    assert info['converged']
+    np.testing.assert_allclose(hop.project(step), step, atol=1e-12)
 
 
 @pytest.mark.integration
-def test_kramers_supercipt_diis_dmrg_matches_exact(tmp_path):
-    mol, mf, initial_mo = _tilted_h_kramers_reference()
-    exact = _kramers_casscf(mf, initial_mo)
-    exact.natorb = False
-    exact.supercipt(use_diis=True)
-
-    base_solver = _dmrg_solver(tmp_path, 2, 1, 2, mol=mol)
-    base_solver.kramers_restricted()
-    dmrg = _kramers_casscf(mf, initial_mo, base_solver)
-    dmrg.natorb = False
-    dmrg.callback = dmrg.fcisolver.restart_scheduler_()
-    dmrg.supercipt(use_diis=True)
-
-    assert exact.converged and dmrg.converged and dmrg.fcisolver.converged
-    assert abs(dmrg.e_tot - exact.e_tot) <= 1e-7
-    assert abs(dmrg.e_cas - exact.e_cas) <= 1e-7
-    assert abs(
-        dmrg.final_orbital_gradient_norm
-        - exact.final_orbital_gradient_norm
-    ) <= 1e-7
-    assert all(
-        row["kramers_rotation"]["output_generator_residual"] <= 1e-12
-        for row in dmrg.supercipt_history[:-1]
-    )
-    assert dmrg.fcisolver.kramers_diagnostics[
-        "raw_ensemble_residual"
-    ] <= 1e-8
-    assert (
-        dmrg.fcisolver.convergence_info["block2_sweep_tolerance"]
-        == dmrg.fcisolver.tol
-    )
-    assert dmrg.fcisolver.convergence_info[
-        "minimal_multiroot_restart_fallback"
-    ]
-    dmrg.fcisolver.close()
+def test_second_order_cd_kramers_two_step_dmrg_scf(tmp_path):
+    mol, mf, mo = _tilted_h_kramers_reference()
+    solver = _dmrg_solver(tmp_path / 'dmrg', 2, 1, 2, mol=mol)
+    mc = _kramers_casscf(mf, mo, solver)
+    mc.natorb = mc.canonicalization = False
+    mc.conv_tol, mc.conv_tol_grad = 1e-8, 1e-4
+    mc.chkfile = str(tmp_path / 'ah.chk')
+    mc.second_order()
+    assert mc.converged and mc.fcisolver.converged
+    assert mc.second_order_diagnostics['kramers_restricted']
+    assert mc.second_order_diagnostics['integrals']['factorized']
+    assert mc.final_orbital_gradient_norm < mc.conv_tol_grad
+    assert abs(mc.e_states[0]-mc.e_states[1]) < 1e-7
+    mapping = identify_kramers_orbitals(mol, mc.mo_coeff, mf.get_ovlp())
+    assert mapping.diagnostics['partner_orbital_error'] < 1e-8
+    solver.close()
 
 
 @pytest.mark.integration

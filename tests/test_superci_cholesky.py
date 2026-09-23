@@ -12,7 +12,8 @@ from socutils.dmrg.dmrgci import (
     energy_from_rdms,
 )
 from socutils.fci import zfci
-from socutils.mcscf import zmc_ao2mo, zmc_superci, zmcscf
+from socutils.mcscf import zmc_ao2mo, zmc_superci, zmcscf, zmc_ah
+from socutils.mcscf.zmc_utils import build_orbital_quantities
 from socutils.scf import spinor_hf
 
 
@@ -46,6 +47,36 @@ def _casscf(mf, mo):
     mc.canonicalize_ = False
     mc.verbose = 0
     return mc
+
+
+def test_second_order_cd_matches_full_hessian(tilted_hf):
+    _, mf_full, mf_cd, mo = tilted_hf
+    mc_full, mc_cd = _casscf(mf_full, mo), _casscf(mf_cd, mo)
+    full, _ = zmc_superci._build_eris(mc_full, mo)
+    cd, _ = zmc_superci._build_eris(mc_cd, mo)
+    cas = zmcscf._fake_h_for_fast_casci(mc_full, mo, full)
+    _, _, ci = cas.kernel(mo, verbose=0)
+    dm1, dm2 = cas.fcisolver.make_rdm12(ci, mc_full.ncas, mc_full.nelecas)
+    gradient_full, _, hop_full, *_ = zmc_ah.gen_g_hop(mc_full, mo, dm1, dm2, full)
+    gradient_cd, _, hop_cd, *_ = zmc_ah.gen_g_hop(mc_cd, mo, dm1, dm2, cd)
+    rng = np.random.default_rng(910)
+    direction = rng.normal(size=gradient_full.size) + 1j*rng.normal(size=gradient_full.size)
+    direction /= np.linalg.norm(direction)
+    np.testing.assert_allclose(gradient_cd, gradient_full, atol=1e-8)
+    np.testing.assert_allclose(hop_cd(direction), hop_full(direction), atol=2e-7)
+    assert np.linalg.norm(hop_cd(1j*direction)-1j*hop_cd(direction)) > 1e-6
+    generator = mc_cd.unpack_uniq_var(direction)
+    eps = 1e-4
+    gradients = []
+    for sign in (-1, 1):
+        rotated = mo @ scipy.linalg.expm(sign*eps*generator)
+        rotated_eris, _ = zmc_superci._build_eris(mc_cd, rotated)
+        gradients.append(build_orbital_quantities(
+            mc_cd, rotated, dm1, dm2, rotated_eris).gradient)
+    q = build_orbital_quantities(mc_cd, mo, dm1, dm2, cd)
+    expected = (gradients[1]-gradients[0])/(2*eps)
+    expected += .5*(generator@q.gradient-q.gradient@generator)
+    np.testing.assert_allclose(hop_cd(direction), mc_cd.pack_uniq_var(expected), atol=2e-7)
 
 
 @pytest.mark.parametrize(

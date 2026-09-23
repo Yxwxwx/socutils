@@ -14,7 +14,7 @@ Kramers-restricted adapter.
   triple-zeta family available for all five elements.
 - AO Coulomb integrals are represented by pivoted Cholesky vectors with
   `tau = 1e-10`.  The same cached vectors and the same X2C mean-field object
-  are used by all three methods.
+  are used by both supported methods.
 - The neutral calculation is CAS(7 electrons, 8 spinors), with six equally
   weighted roots, matching the F reference setup.
 - Active natural-orbital rotations are disabled.  Core/virtual
@@ -38,7 +38,9 @@ The compared methods are:
 
 1. exact relativistic CASSCF + full Super-CI;
 2. Block2 DMRG-SCF + full Super-CI;
-3. Block2 DMRG-SCF + Super-CIPT.
+
+The archived summary CSVs also contain results from the removed Super-CIPT
+optimizer; the current runner no longer offers that method.
 
 `macroiterations` in the summaries is the number of macroiteration
 energy/gradient evaluations, including the initial evaluation and the final
@@ -59,7 +61,7 @@ subset or force replacement of generated results:
 
 ```bash
 uv --cache-dir .cache/uv run python benchmarck/halogen_six_state.py \
-  --elements Br I At --methods dmrg-superci dmrg-supercipt
+  --elements Br I At --methods dmrg-superci
 
 uv --cache-dir .cache/uv run python benchmarck/halogen_six_state.py \
   --elements F --methods casscf-superci --force

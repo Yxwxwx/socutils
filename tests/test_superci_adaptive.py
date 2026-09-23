@@ -243,3 +243,40 @@ def test_instance_switch_separates_conditioning_from_step_control(tmp_path):
         assert (legacy.gen_g_hop, legacy.davidson) == original
         energies.append(mc.e_tot)
     assert abs(energies[0] - energies[2]) < 1e-11
+
+
+@pytest.mark.integration
+def test_forte2_microiterations_hold_ci_fixed(tmp_path):
+    mol = gto.M(atom='H 0 0 0; F .35 .27 .8035', basis='sto-3g', verbose=0)
+    mf = spinor_hf.SCF(mol).x2camf(with_gaunt=False, with_breit=False)
+    mf.init_guess = '1e'
+    mf.kernel()
+    assert mf.converged
+    mc = zmcscf.CASSCF(mf, 4, 2)
+    mc.canonicalization = False
+    mc.max_cycle_macro = 1
+    mc.conv_tol = mc.conv_tol_grad = 0.
+    mc.chkfile = str(tmp_path / 'forte2.chk')
+    eris, provenance = legacy._build_eris(mc, mc.mo_coeff)
+    cas = zmcscf._fake_h_for_fast_casci(mc, mc.mo_coeff, eris)
+    energy, _, ci0 = cas.kernel(mc.mo_coeff)
+    dm1, dm2 = mc.fcisolver.make_rdm12(ci0, mc.ncas, mc.nelecas)
+    x = np.zeros_like(mc.pack_uniq_var(np.zeros_like(mc.mo_coeff)), dtype=complex)
+    objective = legacy._FixedRDMOrbitalObjective(
+        mc, mc.mo_coeff, dm1, dm2, eris, provenance, x, None)
+    assert abs(objective.evaluate(x) - energy) < 1e-8
+    gradient = objective.gradient(x)
+    direction = np.random.default_rng(23).normal(size=len(x)) + 1j*np.random.default_rng(24).normal(size=len(x))
+    direction /= np.linalg.norm(direction)
+    eps = 1e-4
+    plus = objective.evaluate(x + eps*direction)
+    minus = objective.evaluate(x - eps*direction)
+    assert abs((plus-minus)/(2*eps) - np.vdot(gradient, direction).real) < 1e-6
+    with patch.object(mc.fcisolver, 'kernel', wraps=mc.fcisolver.kernel) as ci:
+        mc.forte2()
+    step = mc.macro_history[0]['linear_solver']
+    assert ci.call_count == 2  # initial CI, then one CI after all orbital microsteps
+    assert step['solver'] == 'fixed_rdm_lbfgs'
+    assert step['iterations'] == 6
+    assert mc.macro_history[0]['prediction_model'] == 'fixed_rdm_energy'
+    assert abs(step['fixed_rdm_energy_change']) > 1e-9

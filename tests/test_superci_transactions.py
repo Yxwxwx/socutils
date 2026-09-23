@@ -8,7 +8,7 @@ from pyscf import gto, lib
 
 from socutils.dmrg import DMRGCI
 from socutils.dmrg.dmrgci import energy_from_rdms
-from socutils.mcscf import zmcscf, zmc_superci as sci, zmc_second, zmc_superci_adaptive
+from socutils.mcscf import zmcscf, zmc_superci as sci, zmc_ah, zmc_utils, zmc_superci_adaptive
 from socutils.scf import spinor_hf
 
 
@@ -21,7 +21,7 @@ def test_real_inner_solver_recovers_before_any_ci_call(second_order):
         def hop(x):
             y = h @ np.r_[x.real, x.imag]
             return y[:12] + 1j*y[12:]
-        solve, space = zmc_second.davidson, 4
+        solve, space = zmc_ah.davidson, 4
     else:
         a = rng.normal(size=(12, 12)) + 1j*rng.normal(size=(12, 12))
         h = a.conj().T @ a + np.eye(12)
@@ -39,9 +39,9 @@ def test_real_inner_solver_recovers_before_any_ci_call(second_order):
     mc = SimpleNamespace(second_order_micro_step_tol=1e-4,
         unpack_uniq_var=unpack, fcisolver=SimpleNamespace(converged=True))
     kernel = Mock(return_value=(-1., -1., None))
-    with patch.object(sci, '_build_eris', return_value=(None, {})) as build, \
+    with patch.object(zmc_utils, '_build_eris', return_value=(None, {})) as build, \
          patch.object(zmcscf, '_fake_h_for_fast_casci', return_value=SimpleNamespace(kernel=kernel)), \
-         patch.object(sci, '_schedule_orbital_trial', wraps=sci._schedule_orbital_trial) as gate:
+         patch.object(zmc_utils, '_schedule_orbital_trial', wraps=zmc_utils._schedule_orbital_trial) as gate:
         result = sci._bounded_orbital_update(mc, np.eye(6), 0., g, np.ones(12),
             hop, lambda x: x, solve, .4, .4, 1e-8, space, 1e-8, 1e-4,
             second_order, 0, lib.logger.Logger(None, 0))
@@ -54,6 +54,32 @@ def test_real_inner_solver_recovers_before_any_ci_call(second_order):
     assert np.linalg.norm(result[6]) <= .025
 
 
+def test_ah_numerical_error_shrinks_radius_before_ci():
+    events = []
+    def solve(*args, **kwargs):
+        events.append('solve')
+        if len(events) == 1:
+            raise zmc_ah.AHNumericalError('Scaled AH has no root with a usable reference component')
+        return np.array([-.1]), 0., dict(converged=True, quadratic_form=0.)
+    def unpack(x):
+        return np.array([[0, -x[0].conjugate()], [x[0], 0]], complex)
+    def run(*args, **kwargs):
+        events.append('ci')
+        return -1., -1., None
+    mc = SimpleNamespace(second_order_micro_step_tol=1e-4,
+        unpack_uniq_var=unpack, fcisolver=SimpleNamespace(converged=True))
+    with patch.object(zmc_utils, '_build_eris', return_value=(None, {})), \
+         patch.object(zmcscf, '_fake_h_for_fast_casci',
+                      return_value=SimpleNamespace(kernel=run)):
+        result = sci._bounded_orbital_update(mc, np.eye(2), 0., np.array([.1]),
+            np.ones(1), None, None, solve, .4, .4, 1e-8, 4, 1e-8, 1e-4,
+            True, 0, lib.logger.Logger(None, 0))
+    assert events == ['solve', 'solve', 'ci']
+    assert [row['radius'] for row in result[-1]] == [.4, .2]
+    assert result[-1][0]['stage'] == 'orbital_solve'
+    assert result[-1][1]['accepted']
+
+
 @pytest.mark.parametrize('reason,residual,attempts', [
     ('maximum_space', 1., 6), ('linear_dependence', 1., 6),
     ('invalid_operator', 1., 1), ('maximum_space', np.nan, 1),
@@ -63,8 +89,8 @@ def test_inner_failure_never_touches_ci_and_preserves_failure_history(reason, re
     saved_ci = mc.ci
     solve = Mock(return_value=(None, None,
         dict(converged=False, reason=reason, residual_norm=residual)))
-    with patch.object(sci, '_build_eris') as build, \
-         patch.object(sci, '_schedule_orbital_trial') as gate:
+    with patch.object(zmc_utils, '_build_eris') as build, \
+         patch.object(zmc_utils, '_schedule_orbital_trial') as gate:
         with pytest.raises(RuntimeError, match='Six orbital trials|Orbital solve did not converge'):
             sci._bounded_orbital_update(mc, mc.mo_coeff, mc.e_tot, np.ones(1), np.ones(1),
                 None, None, solve, .4, .4, 1e-8, 4, 1e-8, 1e-4,
@@ -117,7 +143,7 @@ def test_rejected_trial_recomputes_matching_live_dmrg_state(tmp_path, mode, exha
             return result
         cas.kernel = run
         return cas
-    original_solve = zmc_second.davidson
+    original_solve = zmc_ah.davidson
     def fail_after_rejected_ci(*args, **kwargs):
         x, e, info = original_solve(*args, **kwargs)
         if exhaust == 'inner' and len(evaluated) >= 2:
@@ -125,7 +151,7 @@ def test_rejected_trial_recomputes_matching_live_dmrg_state(tmp_path, mode, exha
         return x, e, info
     try:
         with patch.object(zmcscf, '_fake_h_for_fast_casci', side_effect=inject), \
-             patch.object(zmc_second, 'davidson', side_effect=fail_after_rejected_ci):
+             patch.object(zmc_ah, 'davidson', side_effect=fail_after_rejected_ci):
             if exhaust:
                 with pytest.raises(RuntimeError, match='Six orbital trials'):
                     mc.second_order()

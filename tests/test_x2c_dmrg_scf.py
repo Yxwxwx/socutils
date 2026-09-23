@@ -31,8 +31,6 @@ def test_dmrg_casscf_production_defaults():
     assert mc.superci_davidson_tol == 1e-8
     assert mc.superci_davidson_max_space == 200
     assert mc.superci_davidson_strict
-    assert not mc.superci_diis
-    assert not mc.supercipt_diis
 
 
 @pytest.mark.parametrize(
@@ -170,38 +168,6 @@ def _subspace_projector(mo, overlap, columns):
 
 
 @pytest.mark.integration
-def test_superci_orbital_diis_reaches_unaccelerated_solution(be_x2c_reference):
-    """Exercise orbital DIIS on the ordinary complex-spinor Super-CI path."""
-    _, mf, initial_mo = be_x2c_reference
-    reference = _make_casscf(mf, initial_mo, natorb=False)
-    reference.max_cycle_macro = 30
-    reference.superci_diis = False
-    reference.kernel()
-
-    accelerated = _make_casscf(mf, initial_mo, natorb=False)
-    accelerated.max_cycle_macro = 30
-    accelerated.superci(use_diis=True)
-
-    overlap = mf.get_ovlp()
-    assert reference.converged and accelerated.converged
-    assert accelerated.superci_diagnostics['diis']
-    assert any(
-        row.get('diis', {}).get('extrapolated', False)
-        for row in accelerated.macro_history
-    )
-    assert accelerated.final_orbital_gradient_norm <= accelerated.conv_tol_grad
-    assert abs(accelerated.e_tot - reference.e_tot) <= 1e-8
-    assert np.max(
-        abs(
-            accelerated.mo_coeff.T.conj()
-            .dot(overlap)
-            .dot(accelerated.mo_coeff)
-            - np.eye(accelerated.mo_coeff.shape[1])
-        )
-    ) <= 1e-9
-
-
-@pytest.mark.integration
 @pytest.mark.parametrize('natorb', [False, True], ids=['fixed-active', 'natorb'])
 def test_cholesky_x2c_dmrg_scf_matches_exact(
         be_x2c_reference, tmp_path, natorb):
@@ -260,8 +226,6 @@ def test_cholesky_x2c_dmrg_scf_matches_exact(
     assert exact.converged and dmrg.converged and solver.converged
     assert exact.superci_diagnostics['converged']
     assert dmrg.superci_diagnostics['converged']
-    assert not exact.superci_diagnostics['diis']
-    assert not dmrg.superci_diagnostics['diis']
     assert exact.final_orbital_gradient_norm <= exact.conv_tol_grad
     assert dmrg.final_orbital_gradient_norm <= dmrg.conv_tol_grad
     assert energy_error <= 1e-7

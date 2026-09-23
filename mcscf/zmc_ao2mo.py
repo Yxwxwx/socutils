@@ -583,11 +583,25 @@ class _CDERIS(lib.StreamObject):
         self._scf = zcasscf._scf
         self.max_memory = zcasscf.max_memory
         self._aa_half = None
+        self._with_df = with_df
+        self._cderi = cderi
+        self._sph_coeff = c2
+        self._mop_sph = mop_sph
+        self._nao_nr = nao_nr
         self.mo = mo
         self.ncore = ncore
         self.ncas = ncas
         self.nocc = nocc
         log.timer('CD integral transformation', *t0)
+
+    def transform_trial_active(self, trial):
+        """Return L[P,p,u] for trial active columns without forming L[P,p,q]."""
+        trial_sph = self._sph_coeff @ trial
+        return self._build_cd_pa(
+            self._with_df, self._cderi, self._scf.mol, self._nao_nr,
+            self.mo.shape[1], trial.shape[1], trial_sph, self._mop_sph,
+            logger.new_logger(self._scf),
+        )
 
     @staticmethod
     def _half_transform(with_df, mo_sph, nao_nr, log):

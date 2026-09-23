@@ -29,7 +29,7 @@ outer convergence. The enabled mode is logged and recorded
 in `mc.superci_diagnostics['adaptive']`.
 
 Adaptive mode reuses one Krylov space across the projected orbital-shift
-search. Adaptive and second-order runs require orbital DIIS/BFGS disabled
+search. Adaptive and second-order runs require orbital BFGS disabled
 and use accepted-point retries. The DMRG warm-start gate receives the actual
 proposed step immediately before the corresponding CASCI calculation.
 
@@ -41,8 +41,7 @@ the failure is recorded in `fcisolver.convergence_info['restart_fallback']`.
 ### Second-order complex orbital optimization
 
 ```python
-mc.orbital_trust_start = 0.2  # initial Frobenius radius
-mc.max_stepsize = 0.4        # hard upper bound; default remains 0.2
+mc.second_order_max_rotation = 1.0  # independent rotation-vector norm cap
 mc.second_order_micro_step_tol = 1e-4  # 0 restores strict inner solves throughout
 mc.second_order()  # keeps the configured active-space solver, including DMRG
 ```
@@ -52,12 +51,12 @@ two-particle response) and BAGEL-style scaled augmented-Hessian iteration in
 the real tangent space of complex orbital rotations. The step bound is solved
 inside the projected AH problem. It requires full ERIs, no Kramers restriction
 or frozen/screened rotations, `canonicalize_=False`, `natorb=False`, and no
-orbital DIIS/BFGS. The three additional MO integral blocks use approximately
+orbital BFGS. The three additional MO integral blocks use approximately
 `48 * nmo**2 * ncas**2` bytes; the code checks this against available
 `mc.max_memory`. Only 1/2-RDMs are needed.
 
 Both bounded optimizers shrink the radius on rejected steps and may grow it
-after reliable boundary steps, up to `max_stepsize`. Trials start from the
+after reliable boundary steps, up to their configured caps. Trials start from the
 accepted orbitals; a rejected MPS is never used to initialize the retry.
 After six failed trials the accepted point is recomputed cold, including its
 live CI/MPS, RDMs and checkpoint, before raising an error if a trial CASCI was

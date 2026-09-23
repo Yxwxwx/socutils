@@ -17,10 +17,7 @@ They use the canonical `.x2camf()` / `.x2cmp()` driver API.
 | `09-four_component.py` | four-component Dirac-Hartree-Fock |
 | `10-casscf.py` | Cholesky CASSCF orbital optimization (needs zquatev) |
 | `11-kramers_dmrg_scf.py` | Kramers-pair X2C-DMRG-SCF (needs Block2 + zquatev) |
-| `14-supercipt.py` | Block2 X2C-DMRG-SCF with the separate Super-CIPT optimizer |
 | `15-boys-localization.py` | complex and Kramers-preserving Boys localization |
-| `16-nd_h2o8_supercipt_diis.py` | Nd3+(H2O)8 CAS(3,14), 52-root Kramers Super-CIPT/DIIS input |
-| `17-cl_cas16_diis.py` | Cl CAS(7,16), six-root DMRG Super-CIPT/Super-CI DIIS comparison, with optional Kramers restriction |
 | `18-x2c_dmrg_sc_nevpt2.py` | BH CAS(4,6) no-Kramers dense X2C-DMRG-SCF to strict-SI Wick SC-NEVPT2 (needs Block2) |
 | `19-x2c_dmrg_qd_sc_nevpt2.py` | neutral Cl CAS(5,12), six-root SA-X2C-DMRG-SCF to Bloch/canonical Van Vleck QD-SC-NEVPT2 (needs Block2) |
 | `20-h2o_scalar_sc_spatial.py` | minimal H2O scalar SC regression with alpha/beta partners contracted spatially |

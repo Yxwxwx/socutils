@@ -79,7 +79,7 @@ def get_fock(mc, mo_coeff=None, ci=None, eris=None, casdm1=None, verbose=None):
     # get_jk consumes the covariant density with the annihilation index first.
     # The transpose is invisible for real orbitals but essential for a general
     # complex spinor density.  This is the same convention used by the
-    # Super-CIPT generalized-Fock path in zmc_supercipt.py.
+    # The complex-spinor generalized Fock uses the same RDM convention.
     dm = dm_core + reduce(numpy.dot, (mocas, casdm1.T, mocas.conj().T))
     vj, vk = mc._scf.get_jk(mc.mol, dm)
     fock = mc.get_hcore() + vj - vk
@@ -341,16 +341,12 @@ class CASSCF(zcasci.CASCI):
         'max_cycle_macro', 'max_stepsize', 'conv_tol', 'conv_tol_grad',
         'freeze_pair', 'canonicalize_', 'superci_solver', 'superci_bfgs',
         'superci_davidson_tol', 'superci_davidson_max_space',
-        'superci_davidson_strict', 'superci_diis', 'superci_adaptive', 'macro_history',
+        'superci_davidson_strict', 'superci_adaptive', 'macro_history',
         'superci_diagnostics', 'superci_metric_diagnostics',
-        'orbital_trust_start', 'second_order_micro_step_tol', 'orbital_trial_history',
+        'orbital_trust_start', 'second_order_max_rotation',
+        'second_order_micro_step_tol', 'orbital_trial_history',
         'cholesky_diagnostics', 'canonicalization_diagnostics',
-        'final_orbital_gradient_norm', 'supercipt_level_shift',
-        'supercipt_metric_tol', 'supercipt_denominator_tol',
-        'supercipt_diis',
-        'orbital_symmetry', 'orbital_diis_space',
-        'orbital_diis_start_cycle', 'orbital_diis_start_gradient',
-        'supercipt_history', 'supercipt_diagnostics',
+        'final_orbital_gradient_norm', 'orbital_symmetry',
     })
 
     def __init__(self, mf_or_mol, ncas, nelecas, ncore=None, frozen=None, cholesky=True):
@@ -369,9 +365,9 @@ class CASSCF(zcasci.CASCI):
         self.superci_davidson_tol = 1e-8
         self.superci_davidson_max_space = 200
         self.superci_davidson_strict = True
-        self.superci_diis = False
         self.superci_adaptive = False
         self.orbital_trust_start = .2
+        self.second_order_max_rotation = 1.0
         self.second_order_micro_step_tol = 1e-4
         self.orbital_trial_history = []
         self.macro_history = []
@@ -380,16 +376,7 @@ class CASSCF(zcasci.CASCI):
         self.cholesky_diagnostics = None
         self.canonicalization_diagnostics = None
         self.final_orbital_gradient_norm = None
-        self.supercipt_level_shift = 0.0
-        self.supercipt_metric_tol = 1e-6
-        self.supercipt_denominator_tol = 1e-10
-        self.supercipt_diis = False
         self.orbital_symmetry = None
-        self.orbital_diis_space = 15
-        self.orbital_diis_start_cycle = 3
-        self.orbital_diis_start_gradient = 0.02
-        self.supercipt_history = []
-        self.supercipt_diagnostics = None
 
     def get_fock(self, mo_coeff=None, ci=None, eris=None, casdm1=None, verbose=None):
         return get_fock(self, mo_coeff, ci, eris, casdm1, verbose)
@@ -497,11 +484,7 @@ class CASSCF(zcasci.CASCI):
         callback=None,
         _kern=None,
         *,
-        use_diis=None,
         symm=None,
-        diis_space=None,
-        diis_start_cycle=None,
-        diis_start_gradient=None,
     ):
         '''Super-CI CASSCF orbital optimization.
 
@@ -533,6 +516,10 @@ class CASSCF(zcasci.CASCI):
         from socutils.mcscf.zmc_superci import mcscf_superci
         if _kern is None:
             _kern = mcscf_superci
+        return self._run_orbital_optimizer(_kern, mo_coeff, ci0, callback, symm)
+
+    def _run_orbital_optimizer(self, _kern, mo_coeff, ci0, callback, symm):
+        """Shared public-call setup for peer orbital optimizers."""
         if zquatev is None:
             raise RuntimeError('zquatev library is required for spinor CASSCF '
                                'orbital optimization')
@@ -542,16 +529,8 @@ class CASSCF(zcasci.CASCI):
             self.mo_coeff = mo_coeff
         if callback is None:
             callback = self.callback
-        if use_diis is None:
-            use_diis = self.superci_diis
         if symm is None:
             symm = self.orbital_symmetry
-        if diis_space is None:
-            diis_space = self.orbital_diis_space
-        if diis_start_cycle is None:
-            diis_start_cycle = self.orbital_diis_start_cycle
-        if diis_start_gradient is None:
-            diis_start_gradient = self.orbital_diis_start_gradient
 
         self.check_sanity()
         self.dump_flags()
@@ -565,90 +544,28 @@ class CASSCF(zcasci.CASCI):
                       davidson_maxiter=self.superci_davidson_max_space,
                       davidson_tol=self.superci_davidson_tol,
                       davidson_strict=self.superci_davidson_strict,
-                      use_diis=use_diis, symm=symm,
-                      diis_space=diis_space,
-                      diis_start_cycle=diis_start_cycle,
-                      diis_start_gradient=diis_start_gradient,
+                      symm=symm,
                       callback=callback)
         logger.note(self, 'CASSCF energy = %#.15g', self.e_tot)
         self._finalize()
         return self.e_tot, self.e_cas, self.ci, self.mo_coeff, self.mo_energy
 
-    def second_order(self, mo_coeff=None, ci0=None, callback=None):
+    def second_order(self, mo_coeff=None, ci0=None, callback=None, *, symm=None):
         """Fixed-RDM orbital Hessian with BAGEL-style scaled augmented Hessian.
 
-        Requires full ERIs, unrestricted unscreened/unfrozen rotations,
-        natorb=False, canonicalize_=False, and no orbital DIIS/BFGS. The
-        existing active-space solver (including DMRG) supplies the 1/2-RDMs.
+        Supports full or factorized ERIs and optional Kramers restriction.
+        Requires natorb=False, canonicalize_=False, and no orbital BFGS. The
+        active-space solver (including DMRG) supplies the 1/2-RDMs.
+        ``second_order_max_rotation`` bounds the independent rotation-vector
+        norm; its default of 1.0 matches BAGEL AugHess.
         """
+        from socutils.mcscf import zmc_ah
+        return self._run_orbital_optimizer(
+            zmc_ah.kernel, mo_coeff, ci0, callback, symm)
+
+    def forte2(self, mo_coeff=None, ci0=None, callback=None):
+        """Fixed-RDM complex L-BFGS orbitals (six microsteps), then CI/DMRG."""
         from functools import partial
         from socutils.mcscf.zmc_superci import mcscf_superci
         return self.superci(mo_coeff, ci0=ci0, callback=callback,
-                           _kern=partial(mcscf_superci, second_order=True))
-
-    def supercipt(
-        self,
-        mo_coeff=None,
-        ci0=None,
-        callback=None,
-        _kern=None,
-        *,
-        use_diis=None,
-        diis_space=None,
-        diis_start_cycle=None,
-        diis_start_gradient=None,
-    ):
-        '''Perturbative Super-CI CASSCF orbital optimization.
-
-        This is the Guo--Dutta two-component Super-CIPT optimizer.  It is an
-        explicit alternative to :meth:`superci`; calling :meth:`kernel` keeps
-        using the validated full Super-CI/Davidson optimizer.
-
-        General and Kramers-restricted complex spinors, exact CI, state
-        averages and the common Block2 :class:`socutils.dmrg.DMRGCI` solver are
-        supported.  Kramers symmetry and the full/factorized integral route
-        are inferred from the SCF object and active-space solver.  Orbital
-        DIIS is available as an explicit opt-in acceleration.
-        '''
-        del ci0  # Orbital changes invalidate untransformed CI/MPS guesses.
-        from socutils.mcscf.zmc_supercipt import mcscf_supercipt
-        if _kern is None:
-            _kern = mcscf_supercipt
-        if mo_coeff is None:
-            mo_coeff = self.mo_coeff
-        else:
-            self.mo_coeff = mo_coeff
-        if callback is None:
-            callback = self.callback
-        if use_diis is None:
-            use_diis = self.supercipt_diis
-        if diis_space is None:
-            diis_space = self.orbital_diis_space
-        if diis_start_cycle is None:
-            diis_start_cycle = self.orbital_diis_start_cycle
-        if diis_start_gradient is None:
-            diis_start_gradient = self.orbital_diis_start_gradient
-
-        self.check_sanity()
-        self.dump_flags()
-        self.converged, self.e_tot, self.e_cas, self.ci, \
-                self.mo_coeff, self.mo_energy = _kern(
-                    self, mo_coeff,
-                    max_stepsize=self.max_stepsize,
-                    conv_tol=self.conv_tol,
-                    conv_tol_grad=self.conv_tol_grad,
-                    max_cycle=self.max_cycle_macro,
-                    level_shift=self.supercipt_level_shift,
-                    metric_tol=self.supercipt_metric_tol,
-                    denominator_tol=self.supercipt_denominator_tol,
-                    verbose=self.verbose,
-                    cderi=self._cderi,
-                    use_diis=use_diis,
-                    diis_space=diis_space,
-                    diis_start_cycle=diis_start_cycle,
-                    diis_start_gradient=diis_start_gradient,
-                    callback=callback,
-                )
-        logger.note(self, 'Super-CIPT CASSCF energy = %#.15g', self.e_tot)
-        self._finalize()
-        return self.e_tot, self.e_cas, self.ci, self.mo_coeff, self.mo_energy
+                            _kern=partial(mcscf_superci, forte2=True))

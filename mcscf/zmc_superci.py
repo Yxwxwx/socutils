@@ -13,8 +13,19 @@ from socutils.mcscf import zcahf, zcasci, zmcscf, zmc_ao2mo
 from scipy.sparse.linalg import LinearOperator
 import scipy
 from numpy.linalg import norm
+from socutils.mcscf.zmc_utils import (
+    _physical_active_density,
+    _contract_dm2_gradient,
+    _build_eris,
+    _resolve_kramers_mode,
+    _identify_kramers_mapping,
+    _project_kramers_rotation,
+    _ci_convergence_snapshot,
+    _schedule_orbital_trial,
+    _bounded_orbital_update,
+    _kramers_subspace_eigh,
+)
 from socutils.mcscf.hf_superci import precondition_grad, postprocess_x
-from socutils.mcscf.orbital_diis import OrbitalDIIS
 
 
 def expmat(x):
@@ -78,31 +89,6 @@ def _canonical_generalized_eigh(projected_h, projected_s, lindep):
     return eigenvalues, eigenvectors, diagnostics
 
 
-def _physical_active_density(casdm1, tolerance=1e-7):
-    """Return a Hermitian, roundoff-bounded spinor 1-RDM for the metric."""
-    casdm1 = np.asarray(casdm1, dtype=complex)
-    hermiticity_error = float(np.max(abs(casdm1 - casdm1.T.conj())))
-    hermitian_dm1 = (casdm1 + casdm1.T.conj()) * 0.5
-    occupations, orbitals = scipy.linalg.eigh(hermitian_dm1)
-    lower_violation = max(0.0, -float(occupations[0]))
-    upper_violation = max(0.0, float(occupations[-1]) - 1.0)
-    representability_error = max(hermiticity_error, lower_violation, upper_violation)
-    if representability_error > tolerance:
-        raise RuntimeError(
-            "Super-CI active 1-RDM violates spinor N-representability by "
-            "%.6e (tolerance %.6e)" % (representability_error, tolerance)
-        )
-    bounded_occupations = np.clip(occupations, 0.0, 1.0)
-    bounded_dm1 = (orbitals * bounded_occupations).dot(orbitals.T.conj())
-    diagnostics = {
-        "dm1_hermiticity_error": hermiticity_error,
-        "minimum_natural_occupation": float(occupations[0]),
-        "maximum_natural_occupation": float(occupations[-1]),
-        "occupation_bound_correction": float(
-            np.max(abs(bounded_occupations - occupations), initial=0.0)
-        ),
-    }
-    return bounded_dm1, diagnostics
 
 
 def _apply_superci_metric(generator, active_density, ncore, nocc):
@@ -393,72 +379,8 @@ def davidson(
     return last_step, last_eig, last_info
 
 
-def _contract_dm2_gradient(eris, casdm2):
-    """Return the ``p,t`` two-particle contribution to the orbital gradient.
-
-    ``casdm2[t,u,v,w]`` follows the socutils/PySCF spinor convention
-    ``<t† v† w u>``.  For full integrals this contracts
-    ``(p u|v w) casdm2[t,u,v,w]``.  The Cholesky form uses the bilinear
-    (unconjugated) reconstruction
-    ``(p u|v w) = sum_P cd_pa[P,p,u] cd_aa[P,v,w]``.
-    """
-    if isinstance(eris, zmc_ao2mo._ERIS):
-        return lib.einsum("puvw,tuvw->pt", eris.paaa, casdm2)
-    if isinstance(eris, zmc_ao2mo._CDERIS):
-        tmp = lib.einsum("Pvw,tuvw->Ptu", eris.cd_aa, casdm2)
-        return lib.einsum("Ppu,Ptu->pt", eris.cd_pa, tmp)
-    raise TypeError("Unsupported ERI container %s" % type(eris).__name__)
 
 
-def _build_eris(mc, mo, cderi=None):
-    """Build the Super-CI integral container selected by the SCF source.
-
-    An attached ``with_df`` object (or the legacy explicit ``cderi`` argument)
-    selects the existing factorized route.  Otherwise the direct four-index
-    spinor transformation is used.  Keeping this decision in one helper is
-    important because Super-CI rebuilds the transformed integrals after every
-    accepted orbital rotation and, optionally, after active natural-orbital
-    rotations.
-
-    Returns
-    -------
-    eris
-        A :class:`~socutils.mcscf.zmc_ao2mo._CDERIS` or
-        :class:`~socutils.mcscf.zmc_ao2mo._ERIS` instance.
-    diagnostics : dict
-        Stable provenance fields shared by the macroiteration history and the
-        final Super-CI diagnostics.
-    """
-    with_df = getattr(mc._scf, "with_df", None)
-    if with_df is not None or cderi is not None:
-        eris = zmc_ao2mo._CDERIS(mc, mo, cderi=cderi, level=2)
-        from socutils.cd.cd import CD
-
-        is_cholesky = isinstance(with_df, CD)
-        return eris, {
-            "representation": "factorized",
-            "factorized": True,
-            "active": is_cholesky,
-            "container": type(eris).__name__,
-            "source": (
-                type(with_df).__name__
-                if with_df is not None
-                else "legacy-cderi"
-            ),
-            "naux": int(eris.cd_pa.shape[0]),
-            "threshold": getattr(with_df, "tau", None),
-        }
-
-    eris = zmc_ao2mo._ERIS(mc, mo, level=2)
-    return eris, {
-        "representation": "full",
-        "factorized": False,
-        "active": False,
-        "container": type(eris).__name__,
-        "source": "full-integral",
-        "naux": None,
-        "threshold": None,
-    }
 
 
 def _subspace_eigh(casscf, matrix, mo_subspace):
@@ -473,62 +395,6 @@ def _subspace_eigh(casscf, matrix, mo_subspace):
     return scipy.linalg.eigh(matrix)
 
 
-def _kramers_subspace_eigh(casscf, matrix, mo_subspace):
-    """Diagonalize a Kramers-invariant MO subspace without pair-order assumptions.
-
-    ``zquatev`` expects a canonical Kramers basis.  The actual partners and
-    their phases are therefore identified in the AO metric first, and the
-    returned eigenvectors are transformed back to the caller's MO ordering.
-    """
-    from socutils.dmrg.kramers import (
-        identify_kramers_orbitals,
-        time_reverse_one_body,
-    )
-    from socutils.lib import zquatev
-
-    matrix = np.asarray(matrix, dtype=np.complex128)
-    mo_subspace = np.asarray(mo_subspace, dtype=np.complex128)
-    nmo = matrix.shape[0]
-    if matrix.shape != (nmo, nmo) or mo_subspace.shape[1] != nmo:
-        raise ValueError("Kramers subspace matrix and orbitals disagree")
-    if nmo == 0:
-        return np.empty(0), np.empty((0, 0), dtype=np.complex128)
-    if nmo % 2:
-        raise ValueError("a Kramers orbital subspace must have even dimension")
-
-    mapping = identify_kramers_orbitals(
-        casscf.mol,
-        mo_subspace,
-        casscf._scf.get_ovlp(),
-        tolerance=1e-8,
-    )
-    pair_basis = np.zeros((nmo, nmo), dtype=np.complex128)
-    for pair_index, ((first, second), phase) in enumerate(
-        zip(mapping.pairs, mapping.phases)
-    ):
-        phase = phase / abs(phase)
-        pair_basis[first, 2 * pair_index] = 1.0
-        pair_basis[second, 2 * pair_index + 1] = phase
-
-    paired_matrix = reduce(
-        np.dot,
-        (pair_basis.T.conj(), matrix, pair_basis),
-    )
-    canonical_time_reversal = np.zeros_like(paired_matrix)
-    canonical_time_reversal[1::2, 0::2] = np.eye(nmo // 2)
-    canonical_time_reversal[0::2, 1::2] = -np.eye(nmo // 2)
-    paired_matrix = 0.5 * (
-        paired_matrix
-        + time_reverse_one_body(canonical_time_reversal, paired_matrix)
-    )
-    paired_matrix = 0.5 * (paired_matrix + paired_matrix.T.conj())
-
-    block_order = np.r_[np.arange(0, nmo, 2), np.arange(1, nmo, 2)]
-    block_matrix = paired_matrix[np.ix_(block_order, block_order)]
-    eigenvalues, block_vectors = zquatev.eigh(block_matrix, iop=1)
-    paired_vectors = np.zeros_like(block_vectors)
-    paired_vectors[block_order] = block_vectors
-    return eigenvalues, pair_basis.dot(paired_vectors)
 
 
 def _active_natural_orbitals(casscf, casdm1, mo_active):
@@ -536,165 +402,12 @@ def _active_natural_orbitals(casscf, casdm1, mo_active):
     return _subspace_eigh(casscf, -casdm1, mo_active)
 
 
-def _resolve_kramers_mode(casscf, symm=None):
-    """Infer Kramers mode from the reference or active-space solver."""
-    from socutils.scf import spinor_hf
-
-    if symm is not None:
-        symm = str(symm).lower()
-        if symm != "kramers":
-            raise ValueError("symm must be None or 'kramers'")
-    native = isinstance(casscf._scf, spinor_hf.KRHF) or getattr(
-        casscf.fcisolver, "kramers_adapter", None
-    ) is not None
-    return bool(native or symm == "kramers")
 
 
-def _identify_kramers_mapping(casscf, mo):
-    from socutils.dmrg.kramers import (
-        identify_kramers_orbitals,
-    )
-
-    return identify_kramers_orbitals(
-        casscf.mol,
-        mo,
-        casscf._scf.get_ovlp(),
-        tolerance=1e-8,
-    )
 
 
-def _project_kramers_rotation(
-    casscf,
-    mo,
-    generator,
-    *,
-    force=False,
-    mapping=None,
-):
-    """Project a generator onto the allowed Kramers-invariant tangent space.
-
-    The ordinary CASSCF mask can contain constraints beyond the
-    core/active/virtual partition (``frozen``, ``freeze_pair`` and ``irrep``).
-    Such a mask need not itself be closed under time reversal.  The admissible
-    KR tangent is therefore the intersection of the full anti-Hermitian support
-    with its time-reversed image.  This freezes the partner direction as well
-    when only one member of a Kramers-related rotation was excluded.
-    """
-    from socutils.dmrg.kramers import time_reverse_one_body
-    from socutils.scf import spinor_hf
-
-    if not force and not isinstance(casscf._scf, spinor_hf.KRHF):
-        return generator, None
-
-    if mapping is None:
-        mapping = _identify_kramers_mapping(casscf, mo)
-    # Use the phase-resolved, exactly sparse representation rather than the
-    # measured matrix's roundoff-level off-pair entries.  This makes the
-    # symmetry projection idempotent and prevents a sequence of orbital steps
-    # from accumulating Kramers-closure drift.
-    time_reversal = np.zeros_like(mapping.time_reversal)
-    ncore = casscf.ncore
-    nocc = ncore + casscf.ncas
-
-    def orbital_space(index):
-        if index < ncore:
-            return "core"
-        if index < nocc:
-            return "active"
-        return "virtual"
-
-    for (first, second), phase in zip(mapping.pairs, mapping.phases):
-        if orbital_space(first) != orbital_space(second):
-            raise RuntimeError(
-                "a Kramers orbital pair crosses a core/active/virtual boundary"
-            )
-        phase /= abs(phase)
-        time_reversal[second, first] = phase
-        time_reversal[first, second] = -phase
-
-    nonzero = abs(time_reversal) > 0.0
-    if not (
-        np.all(np.count_nonzero(nonzero, axis=0) == 1)
-        and np.all(np.count_nonzero(nonzero, axis=1) == 1)
-    ):
-        raise RuntimeError(
-            "the Kramers orbital mapping is not a signed permutation"
-        )
-    partners = np.argmax(nonzero, axis=1)
-
-    # Build the complete support explicitly instead of calling pack_uniq_var:
-    # the latter invokes screen_irrep(), which mutates its matrix argument.
-    # ``uniq_var_indices`` is the authoritative lower-triangle mask and already
-    # includes frozen, freeze_pair and irrep restrictions.
-    nmo = generator.shape[0]
-    lower_allowed = np.asarray(
-        casscf.uniq_var_indices(nmo, ncore, casscf.ncas, casscf.frozen),
-        dtype=bool,
-    )
-    if lower_allowed.shape != generator.shape:
-        raise ValueError("orbital generator and allowed-variable mask disagree")
-    allowed_support = lower_allowed | lower_allowed.T
-    time_reversed_support = allowed_support[np.ix_(partners, partners)]
-    intersection_support = allowed_support & time_reversed_support
-
-    input_residual = float(
-        np.max(abs(generator - time_reverse_one_body(time_reversal, generator)))
-    )
-    # The intersection support is symmetric and invariant under time reversal,
-    # so support screening, anti-Hermitization and KR symmetrization commute.
-    # A final explicit screen removes only roundoff and cannot break KR.
-    screened = np.zeros_like(generator, dtype=np.complex128)
-    screened[intersection_support] = generator[intersection_support]
-    screened = (screened - screened.T.conj()) * 0.5
-    projected = (
-        screened + time_reverse_one_body(time_reversal, screened)
-    ) * 0.5
-    projected = (projected - projected.T.conj()) * 0.5
-    projected[~intersection_support] = 0.0
-    output_residual = float(
-        np.max(abs(projected - time_reverse_one_body(time_reversal, projected)))
-    )
-    forbidden_residual = float(
-        np.max(abs(projected[~intersection_support]), initial=0.0)
-    )
-    return projected, {
-        "input_generator_residual": input_residual,
-        "output_generator_residual": output_residual,
-        "projection_change_norm": float(norm(projected - generator)),
-        "allowed_support_size": int(np.count_nonzero(allowed_support)),
-        "intersection_support_size": int(
-            np.count_nonzero(intersection_support)
-        ),
-        "support_directions_removed_by_kramers": int(
-            np.count_nonzero(allowed_support & ~intersection_support)
-        ),
-        "forbidden_support_residual": forbidden_residual,
-        "orbital_closure_before_step": mapping.diagnostics["subspace_closure_error"],
-        "orbital_partner_error_before_step": mapping.diagnostics[
-            "partner_orbital_error"
-        ],
-        "pairs": mapping.pairs,
-    }
 
 
-def _ci_convergence_snapshot(solver):
-    info = getattr(solver, "convergence_info", None) or {}
-    keys = (
-        "sweeps",
-        "energy_change",
-        "discarded_weight",
-        "local_residual_bound",
-        "bond_dimension",
-        "npdm_site_type",
-        "npdm_cutoff",
-        "run_mode",
-        "restart_transport",
-        "restart_requested",
-        "restart_fallback",
-        "schedule_mode",
-        "effective_twosite_to_onesite",
-    )
-    return {key: info[key] for key in keys if key in info}
 
 
 # note: the ncas, nelecas, ncore should all be counted as the number of spin orbitals
@@ -1098,112 +811,120 @@ def postprocess_x0(xbar, xs, ys, rhos, a, bfgs_space=10):
     return 0.5 * xbar
 
 
-def _schedule_orbital_trial(mc, gradient, step, *, accepted=True, ci_converged=True):
-    """Gate the MPS immediately before the Hamiltonian it will initialize."""
-    schedule = getattr(mc.fcisolver, 'restart_scheduler_step', None)
-    if schedule is not None:
-        # Disk resume/manual restart is a one-shot initial condition. Trials
-        # use only the current validated MPS and the actual proposed step.
-        mc.fcisolver.restart = False
-        mc.fcisolver.resume = False
-        schedule(dict(accepted=accepted, ci_solver_converged=ci_converged,
-                      orbital_gradient_norm=float(gradient),
-                      applied_orbital_step_norm=step))
-        return dict(mc.fcisolver.restart_diagnostics)
-    return None
 
 
-def _bounded_orbital_update(mc, mo, base_energy, g, hd, hop, sop, solve,
-                            radius, max_radius, tol, mmax, conv_tol,
-                            conv_tol_grad, second_order, verbose, log):
-    """Try bounded steps from one accepted point; rejected MPS are never reused.
+class _FixedRDMOrbitalObjective:
+    """Forte2-style orbital objective: rotate MOs while keeping CI RDMs fixed."""
 
-    A cold replay of the base restores live CI/MPS, its RDMs and checkpoint
-    on exhaustion/error. This follows the existing Super-CIPT replay policy
-    without requiring an in-memory copy of a native Block2 driver. Numerical
-    inner failures shrink the radius before touching any CI/MPS state.
-    """
-    gradient = float(np.linalg.norm(g))
-    trials = []
-    touched = False
-    micro_tol = (getattr(mc, 'second_order_micro_step_tol', 1e-4)
-                 if gradient > 10*conv_tol_grad else 0.)
+    def __init__(self, mc, mo, dm1, dm2, eris, provenance, x, quantities):
+        self.mc, self.mo, self.dm1, self.dm2 = mc, mo.copy(), dm1, dm2
+        self.eris, self.provenance = eris, provenance
+        self.x = x.copy()
+        self.unitary = np.eye(mo.shape[1], dtype=complex)
+        self.quantities = quantities
 
-    def evaluate(coeff):
-        eri, provenance = _build_eris(mc, coeff)
-        cas = zmcscf._fake_h_for_fast_casci(mc, coeff, eri)
-        energy, ecas, ci = cas.kernel(coeff, ci0=None, verbose=verbose)
-        if not np.all(getattr(mc.fcisolver, 'converged', True)) or not np.isfinite(energy):
-            raise RuntimeError('Active-space solver failed at the trial orbitals')
-        return energy, ecas, ci, eri, provenance
+    def evaluate(self, x):
+        delta = x - self.x
+        if np.any(delta):
+            rotation = expmat(self.mc.unpack_uniq_var(delta))
+            self.unitary = self.unitary @ rotation
+            self.mo = self.mo @ rotation
+            self.eris, self.provenance = _build_eris(self.mc, self.mo)
+            self.x = x.copy()
+            self.quantities = None
+        mci = zmcscf._fake_h_for_fast_casci(self.mc, self.mo, self.eris)
+        h1, ecore = mci.get_h1eff(self.mo)
+        energy = (np.einsum('pq,pq->', h1, self.dm1)
+                  + .5*np.einsum('pqrs,pqrs->', self.eris.aaaa, self.dm2)
+                  + ecore)
+        if not np.isfinite(energy) or abs(energy.imag) > 1e-8:
+            raise RuntimeError('Fixed-RDM orbital energy is not real and finite')
+        return float(energy.real)
 
-    try:
-        for attempt in range(6):
-            options = dict(micro_step_tol=micro_tol) if second_order else dict(step_radius=radius)
-            x, _, info = solve(hop, g, hd, sop=sop, max_stepsize=radius,
-                               tol=tol, mmax=mmax, log=log, **options)
-            info = dict(info, solver='davidson')
-            if not info['converged']:
-                trials.append(dict(attempt=attempt, radius=radius, accepted=False,
-                                   stage='orbital_solve', linear_solver=info))
-                if (info.get('reason') not in ('maximum_space', 'linear_dependence')
-                        or not np.isfinite(info.get('residual_norm', np.nan))):
-                    raise RuntimeError('Orbital solve did not converge: %s' % info)
-                log.info('Orbital solve retry: attempt=%d radius=%.5g reason=%s residual=%.3e; shrink radius',
-                         attempt, radius, info['reason'], info['residual_norm'])
-                radius *= .5
-                continue
-            dr = mc.unpack_uniq_var(x)
-            size = float(np.linalg.norm(dr))
-            if size > radius*(1+1e-10):
-                raise RuntimeError('Orbital solver exceeded its trust radius')
-            predicted = float(2*np.vdot(x, g).real)
-            if second_order:
-                predicted += info['quadratic_form']
-            proposed = mo @ expmat(dr)
-            restart = _schedule_orbital_trial(mc, gradient, size, accepted=not touched)
-            record = dict(attempt=attempt, radius=radius, step_norm=size,
-                          predicted_energy_change=predicted, accepted=False, stage='casci',
-                          linear_solver=info, restart=restart)
-            trials.append(record)
-            touched = True
-            try:
-                energy, ecas, ci, eri, provenance = evaluate(proposed)
-            except RuntimeError as error:
-                record['error'] = str(error)
-            else:
-                change = float(energy-base_energy)
-                ratio = change/predicted if predicted < -1e-16 else None
-                # Admit only noise-scale rises at already-small gradients;
-                # the unchanged outer energy and gradient tests still apply.
-                slack = conv_tol if gradient < conv_tol_grad else 0.
-                accepted = change <= slack and (abs(change) < conv_tol or
-                                                (ratio is not None and ratio >= .1))
-                record.update(accepted=bool(accepted), energy=float(energy),
-                              energy_change=change, ratio=ratio,
-                              ci_solver_diagnostics=_ci_convergence_snapshot(mc.fcisolver))
-                if accepted:
-                    next_radius = radius
-                    if ratio is not None and ratio < .25:
-                        next_radius *= .5
-                    elif ratio is not None and ratio > .75 and size >= .9*radius and change < 0:
-                        next_radius = min(max_radius, radius*1.5)
-                    return (proposed, energy, ecas, ci, eri, provenance, dr, x,
-                            info, predicted, change, ratio, next_radius, trials)
-            log.info('Orbital trial rejected: attempt=%d radius=%.5g dE=%s; retry from accepted orbitals',
-                     attempt, radius, record.get('energy_change', record.get('error')))
-            radius *= .5
-        raise RuntimeError('Six orbital trials failed (inner solve or energy acceptance)')
-    except Exception:
-        mc.converged = False
-        mc.orbital_trial_history = trials
-        if touched:
-            _schedule_orbital_trial(mc, gradient, None, accepted=False)
-            energy, ecas, ci, _, _ = evaluate(mo)
-            mc.mo_coeff, mc.e_tot, mc.e_cas, mc.ci = mo.copy(), energy, ecas, ci
-            mc.fcisolver.make_rdm12(ci, mc.ncas, mc.nelecas)
-            log.info('Restored accepted orbitals and recomputed matching CI/RDM/checkpoint')
-        raise
+    def gradient(self, x):
+        if self.quantities is None:
+            from socutils.mcscf.zmc_utils import build_orbital_quantities
+            self.quantities = build_orbital_quantities(
+                self.mc, self.mo, self.dm1, self.dm2, self.eris)
+        # dE = 2 Re(g^H dR) in the independent complex rotation variables.
+        return 2*self.mc.pack_uniq_var(self.quantities.gradient)
+
+    def hess_diag(self, x):
+        q = self.quantities
+        nc, no, nm = self.mc.ncore, self.mc.ncore+self.mc.ncas, self.mo.shape[1]
+        f = np.diag(q.fock_effective).real
+        occupation = np.diag(self.dm1).real
+        lagrangian = np.diag(q.lagrangian)[nc:no].real
+        h = np.zeros((nm, nm))
+        h[no:, :nc] = 2*(f[no:, None] - f[None, :nc])
+        h[no:, nc:no] = 2*(f[no:, None]*occupation[None, :] - lagrangian[None, :])
+        h[nc:no, :nc] = 2*((f[nc:no]-lagrangian)[:, None]
+                            - (1-occupation)[:, None]*f[None, :nc])
+        return self.mc.pack_uniq_var(h)
+
+
+def _fixed_rdm_lbfgs_step(mc, mo, dm1, dm2, eris, provenance, x, quantities,
+                         max_dir, grad_tol):
+    """Forte2's six max-correction L-BFGS microsteps, reset every macro."""
+    objective = _FixedRDMOrbitalObjective(
+        mc, mo, dm1, dm2, eris, provenance, x, quantities)
+    x = x.copy()
+    initial_energy = energy = objective.evaluate(x)
+    gradient = objective.gradient(x)
+    initial_gradient_norm = float(np.linalg.norm(gradient))
+    diagonal = objective.hess_diag(x)
+    cutoff = max(1e-12, 1e-10*np.max(abs(diagonal), initial=0.))
+    mask = abs(diagonal) > cutoff
+    pairs = []
+    last_x, last_gradient = x.copy(), gradient.copy()
+    converged = initial_gradient_norm <= grad_tol*max(1., np.linalg.norm(x))
+    skipped = 0
+    iterations = 0
+    while not converged and iterations < 6:
+        direction = gradient.copy()
+        alphas = []
+        for step, change, rho in reversed(pairs):
+            alpha = rho*np.vdot(step, direction)
+            direction -= alpha*change
+            alphas.append(alpha)
+        direction[mask] /= diagonal[mask]
+        for (step, change, rho), alpha in zip(pairs, reversed(alphas)):
+            beta = rho*np.vdot(change, direction)
+            direction += (alpha-beta)*step
+        direction *= -1
+        if not np.all(np.isfinite(direction)):
+            raise RuntimeError('Fixed-RDM L-BFGS direction is nonfinite')
+        largest = float(np.max(abs(direction), initial=0.))
+        if largest == 0:
+            break
+        x += min(1., max_dir/largest)*direction
+        energy = objective.evaluate(x)
+        iterations += 1
+        if iterations == 6:
+            break
+        gradient = objective.gradient(x)
+        converged = np.linalg.norm(gradient) <= grad_tol*max(1., np.linalg.norm(x))
+        if converged:
+            break
+        step, change = x-last_x, gradient-last_gradient
+        curvature = np.vdot(change, step)
+        if curvature.real > 0:
+            pairs.append((step.copy(), change.copy(), 1/curvature))
+            pairs = pairs[-6:]
+            last_x, last_gradient = x.copy(), gradient.copy()
+        else:
+            skipped += 1
+    generator = scipy.linalg.logm(objective.unitary)
+    generator = (generator-generator.conj().T)*.5
+    return objective.mo, objective.eris, objective.provenance, x, generator, {
+        'solver': 'fixed_rdm_lbfgs', 'converged': bool(converged),
+        'iterations': iterations, 'history_size': len(pairs),
+        'skipped_curvature_pairs': skipped, 'initial_gradient_norm': initial_gradient_norm,
+        'fixed_rdm_energy_start': initial_energy, 'fixed_rdm_energy_end': energy,
+        'fixed_rdm_energy_change': energy-initial_energy, 'max_correction': max_dir,
+    }
+
+
 
 
 def mcscf_superci(
@@ -1219,13 +940,9 @@ def mcscf_superci(
     davidson_maxiter=10,
     davidson_tol=5e-6,
     davidson_strict=True,
-    use_diis=False,
     symm=None,
-    diis_space=15,
-    diis_start_cycle=3,
-    diis_start_gradient=0.02,
     callback=None,
-    second_order=False,
+    forte2=False,
 ):
     # cderi is retained for compatibility with callers that supply vectors
     # directly; normal calculations use the CD object attached to the SCF.
@@ -1246,25 +963,16 @@ def mcscf_superci(
 
     if solver not in ("davidson", "gmres"):
         raise ValueError("Super-CI solver must be 'davidson' or 'gmres'")
-    if use_diis and mc.natorb:
-        log.warn(
-            "Super-CI orbital DIIS is disabled because natorb=True changes "
-            "the active-orbital gauge at every macroiteration"
-        )
-        use_diis = False
-    if use_diis and bfgs:
-        raise ValueError("Super-CI DIIS and BFGS acceleration are mutually exclusive")
     kramers = _resolve_kramers_mode(mc, symm)
-    adaptive = bool(getattr(mc, "superci_adaptive", False)) and not second_order
+    adaptive = bool(getattr(mc, "superci_adaptive", False)) and not forte2
     build_operators, solve_davidson = gen_g_hop, davidson
-    if second_order:
-        from socutils.mcscf import zmc_second, zmc_superci_adaptive
-
+    if forte2:
+        from socutils.mcscf import zmc_superci_adaptive
         zmc_superci_adaptive.validate(mc, mo, solver=solver, cderi=cderi, kramers=kramers)
-        if bfgs or use_diis:
-            raise ValueError('Second-order scaled AH requires BFGS and orbital DIIS disabled')
-        build_operators, solve_davidson = zmc_second.gen_g_hop, zmc_second.davidson
-        log.info('Orbital optimizer = second-order Hessian / real-space scaled AH (BAGEL scheme)')
+        if bfgs:
+            raise ValueError('Forte2 orbital L-BFGS requires Super-CI BFGS disabled')
+        mc.superci_metric_diagnostics = {}
+        log.info('Orbital optimizer = Forte2 fixed-RDM complex L-BFGS (max 6 microsteps)')
     elif adaptive:
         from socutils.mcscf import zmc_superci_adaptive
 
@@ -1274,33 +982,21 @@ def mcscf_superci(
         build_operators = zmc_superci_adaptive.gen_g_hop
         solve_davidson = zmc_superci_adaptive.davidson
         log.info("Super-CI adaptive = True (orbital shift selected by step radius)")
-    bounded = adaptive or second_order
-    if bounded and (bfgs or use_diis):
-        raise ValueError('Bounded orbital optimization requires BFGS and DIIS disabled')
+    bounded = adaptive
+    if bounded and bfgs:
+        raise ValueError('Bounded orbital optimization requires BFGS disabled')
     initial_radius = getattr(mc, 'orbital_trust_start', .2)
-    micro_tol = getattr(mc, 'second_order_micro_step_tol', 1e-4)
-    if bounded and (not np.isfinite(initial_radius) or initial_radius <= 0 or
-                    not np.isfinite(micro_tol) or micro_tol < 0):
+    if bounded and (not np.isfinite(initial_radius) or initial_radius <= 0):
         raise ValueError('Invalid orbital trust radius or micro-step tolerance')
     orbital_radius = min(max_stepsize, initial_radius)
-    orbital_diis = None
-    if use_diis:
-        orbital_diis = OrbitalDIIS(
-            mo,
-            mc._scf.get_ovlp(),
-            space=diis_space,
-            start_cycle=diis_start_cycle,
-            start_gradient=diis_start_gradient,
-        )
-    log.info("Super-CI orbital solver = %s", solver)
-    log.info(
-        "Super-CI Kramers = %s, orbital DIIS = %s",
-        kramers,
-        bool(use_diis),
-    )
-    if solver == "davidson":
+    method_name = 'Forte2' if forte2 else 'Super-CI'
+    log.info("%s orbital solver = %s", method_name,
+             'fixed-RDM L-BFGS' if forte2 else solver)
+    log.info("MCSCF Kramers = %s", kramers)
+    if solver == "davidson" and not forte2:
         log.info(
-            "Super-CI Davidson tolerance = %.3g, maximum space = %d, strict = %s",
+            "%s Davidson tolerance = %.3g, maximum space = %d, strict = %s",
+            method_name,
             davidson_tol,
             davidson_mmax,
             davidson_strict,
@@ -1310,7 +1006,7 @@ def mcscf_superci(
     eris, integral_info = _build_eris(mc, mo, cderi=cderi)
     mc.cholesky_diagnostics = dict(integral_info)
     log.info(
-        "Super-CI ERI route: representation = %s, source = %s, "
+        "MCSCF ERI route: representation = %s, source = %s, "
         "container = %s, naux = %s, Cholesky = %s, threshold = %s",
         integral_info["representation"],
         integral_info["source"],
@@ -1320,7 +1016,7 @@ def mcscf_superci(
         integral_info["threshold"],
     )
     mci = zmcscf._fake_h_for_fast_casci(mc, mo, eris)
-    log.info("******** Initial Super-CI CASCI ********")
+    log.info("******** Initial %s CASCI ********", method_name)
     e_tot, e_cas, fcivec = mci.kernel(mo, verbose=verbose)
     ci_converged = bool(np.all(getattr(mc.fcisolver, "converged", True)))
     if not ci_converged:
@@ -1336,7 +1032,7 @@ def mcscf_superci(
     norm_gorb = norm_gci = -1
     de, elast = np.inf, e_tot
 
-    t1m = log.timer("Initializing Super-CI based MCSCF", *cput0)
+    t1m = log.timer("Initializing MCSCF", *cput0)
     casdm1, casdm2 = mc.fcisolver.make_rdm12(fcivec, ncas, mc.nelecas)
 
     norm_rot = 0.0
@@ -1352,6 +1048,8 @@ def mcscf_superci(
     x_prev = None
     rejected = False
     trust_radii = 0.5
+    orbital_rotation_vector = (np.zeros_like(mc.pack_uniq_var(np.zeros((nmo, nmo))), dtype=complex)
+                               if forte2 else None)
     e_last = e_tot
     dr = None
     macro_history = []
@@ -1397,7 +1095,12 @@ def mcscf_superci(
                 casdm1.diagonal(),
             )
 
-        g, h_diag, hop, sop, precond, mo = build_operators(mc, mo, casdm1, casdm2, eris)
+        if forte2:
+            from socutils.mcscf.zmc_utils import build_orbital_quantities
+            quantities = build_orbital_quantities(mc, mo, casdm1, casdm2, eris)
+            g = mc.pack_uniq_var(quantities.screened_gradient)
+        else:
+            g, h_diag, hop, sop, precond, mo = build_operators(mc, mo, casdm1, casdm2, eris)
         norm_gorb = norm(g)
         de_text = "inf" if not np.isfinite(de) else "%.3e" % de
         log.info(
@@ -1411,7 +1114,6 @@ def mcscf_superci(
         )
         t2m = log.timer("Compute gradient", *t2m)
         norm_gorb = np.linalg.norm(g)
-        g_unpack = mc.unpack_uniq_var(g)
 
         natural_occupations = np.linalg.eigvalsh((casdm1 + casdm1.T.conj()) * 0.5).real[
             ::-1
@@ -1435,7 +1137,7 @@ def mcscf_superci(
             "cholesky_naux": integral_info["naux"],
             "superci_metric": dict(mc.superci_metric_diagnostics),
             "adaptive": adaptive,
-            "orbital_method": "second_order" if second_order else "superci",
+            "orbital_method": "forte2" if forte2 else "superci",
         }
         macro_history.append(history_entry)
 
@@ -1482,21 +1184,52 @@ def mcscf_superci(
                 callback(dict(history_entry))
             break
 
-        if bounded:
+        if forte2:
+            (mo_new, eris, integral_info, orbital_rotation_vector, dr,
+             last_linear_info) = _fixed_rdm_lbfgs_step(
+                mc, mo, casdm1, casdm2, eris, integral_info,
+                orbital_rotation_vector, quantities, max_stepsize, conv_tol_grad)
+            applied_x = mc.pack_uniq_var(dr)
+            step_norm = float(norm(dr))
+            history_entry['restart_before_trial'] = _schedule_orbital_trial(
+                mc, norm_gorb, step_norm)
+            mci = zmcscf._fake_h_for_fast_casci(mc, mo_new, eris)
+            e_tot, e_cas, fcivec = mci.kernel(mo_new, ci0=None, verbose=verbose)
+            ci_converged = bool(np.all(getattr(mc.fcisolver, 'converged', True)))
+            if not ci_converged or not np.isfinite(e_tot):
+                raise RuntimeError('The active-space CI solver did not converge after Forte2 orbital microsteps')
+            de = float(e_tot - e_last)
+            e2 = last_linear_info['fixed_rdm_energy_change']
+            r = de/e2 if abs(e2) > 1e-16 else np.nan
+            step_rescaled = False
+            trust_radii = max_stepsize
+            trust_action = 'fixed-RDM L-BFGS / CI updated'
+            history_entry.update(
+                linear_solver=last_linear_info,
+                proposed_orbital_step_norm=step_norm,
+                applied_orbital_step_norm=step_norm,
+                step_rescaled=False,
+                next_total_energy=float(e_tot),
+                accepted_energy_change=de,
+                predicted_energy_change=e2,
+                prediction_model='fixed_rdm_energy',
+                next_ci_solver_diagnostics=_ci_convergence_snapshot(mc.fcisolver),
+            )
+        elif bounded:
             (mo_new, e_tot, e_cas, fcivec, eris, integral_info, dr, applied_x,
              last_linear_info, e2, de, r, orbital_radius, trials) = _bounded_orbital_update(
                 mc, mo, e_last, g, h_diag, hop, sop, solve_davidson,
                 orbital_radius, max_stepsize, davidson_tol, davidson_mmax,
-                conv_tol, conv_tol_grad, second_order, verbose, log)
+                conv_tol, conv_tol_grad, False, verbose, log, cderi=cderi)
             ci_converged = True
             step_rescaled = False
             trust_radii = orbital_radius
-            trust_action = 'accepted / bounded AH' if second_order else 'accepted / bounded Super-CI'
+            trust_action = 'accepted / bounded Super-CI'
             history_entry.update(linear_solver=last_linear_info, orbital_trials=trials,
                 proposed_orbital_step_norm=float(norm(dr)), applied_orbital_step_norm=float(norm(dr)),
                 step_rescaled=False, next_total_energy=float(e_tot), accepted_energy_change=de,
                 predicted_energy_change=e2,
-                prediction_model='quadratic_orbital_hessian' if second_order else 'linear_orbital_gradient',
+                prediction_model='linear_orbital_gradient',
                 next_ci_solver_diagnostics=_ci_convergence_snapshot(mc.fcisolver),
                 restart_before_trial=trials[-1]['restart'],
                 rejected_trials=sum(trial['stage'] == 'casci' and not trial['accepted'] for trial in trials),
@@ -1561,10 +1294,10 @@ def mcscf_superci(
                     trust_radii = max(trust_radii, 0.2)
                 x, e, last_linear_info = solve_davidson(
                     hop,
-                    gbar if second_order else trust_radii * gbar,
+                    trust_radii * gbar,
                     h_diag,
                     sop=sop,
-                    max_stepsize=max_stepsize if second_order else trust_radii,
+                    max_stepsize=trust_radii,
                     tol=davidson_tol,
                     mmax=davidson_mmax,
                     log=log,
@@ -1643,36 +1376,6 @@ def mcscf_superci(
                 )
             rotation = expmat(dr)
             mo_new = np.dot(mo, rotation)
-            if use_diis:
-                def project_generator(current_mo, generator):
-                    screened = mc.unpack_uniq_var(mc.pack_uniq_var(generator))
-                    if kramers:
-                        return _project_kramers_rotation(
-                            mc,
-                            current_mo,
-                            screened,
-                            force=True,
-                            mapping=kramers_mapping,
-                        )
-                    return screened, None
-
-                diis_result = orbital_diis.update(
-                    mo,
-                    mo_new,
-                    g_unpack,
-                    cycle=imacro,
-                    gradient_norm=norm_gorb,
-                    max_stepsize=max_stepsize,
-                    step_metric="frobenius",
-                    projector=project_generator,
-                )
-                dr = diis_result.generator
-                mo_new = diis_result.mo_coeff
-                rotation = expmat(dr)
-                step_rescaled = bool(
-                    step_rescaled or diis_result.diagnostics["step_scale"] < 1.0
-                )
-                history_entry["diis"] = diis_result.diagnostics
             history_entry["applied_orbital_step_norm"] = float(norm(dr))
             history_entry["step_rescaled"] = bool(step_rescaled)
             applied_x = mc.pack_uniq_var(dr)
@@ -1700,15 +1403,12 @@ def mcscf_superci(
             # Preserve the old heuristic for the other integral/rotation routes.
             metric_frame = hasattr(hop, '_superci_frame')
             e2 = float((2.0 if metric_frame else 0.5) * np.vdot(applied_x, g).real)
-            if second_order:
-                e2 = float(2*np.vdot(applied_x, g).real + np.vdot(applied_x, hop(applied_x)).real)
             r = de / e2 if abs(e2) > 1e-16 else np.inf
 
             history_entry["next_total_energy"] = float(np.real(e_tot))
             history_entry["accepted_energy_change"] = float(np.real(de))
             history_entry["predicted_energy_change"] = float(np.real(e2))
             history_entry["prediction_model"] = (
-                "quadratic_orbital_hessian" if second_order else
                 "linear_orbital_gradient" if metric_frame else "legacy_superci_estimate"
             )
             history_entry["next_ci_solver_diagnostics"] = _ci_convergence_snapshot(
@@ -1798,7 +1498,7 @@ def mcscf_superci(
     mc.final_orbital_gradient_norm = float(norm_gorb)
     mc.superci_diagnostics = {
         "adaptive": adaptive,
-        "orbital_method": "second_order" if second_order else "superci",
+        "orbital_method": "forte2" if forte2 else "superci",
         "converged": bool(conv),
         "final_gradient_norm": float(norm_gorb),
         "energy_tolerance": float(conv_tol),
@@ -1810,8 +1510,6 @@ def mcscf_superci(
         # Retain the historical key for callers that inspect CD provenance.
         "cholesky": dict(integral_info),
         "kramers_restricted": bool(kramers),
-        "diis": bool(use_diis),
-        "diis_space": int(diis_space) if use_diis else None,
         "macro_iterations": int(imacro),
     }
     return conv, e_tot, e_cas, fcivec, mo, mo_energy

@@ -29,7 +29,7 @@ from socutils.scf.spinor_hf import density_fit as spinor_density_fit
 
 
 ELEMENTS = ("F", "Cl", "Br", "I", "At")
-METHODS = ("casscf-superci", "dmrg-superci", "dmrg-supercipt")
+METHODS = ("casscf-superci", "dmrg-superci")
 PROTOCOL_VERSION = 1
 NROOTS = 6
 NCAS = 8
@@ -382,10 +382,7 @@ def run_worker(args, element, method):
                 },
             )
 
-        if method.endswith("supercipt"):
-            mc.supercipt(mo_coeff=initial_mo, callback=macro_callback)
-        else:
-            mc.superci(mo_coeff=initial_mo, callback=macro_callback)
+        mc.superci(mo_coeff=initial_mo, callback=macro_callback)
 
         history = list(mc.macro_history)
         solver_data = _solver_snapshot(mc.fcisolver)

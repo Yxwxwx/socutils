@@ -1,5 +1,7 @@
 # BAGEL ZCASSCF 与无 Kramers、无 CD 的 X2C-DMRG-SCF
 
+历史研究记录：文中提到的 Super-CIPT 和轨道 DIIS 实现现已移除。
+
 2026-09-22。目标算例：`/home/Yxwxwx/new-dmrgscf/laser/CaOH`。
 研究对象是轨道优化的收敛性，不比较 BAGEL 4C 与本程序 X2C 的绝对总能量。
 
@@ -81,7 +83,7 @@ schedule 重算一次。cold 仍失败则保持失败，不能循环重试或放
 
 ## 新增真正的二阶路径
 
-入口为 `mc.second_order()`，实现位于 `mcscf/zmc_second.py`，复用原有
+入口为 `mc.second_order()`，实现位于 `mcscf/zmc_ah.py`，复用原有
 MCSCF 外层、积分容器和用户配置的 DMRG 求解器，不需要 3/4-RDM。
 它对固定 X2C Hamiltonian 和固定 1/2-RDM 的能量求轨道导数：
 

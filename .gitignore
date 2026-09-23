@@ -94,12 +94,7 @@ local/
 note/
 
 # Halogen benchmark runtime data (structured JSON/CSV results are retained)
-benchmarck/.scratch/
-benchmarck/**/.scratch/
-benchmarck/logs/
-benchmarck/results/**/*.progress.json
-benchmarck/kramers/logs/
-benchmarck/kramers/results/**/*.progress.json
+benchmarck/
 
 # Local DMRG runtime state
 dmrg_scratch/
@@ -112,12 +107,8 @@ ref/
 
 
 /tests/*
-!/tests/test_superci_adaptive.py
-!/tests/test_zmc_second.py
-!/tests/test_superci_transactions.py
-docs/*
-!docs/bagel_zmcscf_caoh.md
-!docs/bagel_zmcscf_followup.md
+docs/
+
 
 .pytest_cache/
 

@@ -6,8 +6,8 @@ from scipy.linalg import eigh, expm, logm
 from unittest.mock import patch
 
 from socutils.dmrg.dmrgci import energy_from_rdms
-from socutils.mcscf import zmcscf, zmc_superci as sci, zmc_second as second
-from socutils.mcscf.zmc_supercipt import build_orbital_quantities
+from socutils.mcscf import zmcscf, zmc_superci as sci, zmc_ah as second
+from socutils.mcscf.zmc_utils import build_orbital_quantities
 from socutils.scf import spinor_hf
 from socutils.mcscf import zmc_ao2mo
 from pyscf.ao2mo import nrr_outcore
@@ -92,6 +92,14 @@ def test_inexact_ah_reports_tolerance_and_reuses_hessian_product():
     assert abs(info['quadratic_form'] - np.vdot(step, hop(step)).real) < 1e-12
 
 
+def test_ah_rejects_degenerate_preconditioned_trial():
+    def hop(vector):
+        return vector
+    hop.precondition = lambda vector, shift, floor: np.zeros_like(vector)
+    with pytest.raises(second.AHNumericalError, match='trial vector'):
+        second.davidson(hop, np.ones(2), np.ones(2))
+
+
 @pytest.mark.parametrize('radius', [.2, 4.])
 @pytest.mark.parametrize('curvature', [1., -5.])
 def test_scaled_ah_matches_real_symmetric_reference(radius, curvature):
@@ -116,7 +124,8 @@ def test_scaled_ah_matches_real_symmetric_reference(radius, curvature):
     np.testing.assert_allclose(np.r_[x.real, x.imag], expected, atol=1e-10)
     assert abs(energy-e[root]) < 1e-10
     assert np.linalg.norm(hop(x) + g - scale*energy*x) < 1e-10
-    assert np.linalg.norm(x) <= radius/np.sqrt(2) + 1e-12
+    # BAGEL AugHess stops its scale search within 1% of the requested step.
+    assert np.linalg.norm(x) <= 1.01*radius/np.sqrt(2) + 1e-12
     if radius == .2:
         assert scale > 1
 
@@ -182,14 +191,16 @@ def test_complex_orbital_hessian_against_fixed_rdm_energy(tmp_path):
     mc.max_cycle_macro = 1
     mc.canonicalization = False
     mc.chkfile = str(tmp_path / 'second.chk')
-    with patch.object(sci, 'expmat', wraps=sci.expmat) as rotation:
+    with patch('scipy.linalg.expm', wraps=expm) as rotation:
         mc.second_order()
         assert rotation.call_count == 1
     row = mc.macro_history[0]
     assert row['orbital_method'] == 'second_order'
     assert row['linear_solver']['converged']
     assert row['prediction_model'] == 'quadratic_orbital_hessian'
-    assert row['applied_orbital_step_norm'] <= mc.max_stepsize + 1e-12
+    assert row['orbital_trials'][0]['radius'] == pytest.approx(np.sqrt(2))
+    assert row['applied_orbital_step_norm'] <= np.sqrt(2)*mc.second_order_max_rotation + 1e-12
     step = mc.pack_uniq_var(logm(mo.conj().T @ mf.get_ovlp() @ mc.mo_coeff))
+    assert np.linalg.norm(step) <= mc.second_order_max_rotation + 1e-12
     prediction = 2*np.vdot(g, step).real + np.vdot(step, hop(step)).real
     assert abs(row['predicted_energy_change']-prediction) < 1e-10

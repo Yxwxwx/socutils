@@ -1,5 +1,7 @@
 # BAGEL ZCASSCF 再次对照：改进优先级
 
+历史研究记录：文中提到的 Super-CIPT 和轨道 DIIS 实现现已移除。
+
 2026-09-22。范围为无 Kramers、无 CD/DF 的 X2C-DMRG-SCF。
 下文先保留修改前的源码审查与性能证据；文末记录本轮实现及验证结果。
 审查部分的源码行号对应修改前版本。
@@ -42,7 +44,7 @@ F 的 adaptive 26 条、second_order 24 条记录均缺少它。
 ## P1：步长控制需要真实的接受/拒绝和可调整半径
 
 BAGEL `ref/bagel/src/util/math/aughess.h:58` 使用 packed-vector 半径 1.0，
-在投影 AH 中调节 lambda。我们的 `mcscf/zmc_second.py:105` 使用
+在投影 AH 中调节 lambda。当时的二阶 AH 使用
 `max_stepsize/sqrt(2)`，当前输入固定为 0.2 的生成元 Frobenius 范数。
 两者的数字和 4C/Kramers 变量空间不能直接互换。
 
@@ -67,7 +69,7 @@ norm(residual) / lambda < max(thresh_micro, stepsize * thresh_microstep)
 ```
 
 其中 `thresh_microstep=1e-4`（`zcassecond.cc:38`）。我们的
-`zmc_second.py:154–158` 每轮都要求未缩放残差 `<1e-8`，远离收敛时可能过度求解。
+旧版 AH 每轮都要求未缩放残差 `<1e-8`，远离收敛时可能过度求解。
 
 对 F 的已完成日志逐轮统计：采用类似条件
 `residual/lambda <= max(1e-8, packed_step*1e-4)` 时，第一次越过阈值的位置
@@ -87,17 +89,17 @@ BAGEL 在 `zcassecond_compute.cc:88–105` 准备半变换积分并传给微迭�
 
 本程序可先做不改变数学目标的改动：
 
-1. `zmc_second.py:60–61` 的 inactive/total 两个响应密度合并成一次批量 JK。
+1. 旧版 AH 的 inactive/total 两个响应密度合并成一次批量 JK。
    现有 `spinor_hf.SCF.get_jk` 支持该批量格式；H2/STO-3G 两个随机复 Hermitian
    密度的 full-ERI 检查中，批量与分开调用的 J/K 最大差为 0。
    这验证接口和结果一致性，尚未测得实际速度收益。
 2. 求得 AH 系数时已持有 `sigma @ coeff = Hx`。将该结果或二次型用于能量预测，
    避免 `zmc_superci.py:1560` 再调用一次 `hop(applied_x)`。
    只有最终应用方向与求解方向一致时才能复用；若缩放/变换方向，必须同步修正。
-3. `zmc_second.py:115–119` 每次复制全部 Krylov 向量并重算整个投影矩阵；
+3. 旧版 AH 每次复制全部 Krylov 向量并重算整个投影矩阵；
    可像 BAGEL 一样仅补新行列，并保留实内积及对称化。
 4. `zmc_ao2mo.py:897` 虽计算了可用内存，但后续 `nrr_outcore.general` 未传入；
-   `zmc_second.py:54` 也未传入。当前环境中即使 `PYSCF_MAX_MEMORY=500000`，
+   旧版 AH 也未传入。当前环境中即使 `PYSCF_MAX_MEMORY=500000`，
    此函数的默认 `max_memory` 仍为 4000 MB。应传入扣除驻留数组和 DMRG 占用后
    的有效预算，不能把 500 GB 同时完整分给每个模块。
 5. `papa` 和 `paap` 的第一对 MO 相同，可评估共用半变换；`aapa` 和 `aapp`
