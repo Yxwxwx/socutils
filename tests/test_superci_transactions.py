@@ -1,4 +1,5 @@
 """Exercise actual DMRG state consistency across rejected orbital trials."""
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -57,6 +58,7 @@ def test_real_inner_solver_recovers_before_any_ci_call(second_order):
 def test_ah_numerical_error_shrinks_radius_before_ci():
     events = []
     def solve(*args, **kwargs):
+        assert kwargs['micro_step_tol'] == 1e-4
         events.append('solve')
         if len(events) == 1:
             raise zmc_ah.AHNumericalError('Scaled AH has no root with a usable reference component')
@@ -71,7 +73,7 @@ def test_ah_numerical_error_shrinks_radius_before_ci():
     with patch.object(zmc_utils, '_build_eris', return_value=(None, {})), \
          patch.object(zmcscf, '_fake_h_for_fast_casci',
                       return_value=SimpleNamespace(kernel=run)):
-        result = sci._bounded_orbital_update(mc, np.eye(2), 0., np.array([.1]),
+        result = sci._bounded_orbital_update(mc, np.eye(2), 0., np.array([2.182e-4]),
             np.ones(1), None, None, solve, .4, .4, 1e-8, 4, 1e-8, 1e-4,
             True, 0, lib.logger.Logger(None, 0))
     assert events == ['solve', 'solve', 'ci']
@@ -117,6 +119,9 @@ def test_rejected_trial_recomputes_matching_live_dmrg_state(tmp_path, mode, exha
         n_threads=1, stack_memory=128, random_seed=1234)
     mc = zmcscf.CASSCF(mf, 4, 2)
     mc.fcisolver = solver
+    output = StringIO()
+    mc.stdout = solver.stdout = output
+    mc.verbose = solver.verbose = lib.logger.INFO
     mc.canonicalization = False
     mc.max_cycle_macro = 1
     mc.max_stepsize = .4
@@ -172,6 +177,14 @@ def test_rejected_trial_recomputes_matching_live_dmrg_state(tmp_path, mode, exha
                 assert trials[0]['restart']['orbital_step_norm'] == trials[0]['step_norm']
                 np.testing.assert_allclose(mc.mo_coeff, evaluated[-1], atol=1e-12)
         assert solver.converged
+        text = output.getvalue()
+        assert 'CASCI converged' not in text
+        if not exhaust:
+            assert text.count('CASCI E =') == 1
+            macro = next(line for line in text.splitlines() if line.startswith('MCSCF macro ='))
+            update = next(line for line in text.splitlines() if line.startswith('MCSCF update ='))
+            assert 'E =' in macro and 'Grad norm' in macro
+            assert 'E =' not in update and 'Pred =' in update
         saved = solver.checkpoint_hamiltonian
         dm1, dm2 = solver.make_rdm12(mc.ci, 4, 2)
         energy = energy_from_rdms(saved['h1e'], saved['eri'], dm1, dm2, saved['ecore']).real

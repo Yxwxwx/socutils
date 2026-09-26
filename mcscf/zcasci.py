@@ -264,6 +264,8 @@ class CASCI(zcasbase.CASBase):
     -108.980200816243354
     '''
 
+    _keys = zcasbase.CASBase._keys.union({'_mcscf_embedded'})
+
     #natorb = getattr(__config__, 'zmcscf_gzcasci_CASCI_natorb', False)
     #canonicalization = getattr(__config__, 'zmcscf_gzcasci_CASCI_canonicalization', False)
     sorting_mo_energy = getattr(__config__, 'zmcscf_gzcasci_CASCI_sorting_mo_energy', False)
@@ -433,9 +435,9 @@ class CASCI(zcasbase.CASBase):
 
         if getattr(self.fcisolver, 'converged', None) is not None:
             self.converged = numpy.all(self.fcisolver.converged)
-            if self.converged:
+            if self.converged and not getattr(self, '_mcscf_embedded', False):
                 log.info('CASCI converged')
-            else:
+            elif not self.converged:
                 log.info('CASCI not converged')
         else:
             self.converged = True

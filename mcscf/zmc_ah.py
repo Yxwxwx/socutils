@@ -48,7 +48,7 @@ def kernel(mc, mo_coeff, *, max_stepsize=.2, conv_tol=None,
              provenance['representation'], provenance['source'], provenance['naux'])
     cas = zmcscf._fake_h_for_fast_casci(mc, mo, eris)
     energy, ecas, ci = cas.kernel(mo, verbose=verbose)
-    if not np.all(getattr(mc.fcisolver, 'converged', True)):
+    if not zmc_utils._ci_usable(mc.fcisolver) or not np.isfinite(energy):
         raise RuntimeError('The active-space CI solver did not converge')
     dm1, dm2 = mc.fcisolver.make_rdm12(ci, mc.ncas, mc.nelecas)
     mc.macro_history = []
@@ -64,13 +64,13 @@ def kernel(mc, mo_coeff, *, max_stepsize=.2, conv_tol=None,
             mc, mo, dm1, dm2, eris, kramers=kramers)
         gradient_norm = float(np.linalg.norm(g))
         log.info('MCSCF macro = %4d | E = %22.15f | dE = %11.3e | '
-                 'Grad norm = %9.3e | Step norm = %9.3e',
-                 macro, energy, previous_change, gradient_norm, previous_step)
+                 'Grad norm = %9.3e',
+                 macro, energy, previous_change, gradient_norm)
         row = dict(macro_iteration=macro, total_energy=float(energy),
                    energy_change=None if not np.isfinite(previous_change) else float(previous_change),
                    cas_energy=float(ecas), orbital_gradient_norm=gradient_norm,
                    orbital_step_norm=previous_step, accepted=True, converged=False,
-                   ci_solver_converged=True,
+                   ci_solver_converged=bool(np.all(getattr(mc.fcisolver, 'converged', True))),
                    ci_solver_diagnostics=zmc_utils._ci_convergence_snapshot(mc.fcisolver),
                    integral_representation=provenance['representation'],
                    integral_factorized=provenance['factorized'],
@@ -83,8 +83,7 @@ def kernel(mc, mo_coeff, *, max_stepsize=.2, conv_tol=None,
         if abs(previous_change) < conv_tol and gradient_norm < conv_tol_grad:
             converged = row['converged'] = True
             zmc_utils._schedule_orbital_trial(mc, gradient_norm, None)
-            log.info('MCSCF converged | Macro = %4d | E = %22.15f | Grad norm = %.3e',
-                     macro, energy, gradient_norm)
+            log.info('MCSCF converged | Macro = %4d', macro)
             if callback is not None:
                 callback(dict(row))
             break
@@ -108,9 +107,9 @@ def kernel(mc, mo_coeff, *, max_stepsize=.2, conv_tol=None,
                    trial_radius=trials[-1]['radius'], trust_radius=float(radius),
                    trust_action='accepted / bounded AH',
                    macro_wall_time=float(logger.perf_counter()-start))
-        log.info('MCSCF update = %3d | E = %22.15f | dE = %.3e | Pred = %.3e | '
-                 'Ratio = %s | Step = %.3e | Trust = %.3e',
-                 macro, next_energy, change, predicted, ratio, previous_step, radius)
+        log.info('MCSCF update = %3d | Pred = %.3e | Ratio = %s | '
+                 'Step = %.3e | Trust = %.3e | Time = %.2f s | accepted / bounded AH',
+                 macro, predicted, ratio, previous_step, radius, row['macro_wall_time'])
         mo, energy, ecas, ci, eris, provenance = (
             next_mo, next_energy, next_ecas, next_ci, next_eris, next_provenance)
         previous_change = float(change)

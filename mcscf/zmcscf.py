@@ -35,6 +35,7 @@ def expmat(a):
 def _fake_h_for_fast_casci(casscf, mo, eris):
     mc = casscf.view(zcasci.CASCI)
     mc.mo_coeff = mo
+    mc._mcscf_embedded = True
 
     if eris is None:
         return mc

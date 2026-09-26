@@ -1,16 +1,34 @@
 """Independent energy derivatives and doubled-real references for orbital AH."""
+from io import StringIO
+from types import SimpleNamespace
 import numpy as np
 import pytest
 from pyscf import gto
+from pyscf.lib import logger
 from scipy.linalg import eigh, expm, logm
 from unittest.mock import patch
 
 from socutils.dmrg.dmrgci import energy_from_rdms
-from socutils.mcscf import zmcscf, zmc_superci as sci, zmc_ah as second
+from socutils.mcscf import zcasci, zmcscf, zmc_superci as sci, zmc_ah as second
 from socutils.mcscf.zmc_utils import build_orbital_quantities
 from socutils.scf import spinor_hf
 from socutils.mcscf import zmc_ao2mo
 from pyscf.ao2mo import nrr_outcore
+
+
+def test_embedded_casci_omits_redundant_convergence_message():
+    cas = zcasci.CASCI.__new__(zcasci.CASCI)
+    cas.mo_coeff, cas.ci = np.eye(2), None
+    cas.fcisolver = SimpleNamespace(converged=True)
+    cas.stdout, cas.verbose = StringIO(), 0
+    with patch.object(zcasci, 'kernel', return_value=(-1., -.5, None)):
+        cas.kernel(verbose=logger.INFO)
+        assert 'CASCI converged' in cas.stdout.getvalue()
+        cas.stdout.seek(0)
+        cas.stdout.truncate()
+        embedded = zmcscf._fake_h_for_fast_casci(cas, cas.mo_coeff, None)
+        embedded.kernel(verbose=logger.INFO)
+        assert 'CASCI converged' not in cas.stdout.getvalue()
 
 
 def test_core_jk_cache_shared_by_casci_and_both_orbital_operators():

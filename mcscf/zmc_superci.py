@@ -21,6 +21,7 @@ from socutils.mcscf.zmc_utils import (
     _identify_kramers_mapping,
     _project_kramers_rotation,
     _ci_convergence_snapshot,
+    _ci_usable,
     _schedule_orbital_trial,
     _bounded_orbital_update,
     _kramers_subspace_eigh,
@@ -1019,7 +1020,7 @@ def mcscf_superci(
     log.info("******** Initial %s CASCI ********", method_name)
     e_tot, e_cas, fcivec = mci.kernel(mo, verbose=verbose)
     ci_converged = bool(np.all(getattr(mc.fcisolver, "converged", True)))
-    if not ci_converged:
+    if not _ci_usable(mc.fcisolver) or not np.isfinite(e_tot):
         raise RuntimeError("The active-space CI solver did not converge")
     mc.e_tot, mc.e_cas = e_tot, e_cas
     # mc._finalize()
@@ -1078,7 +1079,7 @@ def mcscf_superci(
             mci = zmcscf._fake_h_for_fast_casci(mc, mo, eris)
             e_nat_tot, e_cas, fcivec = mci.kernel(mo, ci0=None, verbose=verbose)
             ci_converged = bool(np.all(getattr(mc.fcisolver, "converged", True)))
-            if not ci_converged:
+            if not _ci_usable(mc.fcisolver) or not np.isfinite(e_nat_tot):
                 raise RuntimeError(
                     "The active-space CI solver did not converge "
                     "after the natural-orbital rotation"
@@ -1105,12 +1106,11 @@ def mcscf_superci(
         de_text = "inf" if not np.isfinite(de) else "%.3e" % de
         log.info(
             "MCSCF macro = %4d | E = %22.15f | dE = %11s | "
-            "Grad norm = %9.3e | Step norm = %9.3e",
+            "Grad norm = %9.3e",
             imacro,
             e_tot,
             de_text,
             norm_gorb,
-            norm_rot,
         )
         t2m = log.timer("Compute gradient", *t2m)
         norm_gorb = np.linalg.norm(g)
@@ -1175,10 +1175,8 @@ def mcscf_superci(
             _schedule_orbital_trial(mc, norm_gorb, None)
             history_entry["converged"] = True
             log.info(
-                "MCSCF converged | Macro = %4d | E = %22.15f | Grad norm = %.3e",
+                "MCSCF converged | Macro = %4d",
                 imacro,
-                e_tot,
-                norm_gorb,
             )
             if callback is not None:
                 callback(dict(history_entry))
@@ -1196,7 +1194,7 @@ def mcscf_superci(
             mci = zmcscf._fake_h_for_fast_casci(mc, mo_new, eris)
             e_tot, e_cas, fcivec = mci.kernel(mo_new, ci0=None, verbose=verbose)
             ci_converged = bool(np.all(getattr(mc.fcisolver, 'converged', True)))
-            if not ci_converged or not np.isfinite(e_tot):
+            if not _ci_usable(mc.fcisolver) or not np.isfinite(e_tot):
                 raise RuntimeError('The active-space CI solver did not converge after Forte2 orbital microsteps')
             de = float(e_tot - e_last)
             e2 = last_linear_info['fixed_rdm_energy_change']
@@ -1221,7 +1219,7 @@ def mcscf_superci(
                 mc, mo, e_last, g, h_diag, hop, sop, solve_davidson,
                 orbital_radius, max_stepsize, davidson_tol, davidson_mmax,
                 conv_tol, conv_tol_grad, False, verbose, log, cderi=cderi)
-            ci_converged = True
+            ci_converged = bool(np.all(getattr(mc.fcisolver, 'converged', True)))
             step_rescaled = False
             trust_radii = orbital_radius
             trust_action = 'accepted / bounded Super-CI'
@@ -1389,7 +1387,7 @@ def mcscf_superci(
                 mc, norm_gorb, float(norm(dr)))
             e_tot, e_cas, fcivec = mci.kernel(mo_new, ci0=None, verbose=verbose)
             ci_converged = bool(np.all(getattr(mc.fcisolver, "converged", True)))
-            if not ci_converged:
+            if not _ci_usable(mc.fcisolver) or not np.isfinite(e_tot):
                 raise RuntimeError(
                     "The active-space CI solver did not converge after the orbital step"
                 )
@@ -1433,12 +1431,9 @@ def mcscf_superci(
         history_entry["trust_action"] = trust_action
         history_entry["macro_wall_time"] = float(macro_wall)
         log.info(
-            "\nMCSCF update = %3d | E = %22.15f | dE = %10.3e | "
-            "Pred = %10.3e | Ratio = %8.3f | Step = %.3e%s | "
+            "\nMCSCF update = %3d | Pred = %10.3e | Ratio = %8.3f | Step = %.3e%s | "
             "Trust = %.3e | Time = %.2f s | %s",
             imacro,
-            e_tot,
-            de,
             e2,
             r,
             history_entry["applied_orbital_step_norm"],
@@ -1473,7 +1468,6 @@ def mcscf_superci(
         if verbose >= logger.INFO:
             mc.e_tot = e_tot
             mc.e_cas = e_cas
-            mc._finalize()
     mo_energy = None
     if mc.canonicalization:
         log.info("CASSCF final core/virtual canonicalization")

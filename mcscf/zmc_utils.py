@@ -262,10 +262,21 @@ def _ci_convergence_snapshot(solver):
     )
     return {key: info[key] for key in keys if key in info}
 
-def _schedule_orbital_trial(mc, gradient, step, *, accepted=True, ci_converged=True):
+def _ci_usable(solver):
+    if np.all(getattr(solver, 'converged', True)):
+        return True
+    from socutils.dmrg.dmrgci import DMRGCI
+    info = getattr(solver, 'convergence_info', {})
+    return (isinstance(solver, DMRGCI)
+            and not info.get('root_validation_failed', False)
+            and info.get('sweeps', 0) > 0)
+
+def _schedule_orbital_trial(mc, gradient, step, *, accepted=True, ci_converged=None):
     """Gate the MPS immediately before the Hamiltonian it will initialize."""
     schedule = getattr(mc.fcisolver, 'restart_scheduler_step', None)
     if schedule is not None:
+        if ci_converged is None:
+            ci_converged = bool(np.all(getattr(mc.fcisolver, 'converged', True)))
         # Disk resume/manual restart is a one-shot initial condition. Trials
         # use only the current validated MPS and the actual proposed step.
         mc.fcisolver.restart = False
@@ -292,14 +303,13 @@ def _bounded_orbital_update(mc, mo, base_energy, g, hd, hop, sop, solve,
     gradient = float(np.linalg.norm(g))
     trials = []
     touched = False
-    micro_tol = (getattr(mc, 'second_order_micro_step_tol', 1e-4)
-                 if gradient > 10*conv_tol_grad else 0.)
+    micro_tol = getattr(mc, 'second_order_micro_step_tol', 1e-4)
 
     def evaluate(coeff):
         eri, provenance = _build_eris(mc, coeff, cderi=cderi)
         cas = zmcscf._fake_h_for_fast_casci(mc, coeff, eri)
         energy, ecas, ci = cas.kernel(coeff, ci0=None, verbose=verbose)
-        if not np.all(getattr(mc.fcisolver, 'converged', True)) or not np.isfinite(energy):
+        if not _ci_usable(mc.fcisolver) or not np.isfinite(energy):
             raise RuntimeError('Active-space solver failed at the trial orbitals')
         return energy, ecas, ci, eri, provenance
 

@@ -1527,6 +1527,7 @@ class DMRGCI(StreamObject):
             # original active-orbital order.
             driver.reorder_idx = numpy.array(reorder_idx, dtype=int, copy=True)
 
+            root_validation_failed = False
             if nroots > 1:
                 identity_mpo = driver.get_identity_mpo()
                 self.root_overlap = numpy.empty(
@@ -1566,10 +1567,11 @@ class DMRGCI(StreamObject):
                     10.0 * math.sqrt(min(schedule.thrds)),
                     10.0 * self.tol,
                 )
-                if (
+                root_validation_failed = (
                     max(root_orthogonality_error, root_eigen_equation_error)
                     > root_validation_tolerance
-                ):
+                )
+                if root_validation_failed:
                     message = (
                         "split state-averaged MultiMPS roots are inconsistent "
                         "with the reported energies (S-I %.3e, H-SE %.3e)"
@@ -1600,11 +1602,10 @@ class DMRGCI(StreamObject):
             self.e_cas = _real_energy(energy)
             self.e_tot = self.e_cas + ecore_value
             self._record_convergence(run_records)
-            if nroots > 1 and max(
-                root_orthogonality_error, root_eigen_equation_error
-            ) > root_validation_tolerance:
+            if root_validation_failed:
                 self.converged = False
                 self.convergence_info["converged"] = False
+            self.convergence_info["root_validation_failed"] = root_validation_failed
             self.convergence_info.update(
                 {
                     "constant_energy_shift": ecore_value,
@@ -1660,6 +1661,14 @@ class DMRGCI(StreamObject):
                     nroots=nroots, **_kwargs)
                 self.convergence_info["restart_fallback"] = failure
                 return result
+            if not self.converged and not root_validation_failed:
+                logger.warn(
+                    self,
+                    "DMRGCI did not converge after %d/%d sweeps "
+                    "(energy change %.3e, tolerance %.3e); continuing",
+                    self.convergence_info["sweeps"], schedule.n_sweeps,
+                    self.convergence_info["energy_change"], self.tol,
+                )
             self._complete_checkpoint(schedule, run_mode)
             self._checkpoint_hamiltonian = {
                 "format": "socutils.dmrgci.hamiltonian-snapshot",
