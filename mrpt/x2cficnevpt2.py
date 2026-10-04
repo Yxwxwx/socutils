@@ -882,6 +882,7 @@ def _evaluate_fic_subspaces(
     return_timings=False,
     return_diagnostics=False,
     work_memory=256 * 2**20,
+    mps_response=False,
 ):
     """Evaluate and solve all eight spinor FIC-NEVPT2 subspaces."""
 
@@ -956,6 +957,8 @@ def _evaluate_fic_subspaces(
 
     for key in SUBSPACE_ORDER:
         start = time.perf_counter()
+        if mps_response and key in ("i", "r"):
+            continue
         components = _IC_COMPONENTS[key]
         free_labels = tuple(key)
 
@@ -1135,6 +1138,10 @@ class WickX2CFICNEVPT2(lib.StreamObject):
         self.matrix_rtol = 1.0e-9
         self.null_rhs_atol = 1.0e-10
         self.null_rhs_rtol = 1.0e-8
+        self.mps_response = False
+        self.mps_response_options = None
+        self.mps_response_diagnostics = {}
+        self.approximation = "none"
         self.frozen = 0
         self._keys = set(self.__dict__)
 
@@ -1165,10 +1172,15 @@ class WickX2CFICNEVPT2(lib.StreamObject):
         root=None,
         contraction_backend=None,
         compact_eris=True,
+        mps_response=None,
     ):
         """Compute one root-specific X2C-FIC-NEVPT2 correction.
 
         ``pdms`` must contain raw SGF particle RDMs of ranks one through four.
+        Explicit ``mps_response=True`` instead requests ranks 1--3 and follows
+        Block2's whole-class ``aaac/aaav`` uncontracted response branch. The remaining six
+        classes stay FIC; this hybrid is not strict FIC-NEVPT2. Numerical
+        response controls are configured with ``mps_response_options``.
         The active basis is never rotated after those RDMs are formed.
         By default AO2MO transforms only required Wick blocks. Set
         ``compact_eris=False`` for the legacy full-MO-ERI path.
@@ -1189,6 +1201,13 @@ class WickX2CFICNEVPT2(lib.StreamObject):
         if mc is None:
             mc = self._mc
         mc = _utils._full_integral_mc(mc)
+        if mps_response is None:
+            mps_response = self.mps_response
+        if not isinstance(mps_response, (bool, np.bool_)):
+            raise TypeError("mps_response must be boolean")
+        self.mps_response = bool(mps_response)
+        self.approximation = "FIC+UC(i,r)" if mps_response else "none"
+        self.mps_response_diagnostics = {}
         if _utils._has_frozen_orbitals(getattr(mc, "frozen", None)):
             raise NotImplementedError(
                 "nonzero frozen spinors are outside dense FIC v1"
@@ -1229,7 +1248,10 @@ class WickX2CFICNEVPT2(lib.StreamObject):
         self.reference_energy = _utils._reference_energy(mc, root)
 
         pdm_start = time.perf_counter()
-        if pdms is None:
+        if mps_response:
+            from . import nevpt2_mps_response as response
+            pdms = response.prepare_pdms(mc.fcisolver, pdms, root)
+        elif pdms is None:
             pdms = _utils.make_dm1234(mc.fcisolver, root=root)
         nelec_source = getattr(mc.fcisolver, "nelecas", None)
         if nelec_source is None:
@@ -1241,6 +1263,7 @@ class WickX2CFICNEVPT2(lib.StreamObject):
             atol=self.rdm_atol,
             rtol=self.rdm_rtol,
             work_memory=self.rdm_work_memory,
+            max_rank=3 if mps_response else 4,
         )
         pdm_time = time.perf_counter() - pdm_start
 
@@ -1333,8 +1356,20 @@ class WickX2CFICNEVPT2(lib.StreamObject):
             denominator_tol=self.denominator_tol,
             return_timings=True,
             return_diagnostics=True,
+            mps_response=bool(mps_response),
         )
         self.sub_eners, subspace_times, self.sub_diagnostics = evaluated
+        if mps_response:
+            energies, _norms, _gaps, diagnostics, timings = response.evaluate_mps_response(
+                mc, prepared_eris, pdms, core_energy, virtual_energy,
+                root=root, options=self.mps_response_options,
+                contraction_backend=contraction_backend,
+            )
+            self.sub_eners.update(energies)
+            self.sub_diagnostics.update(diagnostics)
+            subspace_times.update(timings)
+            self.mps_response_diagnostics = diagnostics
+            logger.note(self, "root %d uses FIC+UC(i,r): no 4-RDM; i/r are uncontracted MPS response", root)
         self.sub_times = {
             "pdms": pdm_time,
             "eris": integral_time,
@@ -1345,6 +1380,10 @@ class WickX2CFICNEVPT2(lib.StreamObject):
 
         for key in SUBSPACE_ORDER:
             diagnostics = self.sub_diagnostics[key]
+            if mps_response and key in ("i", "r"):
+                logger.note(self, "root %d E(%s-%4s) = %20.14f  uncontracted MPS response",
+                            root, self.__class__.__name__.replace("FIC", "UC"), key, self.sub_eners[key])
+                continue
             minimum = diagnostics["minimum_denominator"]
             maximum = diagnostics["maximum_denominator"]
             logger.note(

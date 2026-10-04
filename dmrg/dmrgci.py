@@ -1212,6 +1212,71 @@ class DMRGCI(StreamObject):
             self.kramers_adapter.validate_problem(norb, nelec, nroots)
         return nelec
 
+    def approx_kernel(
+        self, h1e, eri, norb, nelec, ci0=None, *, ecore=0.0,
+        sweeps=2, davidson_threshold=1e-12, verbose=None, max_memory=None,
+    ):
+        """Finite-sweep, single-root response for orbital microiterations.
+
+        Uses a fresh driver and a *copy* of the current internal MPS image;
+        preserves the site ordering and the configured final bond dimension.
+        Unlike ``kernel``, lack of sweep-energy convergence never triggers a
+        cold full-schedule retry.  No persistent checkpoint is written.  The
+        result is marked approximate even if its last two sweep energies agree.
+        ``davidson_threshold`` is Block2's squared local residual threshold.
+        A caller must do a subsequent strict ``kernel`` before using the state
+        for production RDMs/PT2.  Rejected orbital trials must restore a disk
+        snapshot; merely restoring a Python MPS reference is not sufficient.
+        """
+        if self.nroots != 1:
+            raise NotImplementedError("approx_kernel currently supports one DMRG root")
+        if int(sweeps) != sweeps or sweeps < 2:
+            raise ValueError("micro CI needs at least two sweeps")
+        if not numpy.isfinite(davidson_threshold) or davidson_threshold <= 0:
+            raise ValueError("micro Davidson squared threshold must be positive")
+        self._require_run()
+        if self._multi_mps is None or self.resume:
+            raise RuntimeError("approx_kernel requires a live, non-resume MPS")
+        nelec = self._validate_problem(norb, nelec, 1)
+        signature = self._wavefunction_problem(norb, nelec, 1, numpy.ones(1))
+        if self._mps_signature != signature:
+            raise ValueError("micro CI cannot change the active problem")
+        # Write canonical metadata even when the previous micro solve did not
+        # have a checkpoint directory. kernel() reloads this private image.
+        self._multi_mps.save_data()
+        self._multi_mps.info.save_data(os.path.join(self._scratch, "GS-mps_info.bin"))
+        count = int(sweeps)
+        bond = int(max(self.bond_dims))
+        schedule = DMRGSweepSchedule(
+            (0,), (bond,), (float(davidson_threshold),), (0.0,),
+            (bond,)*count, (float(davidson_threshold),)*count, (0.0,)*count,
+            count, None, True,
+        )
+        saved = (self.checkpoint_dir, self.checkpoint_per_sweep,
+                 self.restart, self._restart, self.resume)
+        self.checkpoint_dir = None
+        self.checkpoint_per_sweep = False
+        self.restart, self._restart, self.resume = True, True, False
+        try:
+            result = DMRGCI.kernel(
+                self, h1e, eri, norb, nelec, ci0=None, verbose=verbose,
+                max_memory=max_memory, ecore=ecore, nroots=1,
+                _micro_schedule=schedule,
+            )
+            if not numpy.isfinite(self.e_tot):
+                raise RuntimeError("nonfinite approximate DMRG energy")
+            self.convergence_info["micro_energy_converged"] = bool(self.converged)
+            self.convergence_info.update(
+                approximate=True, converged=False, requested_micro_sweeps=count,
+            )
+            self.converged = False  # deliberate finite-response state, not a final reference
+            self._multi_mps.save_data()
+            self._multi_mps.info.save_data(os.path.join(self._scratch, "GS-mps_info.bin"))
+            return result
+        finally:
+            (self.checkpoint_dir, self.checkpoint_per_sweep,
+             self.restart, self._restart, self.resume) = saved
+
     def kernel(
         self,
         h1e,
@@ -1223,6 +1288,7 @@ class DMRGCI(StreamObject):
         max_memory=None,
         ecore=0.0,
         nroots=None,
+        _micro_schedule=None,
         **_kwargs,
     ):
         """Run complex SGF DMRG and return ``(energy, MPS)``.
@@ -1332,7 +1398,10 @@ class DMRGCI(StreamObject):
                 "validated internal MPS or a fingerprinted checkpoint",
             )
 
-        schedule = self._schedule_snapshot(restart=run_mode != "cold-start")
+        if _micro_schedule is not None and (nroots != 1 or run_mode != "casscf-warm-start"):
+            raise RuntimeError("Approximate CI requires a compatible single-root warm start")
+        schedule = (_micro_schedule if _micro_schedule is not None else
+                    self._schedule_snapshot(restart=run_mode != "cold-start"))
         effective_twosite_to_onesite = schedule.twosite_to_onesite
         restart_site_conversion_sweeps = 0
 
@@ -1444,7 +1513,7 @@ class DMRGCI(StreamObject):
                         raise RuntimeError(
                             "checkpoint MPS has unsupported site type %s" % ket.dot
                         )
-                    if self.final_one_site:
+                    if self.final_one_site and _micro_schedule is None:
                         restart_site_conversion_sweeps = 2
                         schedule = _convert_twosite_restart_schedule(
                             schedule,
@@ -1643,7 +1712,8 @@ class DMRGCI(StreamObject):
                 self.convergence_info["root_eigen_equation_error"] = (
                     root_eigen_equation_error
                 )
-            if run_mode == "casscf-warm-start" and not self.converged:
+            if (run_mode == "casscf-warm-start" and not self.converged
+                    and _micro_schedule is None):
                 failure = {key: self.convergence_info.get(key) for key in (
                     "converged", "run_mode", "sweeps", "energy_change",
                     "root_orthogonality_error", "root_eigen_equation_error",
@@ -1661,7 +1731,8 @@ class DMRGCI(StreamObject):
                     nroots=nroots, **_kwargs)
                 self.convergence_info["restart_fallback"] = failure
                 return result
-            if not self.converged and not root_validation_failed:
+            if (not self.converged and not root_validation_failed
+                    and _micro_schedule is None):
                 logger.warn(
                     self,
                     "DMRGCI did not converge after %d/%d sweeps "

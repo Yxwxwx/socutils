@@ -99,7 +99,6 @@ benchmarck/
 # Local DMRG runtime state
 dmrg_scratch/
 dmrg_checkpoint/
-/.tmp_superci_debug/
 ref/
 
 # Shelved MRPT prototype and its validation artifacts
@@ -107,10 +106,15 @@ ref/
 
 
 /tests/*
+!/tests/test_uno_spinor.py
 docs/
 
 
 .pytest_cache/
+.ruff_cache/
+# Local debug files/directories are never part of a commit.
+.tmp*
+*.tmp
 
 *.pdf
 *.json
@@ -118,3 +122,24 @@ docs/
 *.out
 *.npz
 scripts/
+
+# Block2-style no-4-RDM NEVPT2 validation sources, not runtime data.
+!/tests/test_nevpt2_mps_response.py
+!/tests/test_x2cscnevpt2_wick.py
+!/tests/test_x2cficnevpt2.py
+!/tests/test_nevpt2_memory.py
+!/tests/test_x2cqdscnevpt2.py
+!/tests/nevpt2_mps_response/
+/tests/nevpt2_mps_response/*
+!/tests/nevpt2_mps_response/f_atom.py
+!/tests/nevpt2_mps_response/diagnose_r85.py
+!/tests/nevpt2_mps_response/class_ab.py
+!/tests/nevpt2_mps_response/run.sh
+!/tests/nevpt2_mps_response/run.slurm
+!/tests/nevpt2_mps_response/six_roots.py
+!/tests/nevpt2_mps_response/run_six_roots.sh
+!/tests/nevpt2_mps_response/README.md
+!/tests/nevpt2_mps_response/report.md
+
+# Generated localization validation logs (the reports and sources are kept).
+/lo/*_output.txt

@@ -53,6 +53,33 @@ def test_real_inner_solver_recovers_before_any_ci_call(second_order):
     assert build.call_count == kernel.call_count == gate.call_count == 1
     assert gate.call_args.kwargs['accepted']  # failed inner solves did not replace the MPS
     assert np.linalg.norm(result[6]) <= .025
+    if second_order:
+        assert result[-2] == .4  # recovery does not lower the next macro's AH cap
+
+
+@pytest.mark.parametrize('second_order', [False, True])
+@pytest.mark.parametrize('change', [7.63335e-7, -1e-6])
+def test_ah_accepts_energy_rise_and_poor_prediction_ratio(second_order, change):
+    def unpack(x):
+        return np.array([[0, -x[0].conjugate()], [x[0], 0]], complex)
+    mc = SimpleNamespace(unpack_uniq_var=unpack,
+                         fcisolver=SimpleNamespace(converged=True))
+    solve = Mock(return_value=(np.array([-.1]), 0.,
+                               dict(converged=True, quadratic_form=.0001)))
+    kernel = Mock(side_effect=[(change, change, None), (-.001, -.001, None)])
+    with patch.object(zmc_utils, '_build_eris', return_value=(None, {})), \
+         patch.object(zmcscf, '_fake_h_for_fast_casci',
+                      return_value=SimpleNamespace(kernel=kernel)):
+        result = zmc_utils._bounded_orbital_update(
+            mc, np.eye(2), 0., np.array([.01]), np.ones(1), None, None,
+            solve, .4, .4, 1e-8, 4, 1e-8, 1e-4, second_order,
+            0, lib.logger.Logger(None, 0))
+    trials = result[-1]
+    assert trials[0]['ratio'] < .1
+    assert trials[0]['accepted'] == second_order
+    assert kernel.call_count == solve.call_count == (1 if second_order else 2)
+    assert result[1] == (change if second_order else -.001)
+    assert result[-2] == (.4 if second_order else .2)
 
 
 def test_ah_numerical_error_shrinks_radius_before_ci():
@@ -141,9 +168,12 @@ def test_rejected_trial_recomputes_matching_live_dmrg_state(tmp_path, mode, exha
             result = kernel(*args, **kwargs)
             evaluated.append(np.array(mo))
             count = len(evaluated)
-            # Disturb only the reported trial energy after real Block2 work.
+            # Fail CI evaluation after real Block2 work for AH; adaptive
+            # Super-CI also recovers from a rejected, uphill energy.
             # The final base replay in the exhaustion case remains physical.
             if count == 2 or (exhaust is True and 2 <= count <= 7):
+                if mode == 'second_order':
+                    raise RuntimeError('Injected trial CI failure')
                 return result[0]+1., result[1]+1., result[2]
             return result
         cas.kernel = run

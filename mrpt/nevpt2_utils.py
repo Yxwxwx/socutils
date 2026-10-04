@@ -694,20 +694,27 @@ def validate_pdms(
     atol=_DEFAULT_RDM_ATOL,
     rtol=_DEFAULT_RDM_RTOL,
     work_memory=_DEFAULT_RDM_WORK_MEMORY,
+    max_rank=4,
 ):
     """Validate raw SGF 1--4 particle RDM shapes, order, and contractions.
 
     ``work_memory`` bounds arithmetic temporaries used by the symmetry checks.
     This matters for a 16-spinor complex 4-RDM, whose dense storage alone is
     64 GiB.  It does not relax or sample any validation condition.
+    The optional no-4-RDM response path explicitly sets ``max_rank=3``;
+    the default remains four and requires all four densities.
 
     Finite relation residuals beyond tolerance emit
     :class:`MRPTNumericalWarning` and are retained in the diagnostics.  Invalid
     shapes, nonnumeric arrays, and non-finite values remain hard errors.
     """
 
-    if not isinstance(pdms, (tuple, list)) or len(pdms) != 4:
-        raise ValueError("pdms must be a (dm1, dm2, dm3, dm4) sequence")
+    if max_rank not in (3, 4):
+        raise ValueError("max_rank must be 3 or 4")
+    if not isinstance(pdms, (tuple, list)) or len(pdms) != max_rank:
+        if max_rank == 4:
+            raise ValueError("pdms must be a (dm1, dm2, dm3, dm4) sequence")
+        raise ValueError("pdms must be a (dm1, dm2, dm3) sequence")
     ncas = int(ncas)
     nelec = int(nelec)
     work_memory = int(work_memory)
@@ -798,7 +805,7 @@ def validate_pdms(
     diagnostics["dm1"]["trace_tolerance"] = float(trace_tolerance)
     diagnostics["dm1"]["trace_gate_passed"] = trace_gate_passed
 
-    for rank in range(2, 5):
+    for rank in range(2, max_rank + 1):
         contracted = np.trace(
             checked[rank - 1], axis1=rank - 1, axis2=rank
         )
@@ -1435,12 +1442,22 @@ def semicanonicalize(
     )
     if verbose is None:
         verbose = getattr(mc, "verbose", logger.NOTE)
+    # A single SOC root need not have a time-reversal-invariant density.
+    # Projecting its Fock onto the KR manifold does not diagonalize the
+    # actual Dyall core/virtual blocks. MC's default policy stays unchanged.
+    from socutils.mcscf import zmcscf
+    canonical_options = (
+        {"kramers": False}
+        if getattr(mc.canonicalize, "__func__", None) is zmcscf.canonicalize
+        else {}
+    )
     rotated, _ci, energies = mc.canonicalize(
         mo_coeff,
         ci=ci,
         cas_natorb=False,
         casdm1=dm1,
         verbose=verbose,
+        **canonical_options,
     )
     rotated = np.asarray(rotated)
     ncore = int(mc.ncore)

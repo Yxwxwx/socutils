@@ -984,6 +984,9 @@ class _ERIS(object):
 
     def second_order_blocks(self, reserved_mb=0):
         """Reuse aa and pa half transforms at this orbital point."""
+        cached = getattr(self, '_micro_second_order_cache', None)
+        if cached is not None:
+            return cached
         mol, mo = self._scf.mol, self.mo
         a = mo[:, self.ncore:self.nocc]
         budget = max(64, .5*(self.max_memory-lib.current_memory()[0]-reserved_mb))
@@ -997,9 +1000,12 @@ class _ERIS(object):
         if self._aa_half is not None:
             self._aa_half.close()
             self._aa_half = None
-        return (self.feri['aapp'][:].reshape(len(a.T), len(a.T), mo.shape[1], mo.shape[1]).transpose(2, 3, 0, 1),
+        result = (self.feri['aapp'][:].reshape(len(a.T), len(a.T), mo.shape[1], mo.shape[1]).transpose(2, 3, 0, 1),
                 self.feri['papa'][:].reshape(mo.shape[1], self.ncas, mo.shape[1], self.ncas),
                 self.feri['paap'][:].reshape(mo.shape[1], self.ncas, self.ncas, mo.shape[1]))
+        if getattr(self, '_micro_cache_enabled', False):
+            self._micro_second_order_cache = result
+        return result
 
     def get_jk(self, dm, mo_coeff=None, mo_occ=None):
         # CASCI and orbital gradients request the same core density. Cache

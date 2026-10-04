@@ -95,6 +95,8 @@ def canonicalize(
     cas_natorb=False,
     casdm1=None,
     verbose=logger.NOTE,
+    *,
+    kramers=None,
 ):
     """Semicanonicalize converged CASSCF core and virtual orbitals.
 
@@ -104,6 +106,8 @@ def canonicalize(
     and external-virtual spaces.  The active orbitals and ``ci`` object are
     deliberately left unchanged, which keeps an exact-CI vector or DMRG MPS
     tied to the same active-orbital basis.
+    ``kramers=None`` inherits the reference restriction; ``False`` permits
+    unrestricted spinor diagonalization, e.g. for a state-specific PT Fock.
 
     ``cas_natorb=True`` is not supported here.  In socutils, active natural
     orbitals are generated transactionally by the Super-CI macroiterations,
@@ -194,9 +198,12 @@ def canonicalize(
         _resolve_kramers_mode,
     )
 
-    kramers = _resolve_kramers_mode(
-        mc, getattr(mc, "orbital_symmetry", None)
-    )
+    if kramers is None:
+        kramers = _resolve_kramers_mode(
+            mc, getattr(mc, "orbital_symmetry", None)
+        )
+    elif not isinstance(kramers, (bool, numpy.bool_)):
+        raise TypeError("kramers must be boolean or None")
 
     def _subspace_eigh(fock, orbitals):
         mf = mc._scf
@@ -563,6 +570,23 @@ class CASSCF(zcasci.CASCI):
         from socutils.mcscf import zmc_ah
         return self._run_orbital_optimizer(
             zmc_ah.kernel, mo_coeff, ci0, callback, symm)
+
+    def micro(self, mo_coeff=None, ci0=None, callback=None, *, symm=None):
+        """One-step complex-spinor CIAH with short DMRG/CI micro responses.
+
+        `micro_integral_mode='dep1'` is exact 1e/core + first-order active
+        two-electron updates. 'exact' is an expensive regression control.
+        Only single-root, state-specific DMRGCI/exact zfci is supported.
+        Final macro energy/gradient and CI tolerances are unchanged.
+        """
+        from functools import partial
+        from socutils.mcscf import zmc_micro
+        for name, value in zmc_micro.DEFAULTS.items():
+            if not hasattr(self, name):
+                setattr(self, name, value)
+        self._keys = self._keys.union(zmc_micro.DEFAULTS)
+        return self._run_orbital_optimizer(
+            partial(zmc_micro.kernel, ci0=ci0), mo_coeff, ci0, callback, symm)
 
     def forte2(self, mo_coeff=None, ci0=None, callback=None):
         """Fixed-RDM complex L-BFGS orbitals (six microsteps), then CI/DMRG."""

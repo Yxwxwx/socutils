@@ -1,5 +1,24 @@
 This repository adds utility for PySCF to include SOMF corrections within spinor style and GHF style calculations.
 
+### Optional no-4-RDM NEVPT2
+
+```python
+from socutils.mrpt import WickX2CSCNEVPT2, WickX2CFICNEVPT2
+
+pt = WickX2CSCNEVPT2(mc)  # or WickX2CFICNEVPT2(mc)
+pt.kernel(root=0, mps_response=True, contraction_backend="pytblis")
+```
+
+The default remains strict SC/FIC with raw 1--4 RDMs. The optional branch
+needs only raw 1--3 RDMs: it keeps six contracted classes and replaces only
+`i/r` with whole-class `aaac/aaav` UC-MPS response through the native
+pyblock2 solver. It is SC/FIC+UC(i,r), not another evaluation of strict
+SC/FIC. No time-propagation module, alpha/beta conversion, CD or Kramers
+restriction is required. Finite global residuals above the validation target
+are warnings; measured values and verification flags remain available.
+See [the validation workflow](tests/nevpt2_mps_response/README.md) and
+[the six-root F results](tests/nevpt2_mps_response/report.md).
+
 ### Opt-in adaptive Super-CI
 
 ```python

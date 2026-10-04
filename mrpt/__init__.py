@@ -56,11 +56,6 @@ from .x2cicmrrept2 import (
     WickX2CICMRREPT2,
     X2CICMRREPT2,
 )
-from .x2ctnevpt2 import (
-    TMPSNEVPT2,
-    X2CTMPSNEVPT2,
-    X2CTNEVPT2,
-)
 from .x2cqdscnevpt2 import (
     QDBlochSCNEVPT2Result,
     QDSCNEVPT2Result,
@@ -69,6 +64,15 @@ from .x2cqdscnevpt2 import (
     X2CQDBlochSCNEVPT2,
     X2CQDSCNEVPT2,
 )
+
+
+def __getattr__(name):
+    # Preserve explicit legacy imports without coupling SC/FIC to this module.
+    if name in ("TMPSNEVPT2", "X2CTMPSNEVPT2", "X2CTNEVPT2"):
+        from . import x2ctnevpt2
+        return getattr(x2ctnevpt2, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "_SpinorERIs",

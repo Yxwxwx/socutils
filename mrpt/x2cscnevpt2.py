@@ -940,6 +940,7 @@ def _evaluate_wick_subspaces(
     return_timings=False,
     return_diagnostics=False,
     work_memory=256 * 2**20,
+    mps_response=False,
 ):
     """Evaluate all generated equations in the supplied semicanonical basis."""
 
@@ -980,6 +981,8 @@ def _evaluate_wick_subspaces(
     for key, leading_slice in _sc_tiles(
         eris, work_memory, enabled=not return_arrays and normalized_groups is None
     ):
+        if mps_response and key in ("i", "r"):
+            continue
         subspace_start = time.perf_counter()
         shape = _free_index_shape(key, eris)
         if leading_slice is not None:
@@ -1442,6 +1445,10 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         self.strict_si_compatible = None
         self.scalar_tolerance = None
         self.reference_residual_bound = None
+        self.mps_response = False
+        self.mps_response_options = None
+        self.mps_response_diagnostics = {}
+        self.approximation = "none"
         self.frozen = 0
         self._keys = set(self.__dict__)
 
@@ -1477,6 +1484,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         return_arrays=False,
         compact_eris=False,
         retain_pdms123=False,
+        mps_response=False,
     ) -> _PreparedSCRoot:
         """Prepare one audited multipartitioning row without committing state.
 
@@ -1499,7 +1507,10 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         scalar_tolerance = float(self.scalar_atol)
 
         pdm_start = time.perf_counter()
-        if pdms is None:
+        if mps_response:
+            from . import nevpt2_mps_response as response
+            pdms = response.prepare_pdms(mc.fcisolver, pdms, root)
+        elif pdms is None:
             pdms = make_dm1234(mc.fcisolver, root=root)
         solver_nelecas = getattr(mc.fcisolver, "nelecas", None)
         if solver_nelecas is None:
@@ -1511,6 +1522,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             atol=self.rdm_atol,
             rtol=self.rdm_rtol,
             work_memory=self.rdm_work_memory,
+            max_rank=3 if mps_response else 4,
         )
         retained_pdms123 = tuple(pdms[:3]) if retain_pdms123 else None
         pdm_time = time.perf_counter() - pdm_start
@@ -1603,6 +1615,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             return_arrays=return_arrays,
             return_timings=True,
             return_diagnostics=True,
+            mps_response=mps_response,
         )
         if return_arrays:
             (
@@ -1626,6 +1639,18 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             diagnostics["root_one_sided_si_audit"]["strict_si_compatible"]
             for diagnostics in realness_diagnostics.values()
         )
+        if mps_response:
+            energies, norms, gaps, diagnostics, timings = response.evaluate_mps_response(
+                mc, prepared_eris, pdms, core_energy, virtual_energy,
+                root=root, options=self.mps_response_options,
+                contraction_backend=contraction_backend, norm_tol=self.norm_tol,
+            )
+            sub_eners.update(energies)
+            sub_norms.update(norms)
+            sub_gaps.update(gaps)
+            realness_diagnostics.update(diagnostics)
+            subspace_times.update(timings)
+            strict_si_compatible = False  # i/r no longer use an SC denominator
         return _PreparedSCRoot(
             root=root,
             reference_energy=reference_energy,
@@ -1665,6 +1690,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         contraction_backend=None,
         strong_contraction_groups=None,
         compact_eris=True,
+        mps_response=None,
     ):
         """Compute one root-specific SC-NEVPT2 correction.
 
@@ -1676,6 +1702,11 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         spin-free SC contraction from explicit alpha/beta spinors.  Because
         labels describe the final MO columns, this option requires
         ``canonicalized=True``.
+        ``mps_response=True`` follows Block2's no-4-RDM branch: only ``i/r``
+        use one whole-class uncontracted MPS response each (aaac/aaav), while
+        the other six classes remain SC.
+        It requests raw RDMs 1--3 only and is not strict SC-NEVPT2. Controls
+        are supplied through ``mps_response_options``; the default is False.
         By default only required ERI blocks are transformed and retained.
         ``compact_eris=False`` explicitly requests the historical full-ERI
         path. AO2MO buffers are controlled by ``integral_max_memory`` and
@@ -1694,6 +1725,13 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         if mc is None:
             mc = self._mc
         mc = _utils._full_integral_mc(mc)
+        if mps_response is None:
+            mps_response = self.mps_response
+        if not isinstance(mps_response, (bool, np.bool_)):
+            raise TypeError("mps_response must be boolean")
+        self.mps_response = bool(mps_response)
+        self.approximation = "SC+UC(i,r)" if mps_response else "none"
+        self.mps_response_diagnostics = {}
         if _has_frozen_orbitals(getattr(mc, "frozen", None)):
             raise NotImplementedError("nonzero frozen spinors are outside dense v1")
         eris_basis = _normalize_eris_basis(eris_basis)
@@ -1719,6 +1757,8 @@ class WickX2CSCNEVPT2(lib.StreamObject):
                 "strong_contraction_groups describes semicanonical MO columns; "
                 "set canonicalized=True and supply matching mo_energy"
             )
+        if mps_response and strong_contraction_groups is not None:
+            raise NotImplementedError("strong-contraction grouping is not used by whole-class MPS response")
         if root is None:
             root = self.root
         root = int(root)
@@ -1740,6 +1780,7 @@ class WickX2CSCNEVPT2(lib.StreamObject):
             strong_contraction_groups=strong_contraction_groups,
             return_arrays=False,
             compact_eris=bool(compact_eris),
+            mps_response=bool(mps_response),
         )
         self.reference_energy = row.reference_energy
         self.reference_energy_diagnostics = row.reference_energy_diagnostics
@@ -1758,12 +1799,17 @@ class WickX2CSCNEVPT2(lib.StreamObject):
         sub_gaps = row.subspace_gaps
         subspace_times = row.subspace_times
         realness_diagnostics = row.subspace_diagnostics
+        if mps_response:
+            self.mps_response_diagnostics = {
+                key: realness_diagnostics[key] for key in ("i", "r")
+            }
+            logger.note(self, "root %d uses SC+UC(i,r): no 4-RDM; i/r are uncontracted MPS response", root)
         self.sub_times = {"pdms": row.pdm_time, "eris": row.integral_time}
         self.sub_eners = {}
         self.sub_norms = {}
         self.sub_denominators = {}
         self.sub_realness_diagnostics = {}
-        if denominator_mode == "hermitianized" and not self.strict_si_compatible:
+        if denominator_mode == "hermitianized" and not self.strict_si_compatible and not mps_response:
             failed = ", ".join(
                 key
                 for key, diagnostics in realness_diagnostics.items()
@@ -1790,7 +1836,8 @@ class WickX2CSCNEVPT2(lib.StreamObject):
                 self,
                 "root %d E(%s-%4s) = %20.14f  norm = %.10g  gap = [%s, %s]",
                 root,
-                self.__class__.__name__,
+                (self.__class__.__name__.replace("SC", "UC")
+                 if mps_response and key in ("i", "r") else self.__class__.__name__),
                 key,
                 sub_eners[key],
                 sub_norms[key],

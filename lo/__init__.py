@@ -14,6 +14,7 @@ from .boys_spinor_kramers import (
     localize_boys_kramers,
 )
 from .ibo import get_iao, get_ibo
+from .uno_spinor import localize_blocks, lowdin, pmloc, sort_orbitals, sqrtm
 
 __all__ = [
     "BoysLocalizationResult",
@@ -24,7 +25,12 @@ __all__ = [
     "boys_spinor_kramers",
     "get_iao",
     "get_ibo",
+    "localize_blocks",
     "localize_boys",
     "localize_boys_kramers",
     "localize_dipoles",
+    "lowdin",
+    "pmloc",
+    "sort_orbitals",
+    "sqrtm",
 ]

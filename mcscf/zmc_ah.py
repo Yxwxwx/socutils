@@ -21,7 +21,7 @@ def kernel(mc, mo_coeff, *, max_stepsize=.2, conv_tol=None,
            conv_tol_grad=None, verbose=5, cderi=None, bfgs=False,
            solver='davidson', davidson_maxiter=40, davidson_tol=1e-8,
            davidson_strict=True, symm=None, callback=None):
-    """Optimize orbitals and CI with a fixed-RDM AH step at each macro point."""
+    """Apply fixed-RDM AH steps without an outer energy-acceptance gate."""
     from socutils.mcscf import zmcscf
 
     mo = np.array(mo_coeff, dtype=np.complex128, copy=True)

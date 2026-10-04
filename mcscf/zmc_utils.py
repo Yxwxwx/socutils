@@ -296,6 +296,8 @@ def _bounded_orbital_update(mc, mo, base_energy, g, hd, hop, sop, solve,
     A cold replay of the base restores live CI/MPS, its RDMs and checkpoint
     on exhaustion/error without requiring an in-memory copy of a native Block2 driver. Numerical
     inner failures shrink the radius before touching any CI/MPS state.
+    Second-order AH applies every valid step, as in BAGEL; energy acceptance
+    and ratio-based radius adaptation apply only to adaptive Super-CI.
     """
     from scipy.linalg import expm as expmat
     from socutils.mcscf import zmcscf
@@ -366,26 +368,33 @@ def _bounded_orbital_update(mc, mo, base_energy, g, hd, hop, sop, solve,
             else:
                 change = float(energy-base_energy)
                 ratio = change/predicted if predicted < -1e-16 else None
-                # Admit only noise-scale rises at already-small gradients;
-                # the unchanged outer energy and gradient tests still apply.
-                slack = conv_tol if gradient < conv_tol_grad else 0.
-                accepted = change <= slack and (abs(change) < conv_tol or
-                                                (ratio is not None and ratio >= .1))
+                if second_order:
+                    # BAGEL applies the AH rotation without an energy gate.
+                    accepted = True
+                else:
+                    # Admit only noise-scale rises at already-small gradients;
+                    # the unchanged outer energy and gradient tests still apply.
+                    slack = conv_tol if gradient < conv_tol_grad else 0.
+                    accepted = change <= slack and (abs(change) < conv_tol or
+                                                    (ratio is not None and ratio >= .1))
                 record.update(accepted=bool(accepted), energy=float(energy),
                               energy_change=change, ratio=ratio,
                               ci_solver_diagnostics=_ci_convergence_snapshot(mc.fcisolver))
                 if accepted:
-                    next_radius = radius
-                    if ratio is not None and ratio < .25:
+                    # AH recovery uses a smaller radius only at this point;
+                    # the next macro starts with the configured BAGEL bound.
+                    next_radius = max_radius if second_order else radius
+                    if not second_order and ratio is not None and ratio < .25:
                         next_radius *= .5
-                    elif ratio is not None and ratio > .75 and size >= .9*radius and change < 0:
+                    elif not second_order and ratio is not None and ratio > .75 and size >= .9*radius and change < 0:
                         next_radius = min(max_radius, radius*1.5)
                     return (proposed, energy, ecas, ci, eri, provenance, dr, x,
                             info, predicted, change, ratio, next_radius, trials)
             log.info('Orbital trial rejected: attempt=%d radius=%.5g dE=%s; retry from accepted orbitals',
                      attempt, radius, record.get('energy_change', record.get('error')))
             radius *= .5
-        raise RuntimeError('Six orbital trials failed (inner solve or energy acceptance)')
+        failure = 'CI evaluation' if second_order else 'energy acceptance'
+        raise RuntimeError('Six orbital trials failed (inner solve or %s)' % failure)
     except Exception:
         mc.converged = False
         mc.orbital_trial_history = trials

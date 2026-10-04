@@ -440,7 +440,7 @@ def test_casscf_restart_reuses_only_compatible_internal_mps(
     solver.make_rdm12(state0, 3, 1)
     assert solver.convergence_info["block2_sweep_tolerance"] == solver.tol
     reorder0 = np.array(solver.driver.reorder_idx, copy=True)
-    driver_id = id(solver.driver)
+    original_driver = solver.driver
     scratch = solver._scratch
 
     h1_next = h1.copy()
@@ -453,7 +453,7 @@ def test_casscf_restart_reuses_only_compatible_internal_mps(
 
     assert abs(energy0 - np.linalg.eigvalsh(h1)[0]) <= ENERGY_TOL
     assert abs(energy1 - reference) <= ENERGY_TOL
-    assert id(solver.driver) != driver_id
+    assert solver.driver is not original_driver
     assert solver._scratch != scratch
     assert solver.convergence_info["run_mode"] == "casscf-warm-start"
     assert solver.convergence_info["restart_transport"] == (
