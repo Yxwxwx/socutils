@@ -19,6 +19,18 @@ are warnings; measured values and verification flags remain available.
 See [the validation workflow](tests/nevpt2_mps_response/README.md) and
 [the six-root F results](tests/nevpt2_mps_response/report.md).
 
+The experimental `X2CUCNEVPT2(mc).run(root=0)` entry instead uses a single
+full-chain Block2 MPS-PT response for all eight external classes, with only
+raw 1/2-RDMs. The default uses native `Linear.solve` with on-the-fly RHS
+contraction; whole-CAS exclusion is an opt-in validation mode. A separate
+PT driver owns its response space and scratch. It does not impose Kramers
+restriction at the PT level. See the [method and measured validation](mrpt/README_ucnevpt2.md)
+and the [sequential X2C example](examples/24-x2c_dmrg_uc_nevpt2.py).
+`pt.response_mode = "external_tuples"` selects active-only responses for
+all fixed external-occupation blocks, excluding the entire CAS sector by
+construction. The six-root F benchmark is complete; residual warnings and
+the unresolved quartet splitting are reported without altering energies.
+
 ### Opt-in adaptive Super-CI
 
 ```python

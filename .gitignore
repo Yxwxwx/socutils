@@ -125,6 +125,8 @@ scripts/
 
 # Block2-style no-4-RDM NEVPT2 validation sources, not runtime data.
 !/tests/test_nevpt2_mps_response.py
+!/tests/test_nevpt2_external_response.py
+!/tests/test_x2cucnevpt2.py
 !/tests/test_x2cscnevpt2_wick.py
 !/tests/test_x2cficnevpt2.py
 !/tests/test_nevpt2_memory.py
@@ -132,6 +134,9 @@ scripts/
 !/tests/nevpt2_mps_response/
 /tests/nevpt2_mps_response/*
 !/tests/nevpt2_mps_response/f_atom.py
+!/tests/nevpt2_mps_response/f_uc.py
+!/tests/nevpt2_mps_response/f_reference_symmetry.py
+!/tests/nevpt2_mps_response/uc_audit.py
 !/tests/nevpt2_mps_response/diagnose_r85.py
 !/tests/nevpt2_mps_response/class_ab.py
 !/tests/nevpt2_mps_response/run.sh

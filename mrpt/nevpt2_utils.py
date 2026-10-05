@@ -709,11 +709,13 @@ def validate_pdms(
     shapes, nonnumeric arrays, and non-finite values remain hard errors.
     """
 
-    if max_rank not in (3, 4):
-        raise ValueError("max_rank must be 3 or 4")
+    if max_rank not in (2, 3, 4):
+        raise ValueError("max_rank must be 2, 3 or 4")
     if not isinstance(pdms, (tuple, list)) or len(pdms) != max_rank:
         if max_rank == 4:
             raise ValueError("pdms must be a (dm1, dm2, dm3, dm4) sequence")
+        if max_rank == 2:
+            raise ValueError("pdms must be a (dm1, dm2) sequence")
         raise ValueError("pdms must be a (dm1, dm2, dm3) sequence")
     ncas = int(ncas)
     nelec = int(nelec)

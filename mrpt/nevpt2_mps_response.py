@@ -15,6 +15,7 @@ L[X] = <X|A|X> - 2 Re<X|B Psi>, then E2 = -<B Psi|X>.
 """
 
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -120,7 +121,7 @@ def _active_mps(driver, reference):
         _release_response_mps(driver, working)
 
 
-def _embed_reference(driver, active_mps, ncore, nvirt):
+def _embed_reference(driver, active_mps, ncore, nvirt, *, cas_info=False):
     """Append empty virtuals or prepend occupied core spinors, without fitting."""
     from pyblock2.algebra.core import MPS, SubTensor, Tensor
     from pyblock2.algebra.io import MPSTools
@@ -156,15 +157,32 @@ def _embed_reference(driver, active_mps, ncore, nvirt):
                                          reduced=np.ones((1,) * len(labels), dtype=complex))]))
     mps = MPSTools.to_block2(MPS(prefix + tensors), driver.basis,
                             center=0, tag=_response_tag())
+    if not cas_info:
+        return driver.adjust_mps(mps, dot=2)[0]
+    old = mps.info
+    old.load_mutable()
+    info = driver.bw.brs.CASCIMPSInfo(driver.n_sites, driver.vacuum, driver.target,
+                                    driver.ghamil.basis, ncore, len(active_mps.tensors), nvirt)
+    info.tag, info.bond_dim = old.tag, old.bond_dim
+    info.left_dims, info.right_dims = old.left_dims, old.right_dims
+    mps.info = info
+    info.save_mutable()
+    mps.save_data()
+    info.save_data(str(Path(driver.scratch) / f"{info.tag}-mps_info.bin"))
     return driver.adjust_mps(mps, dot=2)[0]
 
 
 def _nevpt_mps(driver, ncore, nvirt, key, bond):
-    """Native block2main NEVPTMPSInfo/MPS initialization, not a new solver."""
+    """Native block2main MRCI/NEVPT space descriptors and MPS initialization."""
     bw = driver.bw
-    info = bw.brs.NEVPTMPSInfo(driver.n_sites, ncore, nvirt,
-                             int(key == "i"), int(key == "r"),
-                             driver.vacuum, driver.target, driver.ghamil.basis)
+    if key == "all":
+        info = bw.brs.MRCIMPSInfo(driver.n_sites, ncore, nvirt, 2,
+                                driver.vacuum, driver.target, driver.ghamil.basis)
+    else:
+        info = bw.brs.NEVPTMPSInfo(driver.n_sites, ncore, nvirt,
+                                 sum(key.count(x) for x in "ij"),
+                                 sum(key.count(x) for x in "rs"),
+                                 driver.vacuum, driver.target, driver.ghamil.basis)
     info.tag = _response_tag()
     info.set_bond_dimension(bond)
     info.bond_dim = bond
@@ -187,6 +205,102 @@ def _add_tensor(builder, operators, tensor, sites):
         mapped = np.array([np.asarray(mapping)[axis]
                            for mapping, axis in zip(sites, indices)])
         builder.add_term(operators, mapped.T.ravel(), values)
+
+
+def _source_tensors(eris, order, key):
+    """Coherent, core-normal-ordered Q H sources, summed over all indices.
+
+    Pair factors differ from the fixed ordered tuples in the Wick formulas:
+    here the fermionic MPO itself combines both orders of each external pair.
+    Tensor axes below follow the operator string, not physicists ERI order.
+    """
+    if key == "all":
+        return [term for subspace in u.SUBSPACE_ORDER
+                for term in _source_tensors(eris, order, subspace)]
+
+    def w(labels):
+        indices = [order if x == "A" else np.arange(
+            eris.ncore if x == "I" else eris.nvirt) for x in labels]
+        return np.asarray(eris.get_phys(labels))[np.ix_(*indices)]
+
+    def h(labels):
+        indices = [order if x == "A" else np.arange(
+            eris.ncore if x == "I" else eris.nvirt) for x in labels]
+        return np.asarray(eris.get_h1eff(labels))[np.ix_(*indices)]
+
+    pairs = {"ijrs": ("EEII", .5), "rsi": ("EEIA", 1.),
+             "ijr": ("EAII", 1.), "rs": ("EEAA", .5),
+             "ij": ("AAII", .5)}
+    if key == "cas":
+        return [("CD", h("AA"), "AA"),
+                ("CCDD", .5 * w("AAAA").transpose(0, 1, 3, 2), "AAAA")]
+    if key in pairs:
+        labels, factor = pairs[key]
+        return [("CCDD", factor * w(labels).transpose(0, 1, 3, 2),
+                 labels[:2] + labels[3] + labels[2])]
+    if key == "ir":
+        return [("CD", h("EI"), "EI"),
+                ("CCDD", w("EAIA").transpose(0, 1, 3, 2) - w("EAAI"), "EAAI")]
+    if key == "r":
+        return [("CD", h("EA"), "EA"),
+                ("CCDD", w("EAAA").transpose(0, 1, 3, 2), "EAAA")]
+    if key == "i":
+        return [("CD", h("AI"), "AI"),
+                ("CCDD", w("AAIA").transpose(0, 1, 3, 2), "AAAI")]
+    raise ValueError(f"unknown NEVPT2 class {key!r}")
+
+
+@contextmanager
+def _class_problem(driver, active_mps, eris, order, key, core_energy,
+                   virtual_energy, active_energy, *, source_scale=1., include_cas=False):
+    """Shared eight-class native MPO construction with isolated MPS storage.
+
+    Only spectator spaces used by this class are embedded; ``all`` uses the
+    full chain. NEVPTMPSInfo fixes hole/particle counts for separate classes.
+    include_cas adds the CAS residual, reproducing (H-E0)|reference> exactly
+    from compact integral blocks. Terms annihilating every CAS ket need not
+    be stored. No CAS lift or source-MPS fit is used.
+    """
+    ncore = eris.ncore if key == "all" or any(x in key for x in "ij") else 0
+    nvirt = eris.nvirt if key == "all" or any(x in key for x in "rs") else 0
+    saved = driver.__dict__.copy()
+    reference = source = dyall = None
+    try:
+        driver.initialize_system(n_sites=ncore + eris.ncas + nvirt,
+                                 n_elec=int(saved["target"].n) + ncore)
+        driver.reorder_idx = None
+        sites = {"I": np.arange(ncore), "A": np.arange(eris.ncas) + ncore,
+                 "E": np.arange(nvirt) + ncore + eris.ncas}
+        reference = _embed_reference(driver, active_mps, ncore, nvirt, cas_info=key == "all")
+        builder = driver.expr_builder()
+        _add_tensor(builder, "CD", np.asarray(eris.get_h1eff("AA"))[np.ix_(order, order)],
+                    [sites["A"]] * 2)
+        _add_tensor(builder, "CCDD", .5 * np.asarray(eris.get_phys("AAAA"))[
+            np.ix_(order, order, order, order)].transpose(0, 1, 3, 2), [sites["A"]] * 4)
+        for label, energies in (("I", core_energy), ("E", virtual_energy)):
+            if len(sites[label]):
+                builder.add_term("CD", np.repeat(sites[label], 2), energies)
+        builder.add_const(-active_energy - (sum(core_energy) if ncore else 0.))
+        dyall = driver.get_mpo(builder.finalize(), cutoff=0., iprint=0, add_ident=False)
+        builder = driver.expr_builder()
+        for ops, tensor, labels in _source_tensors(eris, order, key):
+            _add_tensor(builder, ops, source_scale * tensor, [sites[x] for x in labels])
+        if include_cas:
+            if key != "all":
+                raise ValueError("the CAS residual is only part of the full-chain RHS")
+            for ops, tensor, labels in _source_tensors(eris, order, "cas"):
+                _add_tensor(builder, ops, source_scale * tensor, [sites[x] for x in labels])
+            builder.add_const(-source_scale * active_energy)
+        source = driver.get_mpo(builder.finalize(), cutoff=0., iprint=0, add_ident=False)
+        yield reference, source, dyall, ncore, nvirt
+    finally:
+        try:
+            if reference is not None:
+                _release_response_mps(driver, reference)
+        finally:
+            del source, dyall
+            driver.__dict__.clear()
+            driver.__dict__.update(saved)
 
 
 def _whole_class_response(driver, active_mps, eris, order, key, orbital_energy,
@@ -214,18 +328,9 @@ def _whole_class_response(driver, active_mps, eris, order, key, orbital_energy,
         builder.add_const(-active_energy - (np.sum(orbital_energy) if key == "i" else 0.))
         dyall_mpo = driver.get_mpo(builder.finalize(), cutoff=0., iprint=0)
         builder = driver.expr_builder()
-        if key == "i":
-            one = np.asarray(eris.get_h1eff("AI"))[order]
-            three = np.asarray(eris.get_phys("AAIA"))[np.ix_(order, order, np.arange(count), order)]
-            _add_tensor(builder, "CD", one, [active, external])
-            _add_tensor(builder, "CCDD", three.transpose(0, 1, 3, 2),
-                        [active, active, active, external])
-        else:
-            one = np.asarray(eris.get_h1eff("EA"))[:, order]
-            three = np.asarray(eris.get_phys("EAAA"))[np.ix_(np.arange(count), order, order, order)]
-            _add_tensor(builder, "CD", one, [external, active])
-            _add_tensor(builder, "CCDD", three.transpose(0, 1, 3, 2),
-                        [external, active, active, active])
+        sites = {"A": active, "I": external, "E": external}
+        for ops, tensor, labels in _source_tensors(eris, order, key):
+            _add_tensor(builder, ops, tensor, [sites[x] for x in labels])
         source_mpo = driver.get_mpo(builder.finalize(), cutoff=0., iprint=0)
         response = _nevpt_mps(driver, ncore, nvirt, key, bond)
         reported = driver.multiply(

@@ -285,6 +285,88 @@ def test_six_root_runner_preserves_baseline_and_isolates_scratch(tmp_path, monke
     assert json.loads((output / "root_1/full.json").read_text())["root"] == 1
 
 
+def test_external_uc_summary_requires_complete_matching_records(tmp_path):
+    import json
+    from nevpt2_mps_response import six_roots
+
+    reference, baseline, logs, output = (tmp_path / name for name in
+                                         ("reference", "baseline", "logs", "summary"))
+    reference.mkdir()
+    logs.mkdir()
+    metadata = dict(fingerprint="same", root_energies=[-10.] * 4 + [-9.] * 2,
+                    weights=[1 / 6] * 6)
+    (reference / "mcscf.json").write_text(json.dumps(metadata))
+    for root in range(6):
+        directory = baseline / f"root_{root}"
+        directory.mkdir(parents=True)
+        values = dict(reference_energy=metadata["root_energies"][root],
+                      e_tot=metadata["root_energies"][root] - .1)
+        for stage in ("full", "hybrid"):
+            (directory / f"{stage}.json").write_text(json.dumps(dict(
+                root=root, fingerprint="same", results={"SC": values, "FIC": values})))
+    original = (baseline / "root_0/full.json").read_bytes()
+    controls = dict(max_bond_dimension=256, n_sweeps=8, diagnostic=True)
+    header = "F_UC_POINT " + json.dumps(dict(options=controls)) + "\n"
+    (logs / "root0_external_pilot.out").write_text(header + "F_UC_PILOT_RESULT {}\n")
+    (logs / "root1_external_live.out").write_text(header + 'F_UC_RESULT {"root":1')
+    summarize = lambda: six_roots.summarize(output, baseline=baseline,
+                                           reference=reference, uc_logs=logs)
+    summarize()
+    data = json.loads((output / "summary.json").read_text())
+    assert data["external_uc"]["energy_status"] == "pending"
+    assert data["external_uc"]["groups"] == []
+    assert "UC external_tuples: pending" in (output / "energies.txt").read_text()
+
+    def record(root):
+        e2 = -.01 - .001 * root
+        return dict(root=root, fingerprint="same", response_mode="external_tuples",
+            bond=256, sweeps=8, e_corr=e2, e_tot=metadata["root_energies"][root] + e2,
+            converged=root != 5, classes={key: e2 / 8 for key in u.SUBSPACE_ORDER},
+            diagnostics=dict(global_relative_residual=2e-8 if root == 5 else 1e-10,
+                classes={key: dict(tuples=[dict(holes=[0])], tuple_count=1,
+                                   controls=dict(controls, tol=0.))
+                         for key in u.SUBSPACE_ORDER}))
+    for root in range(6):
+        requested = controls if root == 0 else dict(controls, tol=0.)
+        root_header = "F_UC_POINT " + json.dumps(dict(options=requested)) + "\n"
+        (logs / f"root{root}_external_live.out").write_text(root_header + "F_UC_RESULT "
+            + json.dumps(record(root)) + "\nF_UC_RESOURCES "
+            + json.dumps(dict(wall_seconds=1., peak_rss_gib=.1)) + "\n")
+        if root == 0:
+            summarize()
+            group = json.loads((output / "summary.json").read_text())["external_uc"]["groups"][0]
+            assert not group["all_six_energies_present"]
+            assert group["multiplet_total_energy_spreads"]["roots_0_3"] is None
+    summarize()
+    data = json.loads((output / "summary.json").read_text())["external_uc"]
+    assert data["energy_status"] == "complete"
+    group = data["groups"][0]
+    assert len(data["groups"]) == 1 and group["controls"]["tol"] == 0.
+    assert "tol" not in group["roots"]["0"]["controls"]
+    assert group["roots"]["1"]["controls"]["tol"] == 0.
+    assert group["all_six_energies_present"] and not group["all_six_residuals_certified"]
+    assert group["multiplet_total_energy_spreads"] == pytest.approx(dict(roots_0_3=.003, roots_4_5=.001))
+    assert "tuples" not in group["roots"]["0"]["diagnostics"]["classes"]["i"]
+    assert group["roots"]["0"]["process_resources"]["peak_rss_gib"] == .1
+    assert "residual_status=warning" in (output / "energies.txt").read_text()
+    assert (baseline / "root_0/full.json").read_bytes() == original
+    different = record(5)
+    for values in different["diagnostics"]["classes"].values():
+        values["controls"]["tol"] = 1e-4
+    (logs / "root5_external_live.out").write_text(header + "F_UC_RESULT "
+        + json.dumps(different) + "\n")
+    summarize()
+    data = json.loads((output / "summary.json").read_text())["external_uc"]
+    assert data["energy_status"] == "pending" and len(data["groups"]) == 2
+    (logs / "root0_external_duplicate.out").write_text(header + "F_UC_RESULT " + json.dumps(record(0)) + "\n")
+    with pytest.raises(ValueError, match="duplicate root/control"):
+        summarize()
+    wrong = dict(record(0), fingerprint="different")
+    (logs / "root0_external_duplicate.out").write_text(header + "F_UC_RESULT " + json.dumps(wrong) + "\n")
+    with pytest.raises(ValueError, match="incompatible external UC"):
+        summarize()
+
+
 def test_response_defaults_follow_upstream_same_m_schedule():
     controls, bond, tol = response._controls(
         SimpleNamespace(max_bond_dimension=1000, tol=1e-8), None)

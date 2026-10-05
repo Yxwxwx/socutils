@@ -6,6 +6,7 @@ Reuse the existing no-CD/no-KR SA6 reference. Two independent processes use
 """
 import argparse
 import json
+import math
 import os
 import resource
 import shutil
@@ -46,18 +47,77 @@ def run_process(cmd, logfile, root, stage):
                            env=env, check=True)
 
 
-def summarize(output):
+def external_results(logs, metadata):
+    """Only complete full-UC records, never pilots or partial class energies."""
+    points = []
+    for path in sorted(logs.glob("root*_external_*.out")):
+        controls, implementation, inputs, resources, records = None, None, None, None, []
+        with path.open() as stream:
+            for line in stream:
+                if not line.endswith("\n"):
+                    continue  # The live process may still be writing this record.
+                if line.startswith("F_UC_POINT "):
+                    controls = json.loads(line.split(" ", 1)[1])["options"]
+                elif line.startswith("F_UC_IMPLEMENTATION "):
+                    implementation = json.loads(line.split(" ", 1)[1])
+                elif line.startswith("F_UC_PREPARED_INPUT "):
+                    inputs = json.loads(line.split(" ", 1)[1])
+                elif line.startswith("F_UC_RESOURCES "):
+                    resources = json.loads(line.split(" ", 1)[1])
+                elif line.startswith("F_UC_RESULT "):
+                    result = json.loads(line.split(" ", 1)[1])
+                    root = result["root"]
+                    if (type(root) is not int or not 0 <= root < NROOTS
+                            or not path.name.startswith(f"root{root}_")
+                            or result["fingerprint"] != metadata["fingerprint"]
+                            or result["response_mode"] != "external_tuples"):
+                        raise ValueError(f"incompatible external UC result: {path}")
+                    if (controls is None or controls["max_bond_dimension"] != result["bond"]
+                            or controls["n_sweeps"] != result["sweeps"]
+                            or set(result["classes"]) != set(u.SUBSPACE_ORDER)
+                            or not all(math.isfinite(e) for e in
+                                       [result["e_corr"], result["e_tot"], *result["classes"].values()])
+                            or abs(sum(result["classes"].values()) - result["e_corr"]) > 1e-10
+                            or abs(result["e_tot"] - result["e_corr"]
+                                   - metadata["root_energies"][root]) > 1e-8):
+                        raise ValueError(f"inconsistent external UC energy/controls: {path}")
+                    # Keep per-class/worst-tuple certificates. All tuple details
+                    # remain in the original log rather than duplicated here.
+                    effective = [data.get("controls", controls) for data in
+                                 result["diagnostics"]["classes"].values()]
+                    if any(value != effective[0] for value in effective):
+                        raise ValueError(f"inconsistent effective UC controls: {path}")
+                    for data in result["diagnostics"]["classes"].values():
+                        data.pop("tuples", None)
+                    records.append(dict(result, controls=controls.copy(), log=str(path.resolve()),
+                                        effective_controls=effective[0].copy(),
+                                        implementation=implementation, prepared_inputs=inputs))
+        for record in records:
+            record["process_resources"] = resources  # Whole process, not per-point peak RSS.
+        points.extend(records)
+    return points
+
+
+def summarize(output, *, baseline=None, reference=None, uc_logs=None):
+    metadata = json.loads((reference / "mcscf.json").read_text()) if uc_logs is not None else None
+    baseline = output if baseline is None else baseline
     roots = {}
+    fingerprint = metadata["fingerprint"] if metadata is not None else None
     for root in range(NROOTS):
-        directory = output / f"root_{root}"
+        directory = baseline / f"root_{root}"
         if not all((directory / f"{stage}.json").exists() for stage in ("full", "hybrid")):
             continue
         full, hybrid = (json.loads((directory / f"{stage}.json").read_text())
                         for stage in ("full", "hybrid"))
+        fingerprint = full["fingerprint"] if fingerprint is None else fingerprint
+        if any(data["fingerprint"] != fingerprint or data["root"] != root for data in (full, hybrid)):
+            raise ValueError(f"baseline reference/root mismatch: {directory}")
         results = {f"{stage}_{method}": values for stage, data in (("full", full), ("hybrid", hybrid))
                    for method, values in data["results"].items()}
         measured = {path.stem.removeprefix("response_"): json.loads(path.read_text())
                     for path in directory.glob("response_*.json")}
+        if any(data["fingerprint"] != fingerprint or data["root"] != root for data in measured.values()):
+            raise ValueError(f"response baseline reference/root mismatch: {directory}")
         roots[str(root)] = dict(reference_energy=full["results"]["SC"]["reference_energy"],
                                 results=results, convergence=measured)
     verified = len(roots) == NROOTS and all(
@@ -73,11 +133,35 @@ def summarize(output):
                            - cases["M1500"]["response_energies"][key] for key in ("i", "r")}
             bond_stability[root] = dict(class_energy_differences=differences,
                                          total_energy_difference=sum(differences.values()))
-    save_json(output / "summary.json", dict(roots=roots,
+    summary = dict(roots=roots, fingerprint=fingerprint,
               all_six_root_energies_present=len(roots) == NROOTS,
               all_six_final_global_residuals_verified=verified,
               response_residual_status=residual_status,
-              representative_M1500_to_M2000_stability=bond_stability))
+              representative_M1500_to_M2000_stability=bond_stability)
+    if uc_logs is not None:
+        points = external_results(uc_logs, metadata)
+        groups = {}
+        for point in points:
+            signature = json.dumps(point["effective_controls"], sort_keys=True)
+            group = groups.setdefault(signature, dict(controls=point["effective_controls"], roots={}))
+            if str(point["root"]) in group["roots"]:
+                raise ValueError(f"duplicate root/control UC point: {point['log']}")
+            group["roots"][str(point["root"])] = point
+        for group in groups.values():
+            group["multiplet_total_energy_spreads"] = {}
+            for label, members in (("roots_0_3", range(4)), ("roots_4_5", range(4, 6))):
+                values = [group["roots"][str(root)]["e_tot"] for root in members
+                          if str(root) in group["roots"]]
+                group["multiplet_total_energy_spreads"][label] = (
+                    max(values) - min(values) if len(values) == len(members) else None)
+            group["all_six_energies_present"] = len(group["roots"]) == NROOTS
+            group["all_six_residuals_certified"] = (group["all_six_energies_present"]
+                and all(point["converged"] for point in group["roots"].values()))
+        summary["external_uc"] = dict(groups=list(groups.values()),
+            energy_status="complete" if any(g["all_six_energies_present"] for g in groups.values()) else "pending",
+            note="No process-liveness inference from logs; missing complete records are pending.")
+    output.mkdir(parents=True, exist_ok=True)
+    save_json(output / "summary.json", summary)
     # Same State / weight / E layout as the production inputs; totals, not E2.
     lines = []
     for method in ("MCSCF", "full_SC", "full_FIC", "hybrid_SC", "hybrid_FIC"):
@@ -94,6 +178,18 @@ def summarize(output):
                 verified = precision["global_residual_verified"]
                 lines.append(f"  State {root} weight {1/NROOTS:.7g}  E = {energy:.14f}  "
                              f"residual_status={'ok' if verified else 'warning'}")
+    for group in summary.get("external_uc", {}).get("groups", []):
+        controls = group["controls"]
+        lines.append(f"UC external_tuples M{controls['max_bond_dimension']} "
+                     f"S{controls['n_sweeps']} energy for each state")
+        for root, point in sorted(group["roots"].items(), key=lambda item: int(item[0])):
+            lines.append(f"  State {root} weight {metadata['weights'][int(root)]:.7g}  "
+                         f"E = {point['e_tot']:.14f}  E2 = {point['e_corr']:.14f}  "
+                         f"residual_status={'ok' if point['converged'] else 'warning'}")
+        lines.append("  Multiplet spreads / Eh: "
+                     + json.dumps(group["multiplet_total_energy_spreads"]))
+    if uc_logs is not None and summary["external_uc"]["energy_status"] == "pending":
+        lines.append("UC external_tuples: pending; no complete six-root energy set yet.")
     (output / "energies.txt").write_text("\n".join(lines) + "\n")
 
 
@@ -224,10 +320,14 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, default=HERE / "f_sa6_all_roots")
     parser.add_argument("--validate-root", type=int, choices=range(NROOTS))
     parser.add_argument("--summary-only", action="store_true")
+    parser.add_argument("--baseline", type=Path, help="Read existing root JSONs here; write only to --output")
+    parser.add_argument("--uc-logs", type=Path, help="Include complete external-tuple F_UC_RESULT records")
     args = parser.parse_args()
+    if not args.summary_only and (args.baseline is not None or args.uc_logs is not None):
+        parser.error("--baseline and --uc-logs require --summary-only")
     lib.num_threads(THREADS)
     if args.summary_only:
-        summarize(args.output)
+        summarize(args.output, baseline=args.baseline, reference=args.reference, uc_logs=args.uc_logs)
     elif args.validate_root is not None:
         validation(args.reference, args.output, args.validate_root)
     else:

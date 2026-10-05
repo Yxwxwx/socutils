@@ -24,6 +24,7 @@ They use the canonical `.x2camf()` / `.x2cmp()` driver API.
 | `21-h2o_scalar_sc_spinor.py` | minimal H2O scalar SC calculation with independent spinor channels |
 | `22-h2o_scalar_fic.py` | minimal H2O scalar FIC regression without strong-contraction grouping |
 | `23-h2o_scalar_tmps_nevpt2.py` | minimal H2O CAS(8e,6o) fully uncontracted t-MPS-NEVPT2 input (12 explicit spinors; production MPS-overlap backend) |
+| `24-x2c_dmrg_uc_nevpt2.py` | BH CAS(4e,6 spinors), full-ERI/no-Kramers second-order X2C-DMRG-SCF to full eight-class Block2 MPS-PT UC-NEVPT2; raw 1/2-RDMs only |
 
 The `fci/` subfolder has examples for the spinor CI module (`socutils.fci`):
 

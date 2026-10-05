@@ -34,6 +34,7 @@ from .x2cficnevpt2 import (
     X2CICNEVPT2,
     X2CPCNEVPT2,
 )
+from .x2cucnevpt2 import X2CUCNEVPT2, UCNEVPT2
 from .x2ccaspt2 import (
     CASPT2IPEAWarning,
     CASPT2IntruderError,
@@ -101,6 +102,8 @@ __all__ = [
     "X2CICNEVPT2",
     "WickX2CPCNEVPT2",
     "X2CPCNEVPT2",
+    "X2CUCNEVPT2",
+    "UCNEVPT2",
     "CASPT2IPEAWarning",
     "CASPT2IntruderError",
     "CASPT2Matrices",

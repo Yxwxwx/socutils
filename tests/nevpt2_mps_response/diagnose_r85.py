@@ -63,7 +63,17 @@ def mps_vector(driver, ket, ncas, nelec):
     order = getattr(driver, "reorder_idx", None)
     if order is not None:
         determinants = determinants[:, np.asarray(order)]
-    working = driver.copy_mps(ket, tag=_response_tag())
+    if hasattr(ket.info, "casci_mask"):
+        # CASCIMPSInfo compacts frozen/empty physical bases. The SGF
+        # determinant trie assumes the ordinary empty/occupied site basis.
+        # For this diagnostic only, re-import identical tensors with that
+        # basis before requesting determinant coefficients. Never change ket.
+        from pyblock2.algebra.io import MPSTools
+        from socutils.mrpt.nevpt2_mps_response import _active_mps
+        working = MPSTools.to_block2(_active_mps(driver, ket), driver.basis,
+                                     center=0, tag=_response_tag())
+    else:
+        working = driver.copy_mps(ket, tag=_response_tag())
     try:
         driver.align_mps_center(working, ref=0)
         _dets, vector = driver.get_csf_coefficients(

@@ -10,7 +10,7 @@ import json
 import os
 import resource
 import time
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 
 import numpy as np
@@ -151,8 +151,9 @@ def restore(directory):
     return mc, solver, fingerprint
 
 
-def active_action_batch(eri, vectors, norb, nelec):
-    """Vectorize PySCF's SGF contract_2e for a residual measurement, not a solve."""
+@lru_cache(maxsize=8)
+def _active_action_links(norb, nelec):
+    """Fixed-N link maps reused by the measurement batches."""
     from pyscf.fci import cistring
     from scipy.sparse import coo_matrix
     links = cistring.gen_linkstr_index(range(norb), nelec)
@@ -164,6 +165,13 @@ def active_action_batch(eri, vectors, norb, nelec):
                       shape=(norb * norb * dimension, dimension)).tocsr()
     right = coo_matrix((sign, (target, pq * dimension + origin)),
                        shape=(dimension, norb * norb * dimension)).tocsr()
+    return left, right
+
+
+def active_action_batch(eri, vectors, norb, nelec):
+    """Vectorize PySCF's SGF contract_2e for a residual measurement, not a solve."""
+    left, right = _active_action_links(norb, nelec)
+    dimension = left.shape[1]
     # Bound temporary arrays while using the same E_pq E_rs contraction as
     # fci_dhf_slow. No alpha/beta representation or diagonalization is involved.
     result = np.empty_like(vectors)
