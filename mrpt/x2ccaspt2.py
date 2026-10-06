@@ -126,6 +126,11 @@ import numpy as np
 from scipy import linalg
 
 try:
+    from ._ic_metric import congruence, extended_dot, refine_metric_basis
+except ImportError:  # standalone integral-only use
+    from _ic_metric import congruence, extended_dot, refine_metric_basis
+
+try:
     from pyscf import lib as _pyscf_lib
 except ImportError:
     _pyscf_lib = None
@@ -979,12 +984,11 @@ def _metric_congruence(X, operator, source, metric_info):
         for detail in metric_info.get("sector_metric_ranks", {}).values()
     )
     if refined:
-        xl = np.asarray(X, dtype=np.clongdouble)
-        al = np.asarray(operator, dtype=np.clongdouble)
-        transformed_operator = np.asarray(xl.conj().T @ al @ xl, dtype=np.complex128)
+        threads = _pyscf_lib.num_threads() if _pyscf_lib is not None else 1
+        transformed_operator = congruence(X, operator, extended=True, threads=threads)
         transformed_source = (
             None if source is None else
-            np.asarray(xl.conj().T @ np.asarray(source, dtype=np.clongdouble),
+            np.asarray(extended_dot(X.conj().T, source, threads=threads),
                        dtype=np.complex128)
         )
         metric_info["metric_congruence_accumulation_dtype"] = np.dtype(np.clongdouble).name
@@ -1464,6 +1468,7 @@ def _sector_orthogonalizer(matrices, controls):
     rank = sum(int(np.count_nonzero(e > cutoff)) for _, e, _ in parts.values())
     X = np.zeros((len(b), rank), dtype=np.complex128)
     out_slices, details = {}, {}
+    threads = _pyscf_lib.num_threads() if _pyscf_lib is not None else 1
     pos, null_source_sq = 0, 0.0
     for key, (sl, eg, ug) in parts.items():
         if np.min(eg, initial=0.0) < -(atol+rtol*max(1.0, largest)):
@@ -1478,32 +1483,23 @@ def _sector_orthogonalizer(matrices, controls):
         # Extended accumulation is local to this numerical check/refinement;
         # production tensors and amplitudes remain complex128.
         sg = 0.5*(S[sl, sl]+S[sl, sl].conj().T)
-        before = _maxabs(xg.conj().T @ sg @ xg-np.eye(n))
-        refinements = 0
-        if n and before > max(1e-13, atol*0.1):
-            sg_long = np.asarray(sg, dtype=np.clongdouble)
-            for _ in range(2):
-                xl = np.asarray(xg, dtype=np.clongdouble)
-                gram = np.asarray(xl.conj().T @ sg_long @ xl, dtype=np.complex128)
-                gram = 0.5*(gram+gram.conj().T)
-                ge, gu = linalg.eigh(gram)
-                if ge[0] <= 0.5 or ge[-1] >= 1.5:
-                    raise CASPT2NumericalError('retained metric Gram is too ill-conditioned to refine safely')
-                xg = xg @ ((gu/np.sqrt(ge)[None, :]) @ gu.conj().T)
-                refinements += 1
+        try:
+            xg, refinement = refine_metric_basis(
+                xg, sg, tolerance=max(1e-13, atol*0.1), threads=threads,
+            )
+        except FloatingPointError as error:
+            raise CASPT2NumericalError(str(error)) from error
         X[sl, pos:pos+n] = xg
         null_source_sq += float(linalg.norm(ug[:, ~keep].conj().T @ b[sl]))**2
         details[key] = dict(raw_dimension=sl.stop-sl.start, metric_rank=n,
-                            gram_error_before_refinement=before,
-                            gram_refinement_steps=refinements)
+                            **refinement)
         pos += n
     null_source = math.sqrt(null_source_sq)
     if null_source > controls['source_atol']+rtol*linalg.norm(b):
         raise CASPT2NumericalError(f'source outside retained metric span: {null_source:.3e}')
     # Evaluate the final audit with extended accumulation as well. A BLAS
     # product in double precision is itself inaccurate for highly scaled X.
-    xl = np.asarray(X, dtype=np.clongdouble)
-    gram = xl.conj().T @ np.asarray(S, dtype=np.clongdouble) @ xl
+    gram = congruence(X, S, extended=True, threads=threads)
     err = _maxabs(gram-np.eye(rank))
     if err > 10*(atol+rtol):
         raise CASPT2NumericalError(f'classwise metric orthogonalization failed: {err:.3e}')

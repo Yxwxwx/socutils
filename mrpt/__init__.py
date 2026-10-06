@@ -35,6 +35,14 @@ from .x2cficnevpt2 import (
     X2CPCNEVPT2,
 )
 from .x2cucnevpt2 import X2CUCNEVPT2, UCNEVPT2
+from .x2cmsficnevpt2 import (
+    MSFICPrepared,
+    MSFICResult,
+    WickX2CMSFICNEVPT2,
+    X2CMSFICNEVPT2,
+    prepare_msfic,
+    solve_msfic,
+)
 from .x2ccaspt2 import (
     CASPT2IPEAWarning,
     CASPT2IntruderError,
@@ -104,6 +112,12 @@ __all__ = [
     "X2CPCNEVPT2",
     "X2CUCNEVPT2",
     "UCNEVPT2",
+    "MSFICPrepared",
+    "MSFICResult",
+    "WickX2CMSFICNEVPT2",
+    "X2CMSFICNEVPT2",
+    "prepare_msfic",
+    "solve_msfic",
     "CASPT2IPEAWarning",
     "CASPT2IntruderError",
     "CASPT2Matrices",

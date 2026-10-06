@@ -112,15 +112,14 @@ docs/
 
 .pytest_cache/
 .ruff_cache/
-# Local debug files/directories are never part of a commit.
-.tmp*
-*.tmp
-
 *.pdf
 *.json
 *.slurm
 *.out
 *.npz
+*.npy
+*.pkl
+*.chk
 scripts/
 
 # Block2-style no-4-RDM NEVPT2 validation sources, not runtime data.
@@ -131,6 +130,16 @@ scripts/
 !/tests/test_x2cficnevpt2.py
 !/tests/test_nevpt2_memory.py
 !/tests/test_x2cqdscnevpt2.py
+
+# MS-FIC implementation tests and reproducible benchmark sources/evidence.
+!/tests/test_x2cmsficnevpt2.py
+!/tests/msficnevpt2/
+/tests/msficnevpt2/*
+!/tests/msficnevpt2/*.py
+!/tests/msficnevpt2/*.md
+!/tests/msficnevpt2/carbon_evidence.json
+
+# Block2 response validation sources; runtime directories stay ignored.
 !/tests/nevpt2_mps_response/
 /tests/nevpt2_mps_response/*
 !/tests/nevpt2_mps_response/f_atom.py
@@ -148,3 +157,7 @@ scripts/
 
 # Generated localization validation logs (the reports and sources are kept).
 /lo/*_output.txt
+
+# Keep these last: source allowlists must not re-include local debug files.
+.tmp*
+*.tmp

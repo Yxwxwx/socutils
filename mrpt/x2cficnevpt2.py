@@ -236,8 +236,8 @@ def _target(parse_tensor, name: str, labels: tuple[str, ...]):
     return parse_tensor(f"{name}[{''.join(labels)}]")
 
 
-@lru_cache(maxsize=1)
-def _compile_fic_equations() -> _FICEquationBundle:
+@lru_cache(maxsize=2)
+def _compile_fic_equations(include_overlap=False) -> _FICEquationBundle:
     """Generate all FIC RHS, metric, and Dyall-matrix contractions."""
 
     types = _utils._block2_wick_types()
@@ -276,7 +276,8 @@ def _compile_fic_equations() -> _FICEquationBundle:
         for bra_component in components:
             bra = bra_expressions[bra_component.name]
             rhs = _utils._lower_active_operators(
-                _utils._vacuum_reduce(bra * source), types
+                _utils._vacuum_reduce(bra * source), types,
+                include_overlap=include_overlap,
             )
             labels = free_labels + bra_component.bra_active
             rhs_code[(key, bra_component.name)] = rhs.to_einsum(
@@ -294,7 +295,8 @@ def _compile_fic_equations() -> _FICEquationBundle:
                 )
 
                 metric = _utils._lower_active_operators(
-                    _utils._vacuum_reduce(bra * ket), types
+                    _utils._vacuum_reduce(bra * ket), types,
+                    include_overlap=include_overlap,
                 )
 
                 # [one-/two-body H_D, one-/two-body O] is connected and
@@ -304,13 +306,15 @@ def _compile_fic_equations() -> _FICEquationBundle:
                     (h_dyall_active ^ ket).expand(6).simplify()
                 )
                 right = _utils._lower_active_operators(
-                    _utils._vacuum_reduce(bra * connected_right), types
+                    _utils._vacuum_reduce(bra * connected_right), types,
+                    include_overlap=include_overlap,
                 )
                 connected_left = (
                     (bra ^ h_dyall_active).expand(6).simplify()
                 )
                 left = _utils._lower_active_operators(
-                    _utils._vacuum_reduce(connected_left * ket), types
+                    _utils._vacuum_reduce(connected_left * ket), types,
+                    include_overlap=include_overlap,
                 )
 
                 metric_code[pair] = metric.to_einsum(

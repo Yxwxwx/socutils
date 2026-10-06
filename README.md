@@ -1,5 +1,24 @@
 This repository adds utility for PySCF to include SOMF corrections within spinor style and GHF style calculations.
 
+### One-step MS-FIC-NEVPT2
+
+```python
+from socutils.mrpt import prepare_msfic, solve_msfic
+
+prepared = prepare_msfic(mc, sa_roots=range(6), sa_weights=[1/6]*6,
+                        model_roots=(0, 1, 2, 3))
+result = solve_msfic(prepared, ansatz="ms_mr", shift=0.0)
+print(result.energies)
+```
+
+SS-SR and MS-MR share the specified SA-Fock/Dyall partition and use raw
+complex-spinor transition 1--4 RDMs, streamed one ordered pair at a time.
+Model roots select the dynamic-correlation space independently of the SA
+ensemble; no RDM or energy averaging is used to impose degeneracy.
+See the [method/API](mrpt/README_msficnevpt2.md),
+[C benchmark](tests/msficnevpt2/report.md), and
+[F six-state/manifold comparison](tests/msficnevpt2/fluorine_report.md).
+
 ### Optional no-4-RDM NEVPT2
 
 ```python
