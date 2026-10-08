@@ -296,7 +296,7 @@ def _restrict_model(prepared, roots):
         classes[key] = replace(
             block,
             **{
-                name: getattr(block, name)[ic]
+                name: None if getattr(block, name) is None else getattr(block, name)[ic]
                 for name in ("metric", "right", "left", "active")
             },
             source=np.take(np.take(block.source, rows, axis=-2), indices, axis=-1),

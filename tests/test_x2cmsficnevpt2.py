@@ -4,6 +4,7 @@
 import errno
 import itertools
 import json
+import pickle
 import weakref
 from dataclasses import replace
 from pathlib import Path
@@ -72,6 +73,7 @@ def data():
         lambda a, b: pdms[a, b],
         np.eye(nmodel),
         contraction_backend="numpy",
+        retain_commutators=True,
     )
     np.testing.assert_allclose(eref, np.diag(energies), atol=1e-12)
     eps = np.r_[[-10.0, -8.0], np.zeros(na), [7.0, 9.0]]
@@ -109,7 +111,7 @@ def test_all_eight_transition_matrices_non_degenerate_and_dm0(data):
     assert np.linalg.norm(p.classes["r"].right - p.classes["r"].left) > 1e-3
     np.testing.assert_allclose(p.classes["ijrs"].metric, np.eye(5), atol=1e-12)
     for key, block in p.classes.items():
-        for indices in fic._iter_free_tuples(key, p.eris):
+        for position, indices in enumerate(fic._iter_free_tuples(key, p.eris)):
             _, basis, hb = direct_basis(data, key, indices)
             s, f, v = (
                 basis.conj().T @ basis,
@@ -118,7 +120,7 @@ def test_all_eight_transition_matrices_non_degenerate_and_dm0(data):
             )
             np.testing.assert_allclose(block.metric, s, atol=2e-12)
             np.testing.assert_allclose(block.active, f, atol=2e-12)
-            np.testing.assert_allclose(block.source[indices], v, atol=2e-12)
+            np.testing.assert_allclose(block.source[position], v, atol=2e-12)
             e = np.repeat(np.diag(p.active_reference), block.dimension_per_reference)
             np.testing.assert_allclose(block.right, f - s * e[None, :], atol=2e-12)
             np.testing.assert_allclose(block.left, f - e[:, None] * s, atol=2e-12)
@@ -287,6 +289,7 @@ def test_manifold_restriction_matches_direct_transition_preparation(data):
         lambda a, b: pdms[a, b],
         np.eye(2),
         contraction_backend="numpy",
+        retain_commutators=True,
     )
     direct = replace(
         restricted,
@@ -323,6 +326,92 @@ def test_weak_sources_scale_quadratically_without_false_zero(data):
             b.source_response / factor**2, a.source_response, atol=1e-12
         )
         np.testing.assert_allclose(b.shift_norm / factor**2, a.shift_norm, atol=1e-12)
+
+
+@pytest.mark.parametrize("ncore,nvirt", [(0, 3), (1, 3), (3, 0), (3, 1), (3, 4)])
+def test_free_source_packing_matches_solver_order(ncore, nvirt):
+    eris = SimpleNamespace(ncore=ncore, nvirt=nvirt)
+    for key in fic.SUBSPACE_ORDER:
+        shape = fic._shape_for_labels(tuple(key), eris)
+        full = np.arange(int(np.prod(shape)) * 7).reshape(shape + (7,))
+        indices = list(fic._iter_free_tuples(key, eris))
+        packed = ms._pack_free_source(full, key)
+        expected = np.asarray([full[ix] for ix in indices], dtype=full.dtype).reshape(
+            (len(indices), 7)
+        )
+        np.testing.assert_array_equal(packed, expected)
+        assert packed.nbytes == len(indices) * 7 * full.itemsize
+
+
+@pytest.mark.parametrize("ansatz", ["ss_sr", "ms_mr"])
+def test_legacy_dense_prepared_cache_and_packed_sources_agree(data, ansatz):
+    p = data[0]
+    legacy_classes = {}
+    for key, block in p.classes.items():
+        shape = fic._shape_for_labels(tuple(key), p.eris)
+        # Invalid/repeated tuples must never enter either solve.
+        full = np.full(shape + block.source.shape[-2:], 1e30 + 2e30j)
+        for position, indices in enumerate(fic._iter_free_tuples(key, p.eris)):
+            full[indices] = block.source[position]
+        legacy_classes[key] = replace(block, source=full)
+    legacy = pickle.loads(pickle.dumps(replace(p, classes=legacy_classes)))
+    actual, expected = (
+        ms.solve_msfic(p, ansatz=ansatz),
+        ms.solve_msfic(legacy, ansatz=ansatz),
+    )
+    np.testing.assert_allclose(actual.heff, expected.heff, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(
+        actual.shift_norm, expected.shift_norm, atol=1e-12, rtol=0
+    )
+    assert actual.diagnostics["classes"] == expected.diagnostics["classes"]
+
+
+def test_production_releases_commutators_and_preserves_rotated_cache(data):
+    from tests.msficnevpt2.fluorine import _restrict_model
+
+    p, _, _, _, pdms = data
+    expected = _restrict_model(p, (0, 1))
+    classes, eref, audit = ms.build_msfic_classes(
+        p.eris,
+        (0, 1),
+        lambda a, b: pdms[a, b],
+        np.eye(2),
+        contraction_backend="numpy",
+    )
+    assert audit["source_layout"] == "ordered-unique-free-tuples"
+    assert audit["retained_commutators"] is False
+    for key, block in classes.items():
+        assert block.right is block.left is None
+        count = sum(1 for _ in fic._iter_free_tuples(key, p.eris))
+        assert block.source.shape == (count, 2 * block.dimension_per_reference, 2)
+        assert block.source.nbytes <= (
+            int(np.prod(fic._shape_for_labels(tuple(key), p.eris)))
+            * 2
+            * block.dimension_per_reference
+            * 2
+            * 16
+        )
+    packed = pickle.loads(
+        pickle.dumps(
+            replace(expected, classes=classes, active_reference=eref, reference=eref)
+        )
+    )
+    rotation = np.array([[1, 1j], [1j, 1]]) / np.sqrt(2)
+    changed = packed.rotated(rotation)
+    assert all(b.right is b.left is None for b in changed.classes.values())
+    restricted = _restrict_model(packed, (1,))
+    assert all(b.right is b.left is None for b in restricted.classes.values())
+    for ansatz in ("ss_sr", "ms_mr"):
+        actual = ms.solve_msfic(packed, ansatz=ansatz)
+        direct = ms.solve_msfic(expected, ansatz=ansatz)
+        np.testing.assert_allclose(actual.heff, direct.heff, atol=3e-12, rtol=0)
+        np.testing.assert_allclose(
+            actual.shift_norm, direct.shift_norm, atol=3e-12, rtol=0
+        )
+    actual, rotated = ms.solve_msfic(packed), ms.solve_msfic(changed)
+    np.testing.assert_allclose(
+        rotated.heff, rotation.conj().T @ actual.heff @ rotation, atol=3e-12, rtol=0
+    )
 
 
 @pytest.mark.parametrize("ansatz", ["ss_sr", "ms_mr"])
@@ -525,7 +614,8 @@ def test_production_streams_disk_rdms_without_audits(data, monkeypatch, tmp_path
         )
         np.testing.assert_array_equal(loaded_ref, eref)
         for key, block in loaded.items():
-            for name in ("metric", "right", "left", "active", "source"):
+            assert block.right is block.left is None
+            for name in ("metric", "active", "source"):
                 np.testing.assert_array_equal(
                     getattr(block, name), getattr(classes[key], name)
                 )
@@ -535,7 +625,8 @@ def test_production_streams_disk_rdms_without_audits(data, monkeypatch, tmp_path
     np.testing.assert_allclose(eref, p.active_reference[:2, :2], atol=1e-12)
     for key, block in classes.items():
         d = block.dimension_per_reference
-        for name in ("metric", "right", "left", "active"):
+        assert block.right is block.left is None
+        for name in ("metric", "active"):
             np.testing.assert_allclose(
                 getattr(block, name),
                 getattr(p.classes[key], name)[: 2 * d, : 2 * d],
@@ -625,7 +716,8 @@ def test_disk_capacity_falls_back_without_recomputing_rdms(
     np.testing.assert_allclose(eref, p.active_reference[:2, :2], atol=1e-12)
     for key, block in classes.items():
         d = block.dimension_per_reference
-        for name in ("metric", "right", "left", "active"):
+        assert block.right is block.left is None
+        for name in ("metric", "active"):
             np.testing.assert_allclose(
                 getattr(block, name),
                 getattr(p.classes[key], name)[: 2 * d, : 2 * d],

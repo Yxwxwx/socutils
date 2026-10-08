@@ -29,6 +29,17 @@ Hermitian effective Hamiltonian. True first-order amplitudes obey
 `Heff = Href + (V†t + t†V)/2 - eta*t†S*t`, including off-diagonal elements.
 Non-diagonal model Hamiltonians are retained under reference rotations.
 
+Prepared sources store only the unique free tuples (`i<j`, `r<s`), in
+`_iter_free_tuples` order, with shape `(n_unique_tuples, n_model*d, n_model)`.
+This is storage packing only: the same tuples, contractions, and amplitudes
+enter the solve. After the existing commutator checks and active-Hamiltonian
+restoration, `right` and `left` are released (`None`); production keeps the
+metric, active Hamiltonian, and source. Independent validation can call
+`build_msfic_classes(..., retain_commutators=True)` to retain them.
+Rotation, model restriction, and new prepared pickles support this layout.
+Old prepared pickles with dense free-index axes remain readable without
+rewriting them; their existing storage is not automatically compacted.
+
 Raw transition ranks 0–4 enter the contractions unchanged. Production
 preparation checks array shapes and numeric dtypes only, without scanning
 RDM values for antisymmetry, reverse-adjoint or particle-number identities.

@@ -60,9 +60,9 @@ def _hermitian(matrix, atol, rtol, name):
 @dataclass
 class MSFICClass:
     metric: np.ndarray
-    right: np.ndarray
-    left: np.ndarray
-    active: np.ndarray
+    right: np.ndarray | None
+    left: np.ndarray | None
+    active: np.ndarray | None
     source: np.ndarray
     dimension_per_reference: int
     diagnostics: dict
@@ -93,7 +93,7 @@ class MSFICPrepared:
         for key, block in self.classes.items():
             transform = np.kron(unitary, np.eye(block.dimension_per_reference))
             matrices = [
-                transform.conj().T @ a @ transform
+                None if a is None else transform.conj().T @ a @ transform
                 for a in (block.metric, block.right, block.left, block.active)
             ]
             source = np.einsum(
@@ -121,6 +121,16 @@ class MSFICPrepared:
             classes,
             {**self.diagnostics, "reference_rotation": unitary},
         )
+
+
+def _pack_free_source(tensor, key):
+    """Keep exactly the tuples, in the order, consumed by _iter_free_tuples."""
+    # Reverse order keeps the remaining pair's original axis positions valid.
+    for left, right in reversed(fic._FREE_PAIRS[key]):
+        indices = [slice(None)] * tensor.ndim
+        indices[left], indices[right] = np.triu_indices(tensor.shape[left], k=1)
+        tensor = tensor[tuple(indices)]
+    return tensor.reshape((int(np.prod(tensor.shape[:-1])), tensor.shape[-1]))
 
 
 def _contract_pair(eris, pdms, overlap, equations, backend):
@@ -170,11 +180,9 @@ def _contract_pair(eris, pdms, overlap, equations, backend):
             fic._assemble_matrix(tensors[name], zero, components, eris.ncas)
             for name in tensors
         ]
-        # Keep all free tuples in source storage; unique-pair selectors below
-        # are the same as the audited single-state FIC implementation.
         pieces = [
-            sources[c.name].reshape(free_shape + (-1,))[
-                ..., fic._component_selection(c, eris.ncas)
+            _pack_free_source(sources[c.name].reshape(free_shape + (-1,)), key)[
+                :, fic._component_selection(c, eris.ncas)
             ]
             for c in components
         ]
@@ -333,6 +341,7 @@ def build_msfic_classes(
     matrix_rtol=1e-10,
     transition_rdm_dir=None,
     transition_rdm_fallback_dir=None,
+    retain_commutators=False,
 ):
     """Stream ordered model-root pairs, not high-order pairs for all SA roots.
 
@@ -343,6 +352,8 @@ def build_msfic_classes(
     An explicit directory retains files in a fresh preparation subdirectory;
     otherwise only the current pair occupies ``lib.param.TMPDIR``.
     A configured fallback directory is used only for capacity/quota failures.
+    Sources retain only the ordered unique free tuples. Commutator matrices
+    are released after checks unless ``retain_commutators`` is set for tests.
     """
     roots = tuple(model_roots)
     n = len(roots)
@@ -419,8 +430,9 @@ def build_msfic_classes(
                             classes[key] = MSFICClass(
                                 *[
                                     np.zeros((n * d, n * d), dtype=complex)
-                                    for _ in range(4)
+                                    for _ in range(3)
                                 ],
+                                None,
                                 np.zeros(v.shape[:-1] + (n * d, n), dtype=complex),
                                 d,
                                 {},
@@ -469,6 +481,9 @@ def build_msfic_classes(
             "commutator_adjoint": adjoint,
             "energy_restoration": restoration,
         }
+        if not retain_commutators:
+            block.right = block.left = None
+        del s, r, l, s4, se, es
     return (
         classes,
         active_ref,
@@ -478,6 +493,8 @@ def build_msfic_classes(
             "transition_rdm_directory": str(rdm_directory) if keep_rdms else None,
             "transition_rdm_locations": locations,
             "active_reference_hermiticity": ref_error,
+            "source_layout": "ordered-unique-free-tuples",
+            "retained_commutators": bool(retain_commutators),
         },
     )
 
@@ -759,8 +776,9 @@ def solve_msfic(
             "maximum_denominator": None,
             "retained_hermiticity": f_error,
         }
-        for indices in fic._iter_free_tuples(key, eris):
-            source = v[indices]
+        for position, indices in enumerate(fic._iter_free_tuples(key, eris)):
+            # Old prepared pickles retain the dense free-index axes.
+            source = v[position] if v.ndim == 3 else v[indices]
             delta = fic._orbital_gap_at(
                 key,
                 indices,
