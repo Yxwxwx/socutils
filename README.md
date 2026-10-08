@@ -1,200 +1,221 @@
-This repository adds utility for PySCF to include SOMF corrections within spinor style and GHF style calculations.
+# socutils
 
-### One-step MS-FIC-NEVPT2
+Relativistic complex-spinor electronic-structure methods built on PySCF:
+X2CAMF Hartree–Fock, second-order CASSCF/DMRG-SCF, FIC-NEVPT2 and
+one-step MS-FIC-NEVPT2.
 
-```python
-from socutils.mrpt import prepare_msfic, solve_msfic
+## Installation
 
-prepared = prepare_msfic(mc, sa_roots=range(6), sa_weights=[1/6]*6,
-                        model_roots=(0, 1, 2, 3))
-result = solve_msfic(prepared, ansatz="ms_mr", shift=0.0)
-print(result.energies)
-```
-
-SS-SR and MS-MR share the specified SA-Fock/Dyall partition and use raw
-complex-spinor transition 1--4 RDMs, streamed one ordered pair at a time.
-Model roots select the dynamic-correlation space independently of the SA
-ensemble; no RDM or energy averaging is used to impose degeneracy.
-See the [method/API](mrpt/README_msficnevpt2.md),
-[C benchmark](tests/msficnevpt2/report.md), and
-[F six-state/manifold comparison](tests/msficnevpt2/fluorine_report.md).
-
-### Optional no-4-RDM NEVPT2
-
-```python
-from socutils.mrpt import WickX2CSCNEVPT2, WickX2CFICNEVPT2
-
-pt = WickX2CSCNEVPT2(mc)  # or WickX2CFICNEVPT2(mc)
-pt.kernel(root=0, mps_response=True, contraction_backend="pytblis")
-```
-
-The default remains strict SC/FIC with raw 1--4 RDMs. The optional branch
-needs only raw 1--3 RDMs: it keeps six contracted classes and replaces only
-`i/r` with whole-class `aaac/aaav` UC-MPS response through the native
-pyblock2 solver. It is SC/FIC+UC(i,r), not another evaluation of strict
-SC/FIC. No time-propagation module, alpha/beta conversion, CD or Kramers
-restriction is required. Finite global residuals above the validation target
-are warnings; measured values and verification flags remain available.
-See [the validation workflow](tests/nevpt2_mps_response/README.md) and
-[the six-root F results](tests/nevpt2_mps_response/report.md).
-
-The experimental `X2CUCNEVPT2(mc).run(root=0)` entry instead uses a single
-full-chain Block2 MPS-PT response for all eight external classes, with only
-raw 1/2-RDMs. The default uses native `Linear.solve` with on-the-fly RHS
-contraction; whole-CAS exclusion is an opt-in validation mode. A separate
-PT driver owns its response space and scratch. It does not impose Kramers
-restriction at the PT level. See the [method and measured validation](mrpt/README_ucnevpt2.md)
-and the [sequential X2C example](examples/24-x2c_dmrg_uc_nevpt2.py).
-`pt.response_mode = "external_tuples"` selects active-only responses for
-all fixed external-occupation blocks, excluding the entire CAS sector by
-construction. The six-root F benchmark is complete; residual warnings and
-the unresolved quartet splitting are reported without altering energies.
-
-### Opt-in adaptive Super-CI
-
-```python
-mc.superci_adaptive = False  # default: unshifted, metric-conditioned Davidson
-# mc.superci_adaptive = True # additionally bound the solved orbital step
-mc.superci()
-```
-
-This replaces the job-local `from superci_metric_adaptive import install`
-and `install()` calls; remove those calls when using the switch. Selection is
-per CASSCF object, with no global overrides or `.tmp_superci_debug` dependency.
-For full ERI, unrestricted, unscreened, unfrozen rotations and
-`mc.canonicalize_ = False`, both modes use the corrected complex mixed-one-body
-Super-CI operator and occupation-metric coordinates. Conditioning no longer
-requires enabling adaptive shifts. Other orbital/integral routes retain their
-existing operator implementation.
-
-Adaptive mode adds an orbital level shift when the solved step exceeds
-`mc.max_stepsize`; a well-conditioned metric no longer bypasses this bound.
-It requires Davidson, full ERI (no CD/DF), no Kramers restriction or screened/frozen
-rotations, `mc.canonicalize_ = False`, and `mc.natorb = False`. Unsupported
-combinations raise an error rather than silently falling back. The corrected
-full-ERI route uses the actual linear derivative `2 Re(g† step)` for its
-outer energy prediction.
-Convergence tolerances are unchanged; inner convergence does not guarantee
-outer convergence. The enabled mode is logged and recorded
-in `mc.superci_diagnostics['adaptive']`.
-
-Adaptive mode reuses one Krylov space across the projected orbital-shift
-search. Adaptive and second-order runs require orbital BFGS disabled
-and use accepted-point retries. The DMRG warm-start gate receives the actual
-proposed step immediately before the corresponding CASCI calculation.
-
-DMRG two-site results with inconsistent MPS expectation values and reported
-root energies are marked unconverged. A failed internal warm restart is
-retried once with the original full cold schedule and the same tolerances;
-the failure is recorded in `fcisolver.convergence_info['restart_fallback']`.
-
-### Second-order complex orbital optimization
-
-```python
-mc.second_order_max_rotation = 1.0  # independent rotation-vector norm cap
-mc.second_order_micro_step_tol = 1e-4  # 0 restores strict inner solves throughout
-mc.second_order()  # keeps the configured active-space solver, including DMRG
-```
-
-This uses the fixed-1/2-RDM orbital Hessian (including Coulomb/exchange and
-two-particle response) and BAGEL-style scaled augmented-Hessian iteration in
-the real tangent space of complex orbital rotations. The step bound is solved
-inside the projected AH problem. It requires full ERIs, no Kramers restriction
-or frozen/screened rotations, `canonicalize_=False`, `natorb=False`, and no
-orbital BFGS. The three additional MO integral blocks use approximately
-`48 * nmo**2 * ncas**2` bytes; the code checks this against available
-`mc.max_memory`. Only 1/2-RDMs are needed.
-
-Both bounded optimizers shrink the radius on rejected steps and may grow it
-after reliable boundary steps, up to their configured caps. Trials start from the
-accepted orbitals; a rejected MPS is never used to initialize the retry.
-After six failed trials the accepted point is recomputed cold, including its
-live CI/MPS, RDMs and checkpoint, before raising an error if a trial CASCI was
-attempted. Inner `maximum_space`/`linear_dependence` failures with finite
-residuals also shrink the radius, sharing the six-attempt limit. They do not
-run CASCI or change its restart state; failures before any trial CASCI leave
-the accepted CI/MPS intact. Other errors propagate immediately. Noise-scale energy
-rises are allowed only when the orbital gradient is already below tolerance;
-the final energy/gradient tests remain unchanged.
-
-Second-order microiterations use the BAGEL-style scaled-residual/step test
-away from convergence and restore the strict unscaled Davidson tolerance
-when the gradient is within ten times `conv_tol_grad`. Diagnostics distinguish
-`converged_inexact` from `strict_converged`, with the actual residual and
-effective tolerance. Natural/semicanonical coordinates affect only the
-preconditioner, preserving the physical active orbitals and finite-M MPS.
-Integral blocks share their first-pair transforms and use available memory
-after accounting for resident data; the two response densities share a JK call.
-Full-ERI CASCI and orbital gradients also share a core JK cache, keyed by the
-exact tagged core density. Changed densities recompute JK; active and response
-requests bypass this cache.
-
-See [the BAGEL/CaOH comparison](docs/bagel_zmcscf_caoh.md) for the numerical
-checks and the distinction between inner and outer convergence.
-The [follow-up comparison](docs/bagel_zmcscf_followup.md) records the new
-step control, integral reuse and F six-state regression.
-
-The Python environment is locked with `uv` (Python 3.12):
+Use Linux, Python 3.12, a C/C++ compiler, CMake, Make and
+[uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
-uv sync
-make PYTHON=.venv/bin/python
-uv run python -c "import pyscf; import block2; import pyblock2; import socutils"
+git clone https://github.com/Yxwxwx/socutils.git
+cd socutils
+uv sync --frozen
+make PYTHON=.venv/bin/python NPROC=8
+source .venv/bin/activate
+python -c "import socutils, pyscf, block2, pyblock2, pytblis; from socutils.scf import spinor_hf"
 ```
 
-The lock selects the official Block2 preview index because its 0.5.4rc16
-CPython 3.12 wheel is newer than the compatible stable 0.5.3 release and
-provides the complex `pyblock2.driver` APIs used by the DMRG solver. See
-[`docs/x2c_dmrg_validation.md`](docs/x2c_dmrg_validation.md) for the tested
-tensor conventions and numerical results.
-To do a spinor (j-adapted) style calculation, build a spinor SCF and attach an
-X2CAMF spin-orbit Hamiltonian with the `.x2camf()` shortcut (the spinor analogue
-of PySCF's `scf.RHF(mol).x2c()`):
+The locked environment includes PySCF 2.14.0, Block2 0.5.4rc16 and
+pytblis 0.0.16. `make` builds the bundled X2CAMF, quaternion eigensolver
+(`zquatev`) and integral kernels; separate X2CAMF/zquatev installations are
+not required. Build and run with the same Python environment. By default,
+the build uses the BLAS/LAPACK shipped with PySCF.
+
+To explicitly select the bundled X2CAMF implementation, including when an
+external `x2camf` package is installed:
+
+```bash
+export SOCUTILS_X2CAMF=bundled
+export X2CAMF_BACKEND=c
+```
+
+Before running Block2, allow an unlimited process stack:
+
+```bash
+ulimit -s unlimited
+python calculation.py
+```
+
+## HF: CD and Kramers restriction
+
+`spinor_hf.SCF` uses unrestricted complex spinors; `spinor_hf.KRHF` enforces
+Kramers restriction. Cholesky decomposition (CD) is independent of that choice.
+For an existing PySCF molecule `mol`:
+
+| HF configuration | Construction |
+| --- | --- |
+| Full ERIs, no KR | `spinor_hf.SCF(mol).x2camf()` |
+| Full ERIs, KR | `spinor_hf.KRHF(mol).x2camf()` |
+| CD, no KR | `spinor_hf.SCF(mol).x2camf().cholesky(tau=1e-8)` |
+| CD, KR | `spinor_hf.KRHF(mol).x2camf().cholesky(tau=1e-8)` |
+
+`.x2camf()` includes Gaunt and Breit corrections by default. Use
+`.x2camf(with_gaunt=False, with_breit=False)` to disable those corrections,
+not spin–orbit coupling itself. Omitting `.cholesky()` selects full ERIs.
+An attached CD object is also used by second-order MCSCF.
+
+KR requires time-reversal-compatible orbitals and complete Kramers pairs
+within each core/active/virtual partition. For KR-DMRG-SCF, additionally
+enable `solver.kramers_restricted()`; odd-electron state averages must include
+complete Kramers manifolds with equal weights within each manifold.
+
+## Second-order DMRG-SCF → FIC/MS-NEVPT2
+
+The example below computes neutral F from closed-shell F⁻ starting orbitals,
+with CAS(7 electrons, 16 spinors) and six equally weighted reference states.
+`ncas` counts individual spinors, **not spatial orbitals**; `nelecas` is the
+total active electron count. Active-orbital selection must be checked for
+each new system.
+
+Save as `calculation.py`. Set `USE_CD` and `USE_KR` independently to select
+any of the four HF/MCSCF configurations above.
+
 ```python
-from pyscf import gto
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import numpy as np
+from pyscf import gto, lib
+
+from socutils.dmrg import DMRGCI
+from socutils.mcscf import zmcscf
+from socutils.mrpt import WickX2CFICNEVPT2, prepare_msfic, solve_msfic
 from socutils.scf import spinor_hf
 
-mol = gto.M(atom=[["O", (0., 0., 0.)],
-                  ["H", (0., -0.757, 0.587)],
-                  ["H", (0.,  0.757, 0.587)]],
-            basis='ccpvdz', verbose=4)
+USE_CD = False
+USE_KR = False
+THREADS = 16
+lib.num_threads(THREADS)
 
-mf = spinor_hf.SCF(mol).x2camf()          # Gaunt + Breit on by default
-e_spinor = mf.kernel()
+mol = gto.M(
+    atom="F 0 0 0", basis="dyallv3z", charge=-1, spin=0,
+    verbose=4, max_memory=300000,  # MB; does not reserve physical RAM
+)
+hf_class = spinor_hf.KRHF if USE_KR else spinor_hf.SCF
+mf = hf_class(mol).x2camf()
+if USE_CD:
+    mf = mf.cholesky(tau=1e-8)
+mf.conv_tol = 1e-12
+mf.max_cycle = 200
+mf.kernel()
+if not mf.converged:
+    raise RuntimeError("F- HF did not converge")
 
-# turn the Gaunt/Breit two-electron SOC corrections off:
-e_dc = spinor_hf.SCF(mol).x2camf(with_gaunt=False, with_breit=False).kernel()
+# Keep the F- X2CAMF one-electron operator when changing the electron count.
+mf.get_hcore()
+initial_mo = np.array(mf.mo_coeff, copy=True)
+mol.charge, mol.spin = 0, 1
+ncas, nelec, nroots = 16, 7, 6
+weights = np.ones(nroots) / nroots
+
+with TemporaryDirectory(prefix="f_dmrg_", dir=lib.param.TMPDIR) as scratch:
+    solver = DMRGCI(mol).init(
+        ncas=ncas, nelecas=nelec, nroots=nroots,
+        max_bond_dimension=1000, tol=1e-8,
+        schedule_thrd_max=1e-16, orbital_ordering="original",
+        final_one_site=USE_KR,
+        n_threads=THREADS, stack_memory=8192,  # Block2 stack, MB
+        scratch=scratch, checkpoint_dir="dmrg_checkpoint",
+    )
+    if USE_KR:
+        solver.kramers_restricted()
+
+    mc = zmcscf.CASSCF(mf, ncas=ncas, nelecas=nelec)
+    mc.fcisolver = solver
+    mc.state_average_(weights)
+    solver = mc.fcisolver  # state_average_ installs a solver wrapper
+    mc.callback = solver.restart_scheduler_()
+    mc.canonicalization = mc.canonicalize_ = mc.natorb = False
+    mc.superci_bfgs = False
+    mc.max_cycle_macro = 100
+    mc.conv_tol = 1e-9
+    mc.conv_tol_grad = 1e-4
+
+    try:
+        mc.second_order(mo_coeff=initial_mo)
+        if not mc.converged or not solver.converged:
+            raise RuntimeError("DMRG-SCF did not converge")
+        print("MCSCF energies:", mc.e_states)
+
+        for root in range(nroots):
+            pt = WickX2CFICNEVPT2(mc)
+            e2 = pt.kernel(root=root, contraction_backend="pytblis")
+            print(f"FIC root {root}: E0={pt.reference_energy:.12f} "
+                  f"E2={e2:.12f} Etot={pt.e_tot:.12f}")
+            del pt
+
+        # Same six-state SA-Fock for both dynamic-correlation manifolds.
+        for model_roots in ((0, 1, 2, 3), (4, 5)):
+            prepared = prepare_msfic(
+                mc, sa_roots=range(nroots), sa_weights=weights,
+                model_roots=model_roots, contraction_backend="pytblis",
+                transition_rdm_fallback_dir=str(Path("rdm_fallback").resolve()),
+            )
+            result = solve_msfic(prepared, ansatz="ms_mr", shift=0.0)
+            print(f"MS-FIC manifold {model_roots}:", result.energies)
+            del prepared, result
+    finally:
+        solver.close()  # PT needs the live reference MPS
 ```
-Note: the C/C++ libraries these features need are **bundled** with socutils
-(under `socutils/lib`) -- no external packages to install. They are compiled
-once with a single `make` at the repo root (needs a BLAS/LAPACK):
-```
-make            # builds libx2camf_c (X2CAMF SOC integrals),
-                #        libzquatev   (Kramers-restricted spinor SCF), and
-                #        libccsdt_clib (spinor CCSDT kernels) into socutils/lib
-```
-- **x2camf** (the SOC integrals) ships as a pure-C reimplementation exposed as
-  `import x2camf`; an external upstream
-  [warlocat/x2camf](https://github.com/warlocat/x2camf) pybind11 build is
-  *optional* (only for A/B comparison, selected via `X2CAMF_BACKEND` /
-  `SOCUTILS_X2CAMF`).
-- **zquatev** (Kramers-restricted spinor SCF) is the bundled quaternion
-  eigensolver -- the former `xubwa/zquatev` pip package is no longer needed.
 
-See `docs/source/install.rst` for details (BLAS/LAPACK vendor selection,
-environment overrides).
-To do a GHF (spin-orbital) style calculation, use `ghf.GHF` with the same
-`.x2camf()` shortcut; it runs in a spin-orbital rather than a spinor basis and
-agrees with the spinor result to numerical precision:
-```python
-from pyscf import gto
-from socutils.scf import ghf
+`mc.second_order()` explicitly selects the fixed-1/2-RDM orbital Hessian
+and scaled augmented-Hessian optimizer; `mc.kernel()` is not this entry
+point. Full-ERI and CD integral routes, with or without KR, are supported.
+Keep `natorb=False`, `canonicalize_=False` and orbital BFGS disabled.
+`mc.canonicalization=False` also skips final semicanonicalization; PT handles
+the required inactive/virtual semicanonicalization without rotating active
+orbitals. For exact-CI CASSCF, leave the default `mc.fcisolver` in place
+instead of assigning `DMRGCI`.
 
-mol = gto.M(atom=[["O", (0., 0., 0.)],
-                  ["H", (0., -0.757, 0.587)],
-                  ["H", (0.,  0.757, 0.587)]],
-            basis='ccpvdz', verbose=4)
+### FIC-NEVPT2
 
-gmf = ghf.GHF(mol).x2camf()               # Gaunt + Breit on by default
-e_ghf = gmf.kernel()
-```
+`WickX2CFICNEVPT2.kernel(root=...)` evaluates one state's correlation energy
+from its raw complex-spinor 1–4 RDMs. It returns `E2`; `pt.reference_energy`
+and `pt.e_tot` give `E0` and `E0 + E2`. Leave `pt.canonicalized=False`
+(the default) unless the orbitals **and** orbital energies have already
+been prepared consistently for the PT Hamiltonian.
+
+### MS-FIC-NEVPT2
+
+`prepare_msfic` constructs a common SA-Fock/Dyall partition from `sa_roots`
+and `sa_weights`. `model_roots` independently selects the states mixed by
+dynamic correlation and must be a subset of `sa_roots`. `solve_msfic`
+diagonalizes the effective Hamiltonian; `result.energies` contains total
+energies, not just corrections.
+
+The F example uses a common six-root SA ensemble and separate four-root
+and two-root manifolds. To mix all six jointly, prepare once with
+`model_roots=tuple(range(6))`. These groupings are system-specific, not
+automatic assignments. `ansatz="ms_mr"` selects MS-MR; `"ss_sr"` selects
+SS-SR. The example explicitly uses zero level shift; the API default is
+`shift=0.2` Hartree.
+
+### Integrals, RDMs and scratch
+
+FIC/MS-NEVPT2 use full Coulomb integrals even after CD-HF/CD-MCSCF. The PT
+code reuses the orbitals and reference MPS, detaches CD on a private view
+and transforms only the required exact integral blocks. It neither expands
+a full all-MO four-index tensor by default nor reruns MCSCF. For a CD
+reference, FIC's `reference_energy` is its full-Hamiltonian RDM expectation,
+which can differ from the CD-MCSCF energy; use `pt.e_tot` for the PT total.
+KR is a reference-stage restriction, not a NEVPT2-level constraint.
+
+Both methods require full rank-4 densities. MS uses raw transition 1–4
+RDMs, without averaging them to impose degeneracy. Transition pairs are
+staged on disk one at a time, contracted through read-only memory maps
+and deleted afterwards. Set `lib.param.TMPDIR` to job-local NVMe **before**
+creating the solver. `transition_rdm_fallback_dir` provides a larger
+filesystem when that staging directory is full; it does not relocate
+Block2's own scratch. Use `transition_rdm_dir` only when retaining all raw
+pairs is intentional.
+
+Disk streaming does not remove the RAM needed to generate one dense
+4-RDM/4-TRDM. At 16 active spinors, one complex128 rank-1–4 density set is
+about 64.25 GiB, before contraction workspaces and MPS storage. PySCF
+`max_memory` and Block2 `stack_memory` are in MB and are not hard limits on
+total process memory. Both PT implementations currently require no frozen
+orbitals (`frozen=0`). See the [MS-FIC API notes](mrpt/README_msficnevpt2.md)
+for storage options and method details.
