@@ -471,20 +471,136 @@ def test_casscf_restart_reuses_only_compatible_internal_mps(
     solver.close()
 
 
+@pytest.mark.parametrize("warm_start", [False, True])
+def test_two_site_energy_mismatch_only_warns_in_solve_and_restore(
+    tmp_path, monkeypatch, warm_start,
+):
+    from pyblock2.driver.core import DMRGDriver
+    from socutils.mcscf.zmc_utils import _ci_usable
+
+    original = DMRGDriver.dmrg
+    calls, warnings = [], []
+
+    def reported_energy_error(driver, *args, **kwargs):
+        energy = original(driver, *args, **kwargs)
+        calls.append(kwargs["n_sweeps"])
+        return np.asarray(energy) + (0.01 if len(calls) > int(warm_start) else 0)
+
+    monkeypatch.setattr(DMRGDriver, "dmrg", reported_energy_error)
+    monkeypatch.setattr(
+        "socutils.dmrg.dmrgci.logger.warn",
+        lambda solver, message, *args: warnings.append(message % args),
+    )
+    h1 = np.diag([-1.3, -0.4, 0.8]).astype(complex)
+    eri = np.zeros((3,) * 4, dtype=complex)
+    checkpoint = tmp_path / "checkpoint"
+    solver = _solver(tmp_path / "scratch", 3, 1, nroots=2, bond_dim=8)
+    solver.checkpoint_dir = str(checkpoint)
+    try:
+        if warm_start:
+            solver.kernel(h1, eri, 3, 1, verbose=0)
+            solver.restart_scheduler_step({"orbital_gradient_norm": 1e-4})
+        energy, _ = solver.kernel(h1, eri, 3, 1, verbose=0)
+        assert solver.converged
+        assert _ci_usable(solver)
+        assert not solver.convergence_info["root_validation_failed"]
+        assert solver.convergence_info["root_eigen_equation_error"] > 0.009
+        assert solver.convergence_info["root_orthogonality_error"] < 1e-10
+        assert len(calls) == 1 + int(warm_start)
+        assert "restart_fallback" not in solver.convergence_info
+        np.testing.assert_allclose(energy, [-1.29, -0.39], atol=1e-10)
+        assert any("accepting the configured two-site endpoint" in w for w in warnings)
+        manifest = json.loads((checkpoint / "dmrgci-checkpoint.json").read_text())
+        assert manifest["converged"]
+    finally:
+        solver.close()
+
+    restored = _solver(tmp_path / "restored", 3, 1, nroots=2, bond_dim=8)
+    restored.checkpoint_dir = str(checkpoint)
+    try:
+        energy, _ = restored.restore_checkpoint(h1, eri, 3, 1, verbose=0)
+        assert restored.converged
+        assert restored.convergence_info["root_eigen_equation_error"] > 0.009
+        np.testing.assert_allclose(energy, [-1.29, -0.39], atol=1e-10)
+        assert len(calls) == 1 + int(warm_start)
+        assert len(warnings) == 2
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize("restore", [False, True])
+@pytest.mark.parametrize("defect", ["nonorthogonal", "nan", "inf"])
+def test_root_validation_still_rejects_invalid_states(
+    tmp_path, monkeypatch, restore, defect,
+):
+    from pyblock2.driver.core import DMRGDriver
+    from socutils.mcscf.zmc_utils import _ci_usable
+
+    h1 = np.diag([-1.3, -0.4, 0.8]).astype(complex)
+    eri = np.zeros((3,) * 4, dtype=complex)
+    solver = _solver(tmp_path / "scratch", 3, 1, nroots=2, bond_dim=8)
+    solver.checkpoint_dir = str(tmp_path / "checkpoint")
+    if restore:
+        solver.kernel(h1, eri, 3, 1, verbose=0)
+        solver.close()
+    bad_value = {"nonorthogonal": 2.0, "nan": np.nan, "inf": np.inf}[defect]
+    monkeypatch.setattr(DMRGDriver, "expectation", lambda *args, **kwargs: bad_value)
+    try:
+        if defect == "nonorthogonal" and not restore:
+            solver.kernel(h1, eri, 3, 1, verbose=0)
+            assert not solver.converged
+            assert solver.convergence_info["root_validation_failed"]
+            assert not _ci_usable(solver)
+        else:
+            solve = solver.restore_checkpoint if restore else solver.kernel
+            message = "inconsistent" if defect == "nonorthogonal" else "non-finite"
+            with pytest.raises(RuntimeError, match=message):
+                solve(h1, eri, 3, 1, verbose=0)
+    finally:
+        solver.close()
+
+
+def test_one_site_energy_mismatch_is_still_rejected(tmp_path, monkeypatch):
+    from pyblock2.driver.core import DMRGDriver
+
+    original = DMRGDriver.dmrg
+
+    def reported_energy_error(driver, *args, **kwargs):
+        return np.asarray(original(driver, *args, **kwargs)) + 0.01
+
+    monkeypatch.setattr(DMRGDriver, "dmrg", reported_energy_error)
+    solver = _solver(tmp_path, 3, 1, nroots=2, bond_dim=8)
+    solver.final_one_site = True
+    solver.twosite_to_onesite = 2
+    try:
+        with pytest.raises(RuntimeError, match="inconsistent"):
+            solver.kernel(np.diag([-1.3, -0.4, 0.8]).astype(complex),
+                          np.zeros((3,) * 4, dtype=complex), 3, 1, verbose=0)
+    finally:
+        solver.close()
+
+
 @pytest.mark.parametrize('cold_retry_succeeds', [True, False])
-def test_inconsistent_warm_restart_is_retried_without_accepting_bad_energy(
+def test_nonorthogonal_warm_restart_is_retried_without_accepting_bad_roots(
     tmp_path, monkeypatch, cold_retry_succeeds,
 ):
     from pyblock2.driver.core import DMRGDriver
     original = DMRGDriver.dmrg
+    original_split = DMRGDriver.split_mps
     calls = []
-    def reported_energy_error(driver, *args, **kwargs):
+
+    def record_solve(driver, *args, **kwargs):
         energy = original(driver, *args, **kwargs)
         calls.append(kwargs['n_sweeps'])
-        if len(calls) == 2 or (len(calls) == 3 and not cold_retry_succeeds):
-            return np.asarray(energy) + .01
         return energy
-    monkeypatch.setattr(DMRGDriver, 'dmrg', reported_energy_error)
+
+    def nonorthogonal_roots(driver, mps, root, **kwargs):
+        if len(calls) == 2 or (len(calls) == 3 and not cold_retry_succeeds):
+            root = 0
+        return original_split(driver, mps, root, **kwargs)
+
+    monkeypatch.setattr(DMRGDriver, 'dmrg', record_solve)
+    monkeypatch.setattr(DMRGDriver, 'split_mps', nonorthogonal_roots)
     h1 = np.diag([-1.3, -.4, .8]).astype(complex)
     eri = np.zeros((3,)*4, complex)
     solver = DMRGCI().init(3, 1, nroots=2, bond_dims=[8]*8,
@@ -500,7 +616,7 @@ def test_inconsistent_warm_restart_is_retried_without_accepting_bad_energy(
         assert solver.convergence_info['run_mode'] == 'cold-start'
         failure = solver.convergence_info['restart_fallback']
         assert not failure['converged']
-        assert failure['root_eigen_equation_error'] > .009
+        assert failure['root_orthogonality_error'] > .9
         if cold_retry_succeeds:
             np.testing.assert_allclose(energy, [-1.3, -.4], atol=1e-10)
     finally:

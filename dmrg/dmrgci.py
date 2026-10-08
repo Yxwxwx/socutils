@@ -1636,21 +1636,29 @@ class DMRGCI(StreamObject):
                     10.0 * math.sqrt(min(schedule.thrds)),
                     10.0 * self.tol,
                 )
+                if not numpy.all(numpy.isfinite(
+                    (root_orthogonality_error, root_eigen_equation_error)
+                )):
+                    raise RuntimeError("non-finite MultiMPS root validation")
                 root_validation_failed = (
-                    max(root_orthogonality_error, root_eigen_equation_error)
-                    > root_validation_tolerance
+                    root_orthogonality_error > root_validation_tolerance
                 )
-                if root_validation_failed:
+                if (root_validation_failed or
+                        root_eigen_equation_error > root_validation_tolerance):
                     message = (
                         "split state-averaged MultiMPS roots are inconsistent "
                         "with the reported energies (S-I %.3e, H-SE %.3e)"
                         % (root_orthogonality_error, root_eigen_equation_error)
                     )
                     if int(ket.dot) == 2 and not self.final_one_site:
+                        # Two-site Ritz energies need not equal the truncated MPS expectations.
                         logger.warn(
                             self,
-                            "%s; marking the two-site result unconverged",
+                            "%s; %s",
                             message,
+                            ("marking the two-site result unconverged"
+                             if root_validation_failed else
+                             "accepting the configured two-site endpoint"),
                         )
                     else:
                         raise RuntimeError(
@@ -2014,6 +2022,10 @@ class DMRGCI(StreamObject):
                 10.0 * math.sqrt(float(numpy.min(stored_thresholds))),
                 10.0 * self.tol,
             )
+            if not numpy.all(numpy.isfinite(
+                (root_orthogonality_error, root_eigen_equation_error)
+            )):
+                raise RuntimeError("non-finite restored checkpoint root validation")
             if (
                 max(root_orthogonality_error, root_eigen_equation_error)
                 > root_validation_tolerance
@@ -2023,7 +2035,8 @@ class DMRGCI(StreamObject):
                     "energies (S-I %.3e, H-SE %.3e)"
                     % (root_orthogonality_error, root_eigen_equation_error)
                 )
-                if int(ket.dot) == 2 and not self.final_one_site:
+                if (int(ket.dot) == 2 and not self.final_one_site
+                        and root_orthogonality_error <= root_validation_tolerance):
                     logger.warn(
                         self,
                         "%s; accepting the configured two-site endpoint",
