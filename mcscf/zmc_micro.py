@@ -355,12 +355,12 @@ class _CIAdapter:
     """Narrow audited protocol; no implicit ndarray operations on native MPS."""
     def __init__(self, mc):
         from socutils.dmrg import DMRGCI
-        from socutils.fci import zfci
+        from pyscf.fci import fci_dhf_slow
         self.mc, self.solver = mc, mc.fcisolver
         self.is_dmrg = isinstance(self.solver, DMRGCI)
-        self.is_exact = isinstance(self.solver, zfci.FCISolver)
+        self.is_exact = isinstance(self.solver, fci_dhf_slow.FCISolver)
         if not self.is_dmrg and not self.is_exact:
-            raise NotImplementedError('micro() supports socutils DMRGCI or exact zfci.FCISolver')
+            raise NotImplementedError('micro() supports socutils DMRGCI or spinor FCISolver')
         self.ci = None
         self.session = None
 

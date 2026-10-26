@@ -28,14 +28,15 @@ def time_reverse_coefficients(matrix, vectors, nelec):
     Vectors are columns (or one 1-D vector). Second quantization of log(U)
     and sparse expm action avoid constructing the dense exterior-power U.
     This is an exponential-size coefficient diagnostic, never a PT solver.
+    The 22-spinor bound also permits the isolated Ag reference-accuracy audit.
     """
     from scipy.linalg import expm, logm
     from scipy.sparse import coo_matrix
     from scipy.sparse.linalg import expm_multiply
     matrix = np.asarray(matrix, complex)
     norb = len(matrix)
-    if matrix.shape != (norb, norb) or norb > 20:
-        raise ValueError("the reference coefficient audit needs a square map of at most 20 spinors")
+    if matrix.shape != (norb, norb) or norb > 22:
+        raise ValueError("the reference coefficient audit needs a square map of at most 22 spinors")
     np.testing.assert_allclose(matrix.conj().T @ matrix, np.eye(norb), atol=1e-10, rtol=0.)
     generator = logm(matrix)
     np.testing.assert_allclose(expm(generator), matrix, atol=1e-10, rtol=0.)

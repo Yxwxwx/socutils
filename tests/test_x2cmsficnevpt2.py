@@ -126,6 +126,68 @@ def test_all_eight_transition_matrices_non_degenerate_and_dm0(data):
             np.testing.assert_allclose(block.left, f - e[:, None] * s, atol=2e-12)
 
 
+def test_nonstationary_reference_restoration_error_matches_direct_residual(data):
+    """Exact TRDMs do not make commutator restoration exact for approximate CI."""
+    p, refs, _, ha, _ = data
+    nc, na = p.eris.ncore, p.eris.ncas
+    active_indices = ((1 << nc) - 1) | (np.arange(1 << na) << nc)
+    angle = 0.02
+    states = np.column_stack([
+        (np.cos(angle) * refs[0] + np.sin(angle) * refs[2])[active_indices],
+        refs[1][active_indices],
+    ])
+    pdms = {(i, j): transition_pdms(states[:, i], states[:, j], na)
+            for i in range(2) for j in range(2)}
+    with pytest.warns(ms.u.MRPTNumericalWarning, match="F energy restoration"):
+        classes, href, _ = ms.build_msfic_classes(
+            p.eris, (0, 1), lambda i, j: pdms[i, j], np.eye(2),
+            contraction_backend="numpy", retain_commutators=True,
+        )
+    np.testing.assert_allclose(href, states.conj().T @ ha @ states, atol=1e-12)
+    residuals = ha @ states - states @ href
+    assert np.linalg.norm(residuals) > 1e-3
+    embedded = [_embed_active_state(states[:, i], nc, na, p.eris.nvirt) for i in range(2)]
+    embedded_q = [_embed_active_state(residuals[:, i], nc, na, p.eris.nvirt) for i in range(2)]
+    for key in ("r", "i", "ir"):
+        indices = next(iter(fic._iter_free_tuples(key, p.eris)))
+        basis = np.concatenate([_fic_basis_vectors(v, p.eris, key, indices) for v in embedded], axis=1)
+        oq = np.concatenate([_fic_basis_vectors(v, p.eris, key, indices) for v in embedded_q], axis=1)
+        h_basis = _apply_active_hamiltonian(basis, ha, nc, na, p.eris.nvirt)
+        direct = basis.conj().T @ h_basis
+        z = basis.conj().T @ oq
+        block = classes[key]
+        np.testing.assert_allclose(block.active - direct, -0.5 * (z + z.conj().T), atol=3e-12)
+        h_ic = np.kron(href, np.eye(block.dimension_per_reference))
+        restoration = block.right + block.metric @ h_ic - block.left - h_ic @ block.metric
+        np.testing.assert_allclose(restoration, z.conj().T - z, atol=3e-12)
+        assert np.max(np.abs(block.active - direct)) > 1e-6
+
+
+@pytest.mark.parametrize("shift", [0.0, 0.2])
+def test_r_mode_audit_reproduces_public_solver(data, shift):
+    from msficnevpt2.r_modes import spectral_audit
+    p = data[0]
+    b = p.classes["r"]
+    stop = 2 * b.dimension_per_reference
+    reduced = replace(
+        p, model_roots=(0, 1), overlap=np.eye(2),
+        active_reference=p.active_reference[:2, :2], reference=p.reference[:2, :2],
+        classes={"r": replace(b, metric=b.metric[:stop, :stop], active=b.active[:stop, :stop],
+                              source=b.source[:, :stop, :2])},
+    )
+    result = ms.solve_msfic(reduced, shift=shift)
+    audit, coefficients = spectral_audit(reduced, shift)
+    np.testing.assert_allclose(
+        audit["source_response"], 0.5 * (result.source_response + result.source_response.conj().T),
+        atol=2e-11, rtol=0,
+    )
+    np.testing.assert_allclose(audit["shift_norm_correction"], -shift * result.shift_norm, atol=2e-11)
+    np.testing.assert_allclose(audit["channel_corrections"].sum(axis=0),
+                               result.class_corrections["r"], atol=2e-11)
+    np.testing.assert_allclose(coefficients.conj().T @ b.metric[:stop, :stop] @ coefficients,
+                               np.eye(len(coefficients.T)), atol=2e-11)
+
+
 @pytest.mark.parametrize("ansatz", ["ss_sr", "ms_mr"])
 @pytest.mark.parametrize("shift", [0.0, 0.2])
 def test_heff_and_full_shift_norm_against_independent_ic_span(data, ansatz, shift):
@@ -172,12 +234,15 @@ def test_ms_mr_nondegenerate_u5_covariance(data, seed):
 
 
 @pytest.mark.parametrize("ansatz", ["ss_sr", "ms_mr"])
-def test_negative_metric_and_null_source_are_errors(data, ansatz):
+def test_negative_metric_warns_but_null_source_is_error(data, ansatz):
     p = data[0]
     block = p.classes["ijrs"]
     negative = block.metric.copy()
     negative[0, 0] = -0.01
-    with pytest.raises(FloatingPointError, match="negative metric"):
+    with (
+        pytest.warns(ms.u.MRPTNumericalWarning, match="negative metric"),
+        pytest.raises(FloatingPointError, match="discarded metric"),
+    ):
         ms.solve_msfic(
             replace(p, classes={"ijrs": replace(block, metric=negative)}), ansatz=ansatz
         )
@@ -186,6 +251,27 @@ def test_negative_metric_and_null_source_are_errors(data, ansatz):
         ms.solve_msfic(
             replace(p, classes={"ijrs": replace(block, metric=zero)}), ansatz=ansatz
         )
+
+
+@pytest.mark.parametrize("metric_refinement", [False, True])
+def test_negative_metric_direction_is_warned_and_discarded(metric_refinement):
+    s = np.diag([2.0, 1.0, -2.204e-9, 0.0])
+    args = {
+        "metric_atol": 1e-12,
+        "metric_rcond": 1e-11,
+        "matrix_atol": 1e-10,
+        "matrix_rtol": 1e-10,
+        "metric_refinement": metric_refinement,
+    }
+    with pytest.warns(ms.u.MRPTNumericalWarning, match="negative metric eigenvalue"):
+        x, null, diagnostics = ms._metric_basis(s, **args)
+    assert diagnostics["rank"] == 2
+    assert diagnostics["minimum_eigenvalue"] == -2.204e-9
+    np.testing.assert_allclose(x.conj().T @ s @ x, np.eye(2), atol=1e-14)
+    np.testing.assert_array_equal(x[2:], np.zeros((2, 2)))
+    np.testing.assert_allclose(null @ null.conj().T, np.diag([0, 0, 1, 1]))
+    with pytest.raises(FloatingPointError, match="non-finite IC metric"):
+        ms._metric_basis(np.diag([1.0, np.nan]), **args)
 
 
 @pytest.mark.parametrize("ansatz", ["ss_sr", "ms_mr"])
@@ -203,6 +289,37 @@ def test_finite_ic_defects_warn_but_nonfinite_data_still_fail(data, ansatz):
     invalid = replace(block, active=np.full_like(block.active, np.nan))
     with pytest.raises(FloatingPointError, match="non-finite"):
         ms.solve_msfic(replace(p, classes={"ijrs": invalid}), ansatz=ansatz)
+
+
+def test_preparation_commutator_defects_warn_but_invalid_inputs_fail(data, monkeypatch):
+    p, _, _, _, pdms = data
+    contract = ms._contract_pair
+    defect = 1e-7
+
+    def noisy_pair(*args, **kwargs):
+        result = contract(*args, **kwargs)
+        _, right, left, _ = result["rsi"]
+        right[0, 0] += defect
+        left[0, 0] -= defect
+        return result
+
+    monkeypatch.setattr(ms, "_contract_pair", noisy_pair)
+    args = (p.eris, (0,), lambda a, b: pdms[a, b], np.eye(1))
+    options = {"contraction_backend": "numpy"}
+    with pytest.warns(ms.u.MRPTNumericalWarning) as messages:
+        classes, _, _ = ms.build_msfic_classes(*args, **options)
+    assert any("rsi R=L-adjoint" in str(w.message) for w in messages)
+    assert any("rsi F energy restoration" in str(w.message) for w in messages)
+    assert classes["rsi"].diagnostics["energy_restoration"] > defect
+    d = p.classes["rsi"].dimension_per_reference
+    np.testing.assert_allclose(
+        classes["rsi"].active, p.classes["rsi"].active[:d, :d], atol=1e-12, rtol=0
+    )
+    with pytest.raises(FloatingPointError, match="not orthonormal"):
+        ms.build_msfic_classes(*args[:3], np.array([[1.01]]), **options)
+    defect = np.nan
+    with pytest.raises(FloatingPointError, match="rsi R=L-adjoint"):
+        ms.build_msfic_classes(*args, **options)
 
 
 def test_metric_refinement_preserves_retained_span_and_rank():

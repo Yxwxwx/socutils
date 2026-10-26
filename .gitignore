@@ -133,6 +133,7 @@ scripts/
 
 # MS-FIC implementation tests and reproducible benchmark sources/evidence.
 !/tests/test_x2cmsficnevpt2.py
+!/tests/test_msfic_ag_audit.py
 !/tests/msficnevpt2/
 /tests/msficnevpt2/*
 !/tests/msficnevpt2/*.py

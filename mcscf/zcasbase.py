@@ -9,6 +9,8 @@ from socutils.fci import zfci
 
 class CASBase(lib.StreamObject):
 
+    _fcisolver_class = zfci.FCISolver
+
     natorb = getattr(__config__, 'mcscf_casci_CASCI_natorb', False)
     canonicalization = getattr(__config__, 'mcscf_casci_CASCI_canonicalization', True)
     sorting_mo_energy = getattr(__config__, 'mcscf_casci_CASCI_sorting_mo_energy', False)
@@ -42,7 +44,7 @@ class CASBase(lib.StreamObject):
             self.nelecas = nelecas
 
         self.ncore = ncore
-        self.fcisolver = zfci.FCISolver(mol)
+        self.fcisolver = self._fcisolver_class(mol)
         # CI solver parameters are set in fcisolver object
         self.fcisolver.lindep = getattr(__config__, 'mcscf_casci_CASCI_fcisolver_lindep', 1e-12)
         self.fcisolver.max_cycle = getattr(__config__, 'mcscf_casci_CASCI_fcisolver_max_cycle', 200)

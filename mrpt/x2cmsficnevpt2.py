@@ -456,12 +456,14 @@ def build_msfic_classes(
         se = np.einsum("najb,jp->napb", s4, active_ref).reshape(s.shape)
         es = np.einsum("nj,japb->napb", active_ref, s4).reshape(s.shape)
         scale = max(u._maximum_abs(r), u._maximum_abs(l), u._maximum_abs(es))
+        # Approximate DMRG eigenstates can violate these finite IC identities.
         adjoint = _gate(
             u._maximum_abs(r - l.conj().T),
             scale,
             matrix_atol,
             matrix_rtol,
             key + " R=L-adjoint",
+            warning=True,
         )
         restoration = _gate(
             u._maximum_abs((r + se) - (l + es)),
@@ -469,6 +471,7 @@ def build_msfic_classes(
             matrix_atol,
             matrix_rtol,
             key + " F energy restoration",
+            warning=True,
         )
         block.metric, s_error = _hermitian(s, matrix_atol, matrix_rtol, key + " S")
         # Record numerical reference/IC defects before Hermitian averaging.
@@ -615,6 +618,7 @@ def _metric_basis(
         matrix_atol,
         matrix_rtol,
         "negative metric eigenvalue",
+        warning=True,
     )
     cutoff = max(metric_atol, metric_rcond * vals.max(initial=0))
     keep = vals > cutoff

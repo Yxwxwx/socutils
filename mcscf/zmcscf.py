@@ -3,6 +3,7 @@ import numpy
 from functools import reduce
 from pyscf import __config__
 from pyscf.lib import logger
+from pyscf.fci import fci_dhf_slow
 
 from socutils.scf import spinor_hf
 from socutils.mcscf import zcasbase, zcasci
@@ -342,6 +343,8 @@ def canonicalize(
 
 
 class CASSCF(zcasci.CASCI):
+
+    _fcisolver_class = fci_dhf_slow.FCISolver
 
     max_cycle_macro = getattr(__config__, 'mcscf_mc1step_CASSCF_max_cycle_macro', 50)
     irrep=None

@@ -167,8 +167,13 @@ point. Full-ERI and CD integral routes, with or without KR, are supported.
 Keep `natorb=False`, `canonicalize_=False` and orbital BFGS disabled.
 `mc.canonicalization=False` also skips final semicanonicalization; PT handles
 the required inactive/virtual semicanonicalization without rotating active
-orbitals. For exact-CI CASSCF, leave the default `mc.fcisolver` in place
-instead of assigning `DMRGCI`.
+orbitals. For full-CI CASSCF, leave the default `mc.fcisolver` in place:
+it is PySCF's `fci_dhf_slow.FCISolver`, which uses iterative Davidson
+without constructing the full CI Hamiltonian. Set `mc.fcisolver.conv_tol`
+and, when needed, `mc.fcisolver.conv_tol_residual` for the CI accuracy.
+For small-space dense diagonalization, explicitly assign
+`socutils.fci.zfci.FCISolver(mol)`. Standalone `zcasci.CASCI` keeps its
+dense default.
 
 ### FIC-NEVPT2
 
